@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "algorithm": "AES-256-GCM",
+  "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "iv": "ICEiIyQlJicoKSor",
+  "aad": "AWR1|A2I|019d2f1a-7b4c-7d10-8c21-1c77be6a91b0|phase0-ios|1|1788148800000",
+  "plaintext": "{\"sender\":\"Phase 0\",\"body\":\"cross-language AES-GCM\"}",
+  "ciphertext": "qRjVFQL8f3w4RmCeqXmHnPB5zrCl4gyKFdRWMCr4MXoGo4ll4EJAu3OYTtMdWjKPoWfO8-jDVNOXIwf47l4m21dtWNg"
+}

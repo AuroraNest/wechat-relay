@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#f5f5f7">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>Aurora Relay</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="stylesheet" href="/style.css?v=image-view-1">
+  <script src="/app.js?v=image-view-1" type="module"></script>
+</head>
+<body>
+  <main class="app-shell">
+    <header class="app-header">
+      <div>
+        <p class="app-name">Aurora Relay</p>
+        <h1>微信消息</h1>
+      </div>
+      <div class="header-actions">
+        <button id="clearMessages" class="header-button" type="button" hidden>清空</button>
+        <button id="openSettings" class="header-button" type="button">设置</button>
+      </div>
+    </header>
+
+    <section class="messages-card" aria-labelledby="messages-title">
+      <h2 id="messages-title" class="visually-hidden">微信消息</h2>
+      <div id="messages" class="message-list" aria-live="polite"></div>
+      <div id="emptyMessages" class="empty-state">
+        <p class="empty-title">暂无微信消息</p>
+        <p>收到并解密的消息只保存在此设备</p>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="settingsDialog" class="settings-dialog">
+    <div class="settings-sheet">
+      <header class="settings-header">
+        <h2>设置</h2>
+        <button id="closeSettings" class="header-button" type="button">完成</button>
+      </header>
+      <div class="settings-scroll">
+        <details class="settings-group disclosure-card connect-card" open>
+          <summary>设备连接</summary>
+          <div class="disclosure-content connect-content">
+            <p class="section-copy">填写自己的 Token 后, 将自动开启通知、创建密钥并生成仅可使用一次、10 分钟有效的配对码。配对码包含端到端密钥, 请勿发送给他人。</p>
+            <label for="token">开发配对 Token</label>
+            <input id="token" type="password" autocomplete="off" spellcheck="false" aria-describedby="pairingStatus">
+            <button id="createPairing" class="primary-button" type="button">生成新的 Android 配对码</button>
+            <p id="pairingStatus" class="pairing-status" aria-live="polite">重复生成会直接替换旧配对.</p>
+            <button id="copyPairing" class="secondary-button" type="button" hidden>复制配对码</button>
+            <textarea id="pairingCode" rows="13" readonly spellcheck="false" hidden></textarea>
+            <button id="subscribe" class="quiet-button" type="button">仅开启通知并创建密钥</button>
+            <button id="unregister" class="quiet-button" type="button">注销 Service Worker</button>
+          </div>
+        </details>
+
+        <details class="settings-group disclosure-card status-card">
+          <summary>连接状态</summary>
+          <div class="disclosure-content status-content">
+            <div class="status-toolbar">
+              <span>设备诊断</span>
+              <button id="refresh" class="text-button" type="button">刷新</button>
+            </div>
+            <dl id="status" aria-live="polite"></dl>
+          </div>
+        </details>
+
+        <details class="settings-group disclosure-card advanced-card">
+          <summary>开发者工具</summary>
+          <div class="disclosure-content advanced-content">
+            <label for="body">本地测试正文</label>
+            <textarea id="body" maxlength="4000">Phase 0 加密通知测试</textarea>
+
+            <div class="field-grid">
+              <div>
+                <label for="delay">延迟秒数</label>
+                <input id="delay" type="number" value="0" min="0" max="86400">
+              </div>
+              <div>
+                <label for="scenario">测试场景</label>
+                <input id="scenario" value="foreground" maxlength="80">
+              </div>
+              <div>
+                <label for="network">网络</label>
+                <select id="network">
+                  <option value="wifi">Wi-Fi</option>
+                  <option value="cellular">蜂窝</option>
+                  <option value="transition">网络切换</option>
+                  <option value="unknown">未知</option>
+                </select>
+              </div>
+              <div>
+                <label for="screen">屏幕/PWA 状态</label>
+                <select id="screen">
+                  <option value="foreground">前台</option>
+                  <option value="background">后台</option>
+                  <option value="killed">已划掉</option>
+                  <option value="locked">锁屏</option>
+                  <option value="unknown">未知</option>
+                </select>
+              </div>
+            </div>
+
+            <label for="ios">iOS 版本</label>
+            <input id="ios" placeholder="例如 26.0" maxlength="32">
+
+            <div class="action-grid">
+              <button id="send" class="primary-button" type="button">加密并发送</button>
+              <button id="resend" class="secondary-button" type="button">重发上一条</button>
+              <button id="fault" class="secondary-button" type="button">切换 SW 故障模式</button>
+              <button id="clearKey" class="secondary-button" type="button">清除本地 Key</button>
+            </div>
+
+            <div class="event-panel">
+              <h3>调试事件</h3>
+              <pre id="events" role="status" aria-live="polite">尚无事件</pre>
+            </div>
+          </div>
+        </details>
+
+        <p class="privacy-note">消息正文只在设备本地解密,Server 仅接收密文</p>
+      </div>
+    </div>
+  </dialog>
+  <dialog id="imageDialog" class="image-dialog" aria-label="查看图片">
+    <header><a id="saveImage" download="relay-image.jpg">保存图片</a><button id="closeImage" type="button">关闭</button></header>
+    <img id="fullImage" alt="消息图片">
+  </dialog>
+</body>
+</html>

@@ -1,0 +1,51 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <queries>
+        <package android:name="com.tencent.mm" />
+    </queries>
+    <application
+        android:allowBackup="false"
+        android:label="微信消息中继"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.NotificationProbe">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name=".UnlockGateActivity"
+            android:directBootAware="false"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:showWhenLocked="true"
+            android:theme="@style/Theme.NotificationProbe.UnlockGate"
+            android:turnScreenOn="true" />
+
+        <service
+            android:name=".WechatNotificationListenerService"
+            android:exported="true"
+            android:label="微信消息中继通知权限"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+        <service
+            android:name=".LockscreenAccessibilityReplyService"
+            android:directBootAware="false"
+            android:exported="true"
+            android:label="微信锁屏回复实验"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/lockscreen_accessibility_service" />
+        </service>
+    </application>
+</manifest>

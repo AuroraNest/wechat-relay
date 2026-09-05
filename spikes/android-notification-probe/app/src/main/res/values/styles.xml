@@ -1,0 +1,19 @@
+<resources>
+    <style name="Theme.NotificationProbe" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:statusBarColor">#F4F7FB</item>
+        <item name="android:navigationBarColor">#F4F7FB</item>
+        <item name="android:windowBackground">#F4F7FB</item>
+        <item name="android:colorAccent">#1677FF</item>
+    </style>
+    <style name="Theme.NotificationProbe.UnlockGate" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowIsTranslucent">false</item>
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:statusBarColor">#000000</item>
+        <item name="android:navigationBarColor">#000000</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">#1677FF</item>
+        <item name="android:windowDisablePreview">true</item>
+    </style>
+</resources>

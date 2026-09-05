@@ -1,0 +1,3 @@
+<resources>
+    <string name="lockscreen_accessibility_description">仅用于用户明确开启的 debug 锁屏微信回复和图片查看器截图实验.</string>
+</resources>

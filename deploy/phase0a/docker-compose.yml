@@ -1,0 +1,46 @@
+services:
+  redis:
+    image: redis:8.2.9-alpine
+    command: ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+      - /data:size=8m,mode=0700
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    mem_limit: 96m
+    restart: unless-stopped
+  relay-phase0a:
+    build: ../../spikes/ios-web-push
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      BUILD_VERSION: ${BUILD_VERSION:-local}
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:8092:8080
+    volumes:
+      - relay-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  relay-data:

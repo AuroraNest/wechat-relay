@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeWindowContentChanged|typeViewClicked|typeViewTextChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
+    android:canTakeScreenshot="true"
+    android:description="@string/lockscreen_accessibility_description"
+    android:isAccessibilityTool="false"
+    android:notificationTimeout="80"
+    android:packageNames="com.android.systemui,com.tencent.mm" />
