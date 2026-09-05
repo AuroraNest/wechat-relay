@@ -2,15 +2,27 @@
 
 Android 客户端监听用于工作的个人微信通知, 将加密消息上传到 Relay, 并接收来自 iPhone PWA 的加密回复. 诊断导出会脱敏, 不记录通知正文, 联系人, 图片, 截图或回复文本.
 
-## 构建
+## 构建环境
 
-需要 JDK 17 与 Android SDK. 将 `relayOrigin` 指向与 PWA `PUBLIC_ORIGIN` 相同的 HTTPS Origin:
+需要 JDK 17 与 Android SDK. 默认环境是 development. 复制本地配置模板, 填写自己的 HTTPS Origin 后构建:
 
 ```bash
-./gradlew -PrelayOrigin=https://relay.example.com testDebugUnitTest assembleDebug
+cp relay.development.properties.example relay.development.properties
+./gradlew -PrelayEnvironment=development testDebugUnitTest assembleDebug
 ```
 
-安装 debug APK 后, 在系统设置中授予 Notification Listener 权限, 再通过 PWA 配对. `RemoteInput` 会从活动的微信通知中取得, 是默认回复路径.
+`relay.development.properties` 只保存本机开发环境的 `relayOrigin`. 构建会从 properties 读取该值. `-PrelayOrigin=https://relay.example.com` 可显式覆盖它.
+
+要构建 production 环境, 使用独立模板并显式选择:
+
+```bash
+cp relay.production.properties.example relay.production.properties
+./gradlew -PrelayEnvironment=production testDebugUnitTest assembleDebug
+```
+
+环境只选择 Relay 地址. 它不改变 applicationId, 签名或构建产物覆盖规则. 不要将任意 debug APK 当作已有安装包的替代品.
+
+安装 debug APK 后, 在系统设置中授予 Notification Listener 权限, 再通过 PWA 配对. PWA 的 `PUBLIC_ORIGIN` 与 Android 的 `relayOrigin` 必须完全相同. iPhone 与 Android 实际测试需要你自己的 HTTPS Origin.
 
 ## 实验性锁屏回复
 

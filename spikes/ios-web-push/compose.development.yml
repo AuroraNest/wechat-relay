@@ -1,0 +1,21 @@
+name: wechat-relay-development
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: wechat_relay_dev
+      MYSQL_USER: ${MYSQL_USER:?Set MYSQL_USER in .env.development}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env.development}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_DEV_ROOT_PASSWORD:?Set MYSQL_DEV_ROOT_PASSWORD in .env.development}
+    ports:
+      - 127.0.0.1:23306:3306
+    volumes:
+      - mysql-development:/var/lib/mysql
+      - ./scripts/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+volumes:
+  mysql-development:

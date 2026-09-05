@@ -6,25 +6,29 @@ PWA 在本地生成并保存不可导出的 AES-GCM `CryptoKey`, 在本地解密
 
 ## 本地开发
 
-需要 Node.js 24 与 MySQL. 创建空数据库和仅拥有该库权限的用户, 然后按顺序导入 `scripts/migrations/001-baseline.sql` 到 `scripts/migrations/004-conversation-send-capability.sql`.
+需要 Node.js 24 和可用的 Docker daemon. 复制模板后, 在启动前填写所有空值:
 
 ```bash
-cp .env.example .env
-# 在 .env 填写 MYSQL_HOST, MYSQL_DATABASE, MYSQL_USER, MYSQL_PASSWORD
-mysql -h 127.0.0.1 -u relay_user -p relay < scripts/migrations/001-baseline.sql
-mysql -h 127.0.0.1 -u relay_user -p relay < scripts/migrations/002-multi-pair-browser-sessions.sql
-mysql -h 127.0.0.1 -u relay_user -p relay < scripts/migrations/003-message-reply-capability.sql
-mysql -h 127.0.0.1 -u relay_user -p relay < scripts/migrations/004-conversation-send-capability.sql
+cp .env.development.example .env.development
 npm ci
+node --input-type=module -e "import webpush from 'web-push'; console.log(webpush.generateVAPIDKeys())"
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
 npm test
-node --env-file=.env scripts/run-local.mjs
+npm run dev:db
+npm run dev
 ```
 
-这等同于 `npm run dev`, 但会加载 `.env` 中的 MySQL 配置. 每次启动都会更换 VAPID 和存储密钥, 因而已订阅的浏览器和已有本地数据会失效. 仅使用可丢弃的开发数据库.
+将 VAPID 输出的两个字段填入 `.env.development`. 为 `MYSQL_PASSWORD`, `MYSQL_DEV_ROOT_PASSWORD`, `TEST_TOKEN` 和 `STORAGE_KEY` 各运行一次随机值命令, 并填入四个不同的输出. 这些开发值应保持不变, 否则已有开发数据和订阅可能失效.
 
-## 配置与运行
+`.env.development` 是 `npm run dev` 唯一读取的环境文件. 启动前会校验 `NODE_ENV=development`, `MYSQL_HOST=127.0.0.1`, `MYSQL_PORT=23306`, `MYSQL_DATABASE=wechat_relay_dev`, `DATA_DIR=data/development`, 并要求 `REDIS_URL` 为空. `npm run dev:db` 使用 `compose.development.yml` 创建独立 MySQL 8.4 volume. 初始迁移只会在新 volume 创建时导入. 已有 volume 应按版本应用增量迁移, 不要为重新初始化迁移删除数据.
 
-复制 `.env.example` 为仅限运行环境读取的配置文件. 填写 `PUBLIC_ORIGIN`, VAPID 密钥, `STORAGE_KEY`, `TEST_TOKEN` 和 `MYSQL_*`. 生成一次密钥并保存到 `.env`, 不要在重启时更换:
+开发 Origin 只能用于本机检查. 若要在 iPhone 上安装 PWA 或接收 Web Push, 请配置自己的 HTTPS Origin, 并将它写入 development 配置的 `PUBLIC_ORIGIN`.
+
+## 生产自托管
+
+复制 `.env.production.example` 为 `.env.production`, 完整填写生产配置与 MySQL 连接. 该文件包含独立运行所需的 `PUBLIC_ORIGIN`, `PUBLIC_DIR`, `DATA_DIR`, VAPID, `STORAGE_KEY` 和 `TEST_TOKEN`.
+
+VAPID, `STORAGE_KEY` 和 `TEST_TOKEN` 必须只生成一次并跨重启保留. 使用现有依赖生成后写入 `.env.production`:
 
 ```bash
 node --input-type=module -e "import webpush from 'web-push'; console.log(webpush.generateVAPIDKeys())"
@@ -32,21 +36,17 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'
 node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
 ```
 
-第二和第三个命令分别生成 `STORAGE_KEY` 和 `TEST_TOKEN`. `TEST_TOKEN` 没有默认值, 必须设置后才能使用配对接口.
-
-先应用全部 MySQL 迁移. 可通过项目提供的 Docker 配置运行, 或直接执行:
+第二和第三个命令分别生成 `STORAGE_KEY` 和 `TEST_TOKEN`. `TEST_TOKEN` 没有默认值. 先应用项目 SQL 迁移, 再构建和启动:
 
 ```bash
 npm ci
 npm run build
-node --env-file=.env dist/server.js
+npm run start:production
 ```
 
-`.env.example` 的 `PUBLIC_DIR=/app/public` 和 `DATA_DIR=/data` 用于 Docker. 独立运行时改为 `PUBLIC_DIR=public` 和可写的 `DATA_DIR=data`.
+`npm run start:production` 只读取 `.env.production`, 不继承业务环境变量, 并验证 `NODE_ENV=production` 与 HTTPS `PUBLIC_ORIGIN`. 它只启动当前机器上的服务, 不会自动部署. `PUBLIC_ORIGIN` 必须与 Android `relayOrigin` 完全相同.
 
-生产环境必须使用 HTTPS. `PUBLIC_ORIGIN` 必须与 Android 的 `relayOrigin` 完全相同, 然后才能配对和接收 Web Push. iPhone 上请使用 Safari 打开该 Origin 并添加到主屏幕.
-
-不要提交配置文件, 测试令牌, 配对码, Push Subscription 或密钥.
+`deploy/phase0a` 提供通用 Docker 和 Nginx 示例, 不会直接替换任何已有环境. 忽略规则不能代替对 `.env.production`, Push Subscription, 配对码和密钥的访问控制.
 
 ## 限制
 

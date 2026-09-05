@@ -1,11 +1,18 @@
 import java.net.URI
+import java.util.Properties
 
 plugins {
     id("com.android.application")
     id("com.google.devtools.ksp")
 }
 
-val relayOrigin = providers.gradleProperty("relayOrigin").orElse("https://relay.example.com").get()
+val relayEnvironment = providers.gradleProperty("relayEnvironment").orElse("development").get()
+require(relayEnvironment in setOf("development", "production")) { "Unknown relayEnvironment" }
+val localRelayProperties = Properties()
+val localRelayFile = rootProject.file("relay.$relayEnvironment.properties")
+if (localRelayFile.isFile) localRelayFile.inputStream().use { localRelayProperties.load(it) }
+val relayOrigin = providers.gradleProperty("relayOrigin")
+    .orElse(localRelayProperties.getProperty("relayOrigin", "https://relay.example.com")).get()
 val relayUri = URI(relayOrigin)
 require(relayUri.scheme == "https" && relayUri.host != null &&
     relayUri.rawUserInfo == null && relayUri.rawQuery == null && relayUri.rawFragment == null &&

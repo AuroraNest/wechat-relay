@@ -8,9 +8,11 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "npm run build && node scripts/run-local.mjs",
-    "test": "npm run build && node --test dist/*.test.js",
-    "start": "node dist/server.js"
+    "dev": "npm run build && node scripts/run-server.mjs development",
+    "dev:db": "docker compose --env-file .env.development -f compose.development.yml up -d",
+    "test": "npm run build && node --test dist/*.test.js scripts/*.test.mjs",
+    "start": "node dist/server.js",
+    "start:production": "node scripts/run-server.mjs production"
   },
   "dependencies": {
     "mysql2": "3.24.2",
