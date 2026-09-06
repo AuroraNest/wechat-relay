@@ -13,6 +13,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import org.json.JSONArray
+import org.json.JSONObject
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -48,6 +50,30 @@ data class ReplyTarget(
     val route: String,
     val conversationTitleHash: String,
 )
+
+data class HistoryForwardInput(
+    val id: String,
+    val sourceKey: String,
+    val wechatUserSerial: Long,
+    val postTime: Long,
+    val payload: String,
+)
+
+@Entity(tableName = "history_forward_tasks")
+data class HistoryForwardTask(
+    @androidx.room.PrimaryKey val id: String,
+    val deviceId: String,
+    val messageId: String,
+    val seq: Long,
+    val sourceKey: String,
+    val wechatUserId: Int,
+    val wechatUserSerial: Long,
+    val postTime: Long,
+    val payload: String,
+    val state: String,
+    val stage: String,
+)
+
 data class MessageEncryptionContext(val deviceId: String, val a2iKey: ByteArray)
 data class RequestSigningContext(val deviceId: String, val signingAlias: String)
 data class PendingReplyAck(val deviceId: String, val replyId: String, val status: String)
@@ -86,20 +112,40 @@ interface ReplyTargetDao {
     @Query("DELETE FROM reply_targets") fun clear()
 }
 
-@Database(entities = [SyncQueueItem::class, ReplyTarget::class], version = 9, exportSchema = false)
+@Dao
+interface HistoryForwardTaskDao {
+    @Query("SELECT * FROM history_forward_tasks WHERE deviceId = :deviceId AND state = 'FAILED' ORDER BY seq DESC LIMIT 32") fun failed(deviceId: String): List<HistoryForwardTask>
+    @Insert(onConflict = OnConflictStrategy.IGNORE) fun insert(task: HistoryForwardTask): Long
+    @Query("SELECT * FROM history_forward_tasks WHERE deviceId = :deviceId AND state = 'QUEUED' ORDER BY seq ASC") fun pending(deviceId: String): List<HistoryForwardTask>
+    @Query("SELECT * FROM history_forward_tasks WHERE deviceId = :deviceId AND id = :id") fun find(deviceId: String, id: String): HistoryForwardTask?
+    @Query("UPDATE history_forward_tasks SET state = :state, stage = :stage WHERE deviceId = :deviceId AND id = :id") fun state(deviceId: String, id: String, state: String, stage: String): Int
+    @Query("UPDATE history_forward_tasks SET state = 'SENDING' WHERE deviceId = :deviceId AND id = :id AND state = 'RUNNING'") fun claimSend(deviceId: String, id: String): Int
+    @Query("UPDATE history_forward_tasks SET state = 'QUEUED', stage = '' WHERE deviceId = :deviceId AND state = 'RUNNING'") fun recoverRunning(deviceId: String): Int
+    @Query("UPDATE history_forward_tasks SET state = 'UNKNOWN', stage = 'PROCESS_INTERRUPTED' WHERE deviceId = :deviceId AND state = 'SENDING'") fun recoverSending(deviceId: String): Int
+    @Query("SELECT * FROM history_forward_tasks WHERE deviceId = :deviceId AND sourceKey = :sourceKey AND postTime <= :postTime AND state IN ('QUEUED', 'RUNNING', 'SENDING') ORDER BY seq ASC") fun textRecipients(deviceId: String, sourceKey: String, postTime: Long): List<HistoryForwardTask>
+    @Query("UPDATE history_forward_tasks SET payload = :payload WHERE deviceId = :deviceId AND id = :id") fun payload(deviceId: String, id: String, payload: String): Int
+    @Query("SELECT state, COUNT(*) AS count FROM history_forward_tasks WHERE deviceId = :deviceId GROUP BY state") fun counts(deviceId: String): List<HistoryForwardTaskCount>
+    @Query("DELETE FROM history_forward_tasks WHERE deviceId = :deviceId") fun clear(deviceId: String)
+}
+
+data class HistoryForwardTaskCount(val state: String, val count: Int)
+
+@Database(entities = [SyncQueueItem::class, ReplyTarget::class, HistoryForwardTask::class], version = 10, exportSchema = false)
 abstract class SyncDatabase : RoomDatabase() {
     abstract fun queue(): SyncQueueDao
     abstract fun replyTargets(): ReplyTargetDao
+    abstract fun historyForwardTasks(): HistoryForwardTaskDao
 }
 
 class SyncStore private constructor(context: Context) {
     private val appContext = context.applicationContext
     private val preferences = appContext.getSharedPreferences("phase1_sync", Context.MODE_PRIVATE)
     private val database = Room.databaseBuilder(appContext, SyncDatabase::class.java, "phase1-sync.db")
-        .addMigrations(Migration1To2, Migration2To3, Migration3To4, Migration4To5, Migration5To6, Migration6To7, Migration7To8, Migration8To9)
+        .addMigrations(Migration1To2, Migration2To3, Migration3To4, Migration4To5, Migration5To6, Migration6To7, Migration7To8, Migration8To9, Migration9To10)
         .build()
     private val queue = database.queue()
     private val replyTargets = database.replyTargets()
+    private val historyForwardTasks = database.historyForwardTasks()
 
     @Synchronized
     fun paired(): Boolean {
@@ -140,11 +186,19 @@ class SyncStore private constructor(context: Context) {
         return next
     }
     @Synchronized
-    fun enqueue(expectedDeviceId: String, id: String, seq: Long, createdAt: Long, envelope: String, assetsJson: String = "[]", wechatUserId: Int = 0, replyTarget: ReplyTarget? = null, conversationSendCapable: Boolean = false): Boolean {
+    fun enqueue(expectedDeviceId: String, id: String, seq: Long, createdAt: Long, envelope: String, assetsJson: String = "[]", wechatUserId: Int = 0, replyTarget: ReplyTarget? = null, conversationSendCapable: Boolean = false, historyForward: HistoryForwardInput? = null, historyRecovery: Pair<String, String>? = null): Boolean {
         check(isCurrentDevice(expectedDeviceId))
         require(NotificationSnapshot.isAllowedWechatUserId(wechatUserId))
         require(replyTarget == null || replyTarget.wechatUserId == wechatUserId)
         require(!conversationSendCapable || replyTarget != null)
+        val encryptedHistoryPayload = historyForward?.let { input ->
+            val plaintext = input.payload.toByteArray(Charsets.UTF_8)
+            try {
+                wrap(plaintext)
+            } finally {
+                plaintext.fill(0)
+            }
+        }
         var queued = false
         database.runInTransaction {
             queue.bindLegacy(expectedDeviceId)
@@ -153,6 +207,26 @@ class SyncStore private constructor(context: Context) {
             if (overflow > 0) queue.dropOldestAccepted(expectedDeviceId, overflow)
             if (queue.count(expectedDeviceId) < QueueCap && queue.insert(SyncQueueItem(id, expectedDeviceId, seq, createdAt, envelope, assetsJson, wechatUserId, replyTarget != null, conversationSendCapable, Queued)) != -1L) {
                 replyTarget?.let(replyTargets::insert)
+                if (historyForward != null && encryptedHistoryPayload != null) {
+                    historyForwardTasks.insert(HistoryForwardTask(
+                        historyForward.id,
+                        expectedDeviceId,
+                        id,
+                        seq,
+                        historyForward.sourceKey,
+                        wechatUserId,
+                        historyForward.wechatUserSerial,
+                        historyForward.postTime,
+                        encryptedHistoryPayload,
+                        HistoryQueued,
+                        "",
+                    ))
+                }
+                historyRecovery?.let { (taskId, body) ->
+                    historyForwardTasks.find(expectedDeviceId, taskId)?.let { task ->
+                        appendHistoryText(expectedDeviceId, task, body)
+                    }
+                }
                 queued = true
             }
         }
@@ -175,6 +249,142 @@ class SyncStore private constructor(context: Context) {
     fun state(expectedDeviceId: String, id: String, state: String) {
         check(isCurrentDevice(expectedDeviceId))
         queue.state(expectedDeviceId, id, state)
+    }
+    @Synchronized
+    fun pendingHistoryTasks(expectedDeviceId: String): List<HistoryForwardTask> {
+        requireActiveHistoryPair(expectedDeviceId)
+        return historyForwardTasks.pending(expectedDeviceId)
+    }
+    @Synchronized
+    fun failedVoiceTasks(expectedDeviceId: String): List<HistoryForwardTask> {
+        requireActiveHistoryPair(expectedDeviceId)
+        // ponytail: manual recovery shows 32 recent failures; add paging if older recovery is needed.
+        return historyForwardTasks.failed(expectedDeviceId).filter {
+            JSONObject(historyTaskPayload(expectedDeviceId, it)).optString("kind") == "voice"
+        }
+    }
+    @Synchronized
+    fun retryLatestFailedVoice(expectedDeviceId: String): Boolean {
+        requireActiveHistoryPair(expectedDeviceId)
+        val task = failedVoiceTasks(expectedDeviceId).firstOrNull() ?: return false
+        val payload = JSONObject(historyTaskPayload(expectedDeviceId, task))
+        payload.remove("voiceResult")
+        payload.put("manualRetryAt", System.currentTimeMillis())
+        val plaintext = payload.toString().toByteArray(Charsets.UTF_8)
+        try {
+            database.runInTransaction {
+                historyForwardTasks.payload(expectedDeviceId, task.id, wrap(plaintext))
+                historyForwardTasks.state(expectedDeviceId, task.id, HistoryQueued, "MANUAL_RETRY")
+            }
+        } finally { plaintext.fill(0) }
+        return true
+    }
+    @Synchronized
+    fun cacheVoiceResult(task: HistoryForwardTask, result: AccessibilityReplyResult) {
+        requireActiveHistoryPair(task.deviceId)
+        val current = checkNotNull(historyForwardTasks.find(task.deviceId, task.id))
+        val payload = JSONObject(historyTaskPayload(task.deviceId, current))
+        if (payload.has("voiceResult")) return
+        payload.put("voiceResult", JSONObject().put("status", result.status).put("stage", result.stage).put("transcript", result.transcript))
+        val plaintext = payload.toString().toByteArray(Charsets.UTF_8)
+        try { historyForwardTasks.payload(task.deviceId, task.id, wrap(plaintext)) }
+        finally { plaintext.fill(0) }
+    }
+    @Synchronized
+    fun completeVoiceTask(task: HistoryForwardTask, messages: List<Pair<SyncQueueItem, ReplyTarget>>, succeeded: Boolean, stage: String): Boolean {
+        requireActiveHistoryPair(task.deviceId)
+        require(messages.isNotEmpty())
+        var completed = false
+        database.runInTransaction {
+            check(historyForwardTasks.find(task.deviceId, task.id)?.state == HistoryRunning)
+            val overflow = queue.count(task.deviceId) + messages.size - QueueCap
+            if (overflow > 0) queue.dropOldestAccepted(task.deviceId, overflow)
+            if (queue.count(task.deviceId) + messages.size > QueueCap) {
+                historyForwardTasks.state(task.deviceId, task.id, HistoryQueued, "VOICE_RESULT_QUEUE_FULL")
+                return@runInTransaction
+            }
+            messages.forEach { (item, target) ->
+                require(item.deviceId == task.deviceId && item.wechatUserId == task.wechatUserId && target.messageId == item.id)
+                check(enqueue(task.deviceId, item.id, item.seq, item.createdAt, item.envelope, item.assetsJson,
+                    item.wechatUserId, target, item.conversationSendCapable))
+            }
+            // Commit all transcript parts and task completion together; recovery cannot publish them twice.
+            historyForwardTasks.state(task.deviceId, task.id, if (succeeded) HistorySent else HistoryFailed, stage)
+            val payload = JSONObject(historyTaskPayload(task.deviceId, checkNotNull(historyForwardTasks.find(task.deviceId, task.id))))
+            payload.remove("voiceResult")
+            val plaintext = payload.toString().toByteArray(Charsets.UTF_8)
+            try { historyForwardTasks.payload(task.deviceId, task.id, wrap(plaintext)) }
+            finally { plaintext.fill(0) }
+            completed = true
+        }
+        return completed
+    }
+    @Synchronized
+    fun findHistoryTask(expectedDeviceId: String, id: String): HistoryForwardTask? {
+        requireActiveHistoryPair(expectedDeviceId)
+        return historyForwardTasks.find(expectedDeviceId, id)
+    }
+    @Synchronized
+    fun historyTaskPayload(expectedDeviceId: String, task: HistoryForwardTask): String {
+        requireActiveHistoryPair(expectedDeviceId)
+        check(task.deviceId == expectedDeviceId)
+        val plaintext = unwrap(task.payload)
+        return try {
+            String(plaintext, Charsets.UTF_8)
+        } finally {
+            plaintext.fill(0)
+        }
+    }
+    @Synchronized
+    fun historyTaskState(expectedDeviceId: String, id: String, state: String, stage: String) {
+        requireActiveHistoryPair(expectedDeviceId)
+        require(state in HistoryTaskStates)
+        historyForwardTasks.state(expectedDeviceId, id, state, stage)
+    }
+    @Synchronized
+    fun claimHistorySend(expectedDeviceId: String, id: String): Boolean {
+        if (!isCurrentDevice(expectedDeviceId) || !paired()) return false
+        return historyForwardTasks.claimSend(expectedDeviceId, id) == 1
+    }
+    @Synchronized
+    fun recoverHistoryTasks(expectedDeviceId: String) {
+        requireActiveHistoryPair(expectedDeviceId)
+        database.runInTransaction {
+            historyForwardTasks.recoverRunning(expectedDeviceId)
+            historyForwardTasks.recoverSending(expectedDeviceId)
+        }
+    }
+    @Synchronized
+    fun noteHistoryText(expectedDeviceId: String, sourceKey: String, postTime: Long, body: String) {
+        requireActiveHistoryPair(expectedDeviceId)
+        database.runInTransaction {
+            historyForwardTasks.textRecipients(expectedDeviceId, sourceKey, postTime).forEach { task ->
+                appendHistoryText(expectedDeviceId, task, body)
+            }
+        }
+    }
+    @Synchronized
+    fun historyTaskCounts(expectedDeviceId: String): Map<String, Int> {
+        requireActiveHistoryPair(expectedDeviceId)
+        return historyForwardTasks.counts(expectedDeviceId).associate { it.state to it.count }
+    }
+
+    private fun appendHistoryText(expectedDeviceId: String, task: HistoryForwardTask, body: String) {
+        val root = JSONObject(historyTaskPayload(expectedDeviceId, task))
+        val knownTexts = root.optJSONArray("knownTexts") ?: JSONArray()
+        knownTexts.put(body)
+        root.put("knownTexts", knownTexts)
+        val plaintext = root.toString().toByteArray(Charsets.UTF_8)
+        try {
+            historyForwardTasks.payload(expectedDeviceId, task.id, wrap(plaintext))
+        } finally {
+            plaintext.fill(0)
+        }
+    }
+
+    private fun requireActiveHistoryPair(expectedDeviceId: String) {
+        check(isCurrentDevice(expectedDeviceId))
+        check(paired())
     }
     @Synchronized
     fun i2aKey(expectedDeviceId: String): ByteArray {
@@ -258,6 +468,7 @@ class SyncStore private constructor(context: Context) {
         if (replacedDeviceId != null) runCatching {
             database.runInTransaction {
                 queue.clear(replacedDeviceId)
+                historyForwardTasks.clear(replacedDeviceId)
                 replyTargets.clear()
             }
         }
@@ -284,7 +495,9 @@ class SyncStore private constructor(context: Context) {
 
     companion object {
         const val Queued = "QUEUED"; const val Uploading = "UPLOADING"; const val ServerAccepted = "SERVER_ACCEPTED"
+        const val HistoryQueued = "QUEUED"; const val HistoryRunning = "RUNNING"; const val HistorySending = "SENDING"; const val HistorySent = "SENT"; const val HistoryFailed = "FAILED"; const val HistoryUnknown = "UNKNOWN"
         private const val QueueCap = 1000; private const val DeviceId = "device_id"; private const val Sequence = "seq"; private const val SigningAlias = "signing_alias"; private const val WrappedA2i = "wrapped_a2i"; private const val WrappedI2a = "wrapped_i2a"; private const val QueuedNotificationIdentities = "queued_notification_identities"; private const val PendingReplyDeviceId = "pending_reply_device_id"; private const val PendingReplyId = "pending_reply_id"; private const val PendingReplyStatus = "pending_reply_status"; private const val WrapAlias = "awrelay_phase1_wrap"
+        private val HistoryTaskStates = setOf(HistoryQueued, HistoryRunning, HistorySending, HistorySent, HistoryFailed, HistoryUnknown)
         // ponytail: arbitrary old identities may be evicted at 64; upgrade to Room UNIQUE identity if replay volume exceeds it.
         private const val MaxQueuedNotificationIdentities = 64
         private val Migration1To2 = object : Migration(1, 2) {
@@ -327,6 +540,11 @@ class SyncStore private constructor(context: Context) {
         private val Migration8To9 = object : Migration(8, 9) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE reply_targets ADD COLUMN wechatUserSerial INTEGER NOT NULL DEFAULT -1")
+            }
+        }
+        private val Migration9To10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS history_forward_tasks (id TEXT NOT NULL, deviceId TEXT NOT NULL, messageId TEXT NOT NULL, seq INTEGER NOT NULL, sourceKey TEXT NOT NULL, wechatUserId INTEGER NOT NULL, wechatUserSerial INTEGER NOT NULL, postTime INTEGER NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL, stage TEXT NOT NULL, PRIMARY KEY(id))")
             }
         }
         internal fun replacedDeviceId(existingDeviceId: String?, newDeviceId: String): String? =

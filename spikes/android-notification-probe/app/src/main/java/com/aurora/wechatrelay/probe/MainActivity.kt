@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.app.NotificationManager
 import android.content.ComponentName
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -25,6 +26,7 @@ import java.io.FileInputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import org.json.JSONObject
 
 class MainActivity : Activity() {
     private lateinit var statusView: TextView
@@ -72,6 +74,13 @@ class MainActivity : Activity() {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         })
         actions.addView(button("重新配对") { showPairingEntry() })
+        actions.addView(button("补传语音转写到原会话") { showClipboardSync() })
+        actions.addView(button("重试最近失败语音") {
+            AlertDialog.Builder(this).setMessage("将重新打开最近失败语音的微信会话并读取转写. 请确认该会话没有更新的语音, 或发送一条新语音触发自动处理.")
+                .setNegativeButton("取消", null).setPositiveButton("重试") { _, _ ->
+                    WechatNotificationListenerService.requestLatestVoiceRetry(this)
+                }.show()
+        })
         content.addView(card("连接与修复", actions))
 
         lockscreenStatusView = TextView(this).apply {
@@ -82,7 +91,7 @@ class MainActivity : Activity() {
         val lockscreen = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         lockscreen.addView(lockscreenStatusView)
         lockscreen.addView(TextView(this).apply {
-            text = "实验功能包含锁屏回复和新图片同步. 新图片会在微信查看器中按屏幕显示分辨率截图, 不保存到安卓相册. 截图仅裁剪图片显示区域并加密传给已配对 iPhone. 仅在 Android 16/API 36+ 的 debug build 可启用. 重启后必须先手动解锁一次. PIN 错误或流程异常会自动禁用, 需要重新保存 PIN."
+            text = "实验功能包含锁屏回复, 新图片同步, 聊天记录自动转发和语音转文字. 新语音通过微信原生转文字同步到 PWA, 不在微信发送消息, 不提供原声. 新收到的聊天记录会通过微信转发到聊天记录中继群, 请先建群并加入接收端微信. 来源或目标不明确时停止, 发送结果不明时不重试. 新图片会在微信查看器中按屏幕显示分辨率截图, 不保存到安卓相册. 截图仅裁剪图片显示区域并加密传给已配对 iPhone. 仅在 Android 16/API 36+ 的 debug build 可启用. 重启后必须先手动解锁一次. PIN 错误或流程异常会自动禁用, 需要重新保存 PIN."
             textSize = 13f
             setTextColor(Color.rgb(111, 121, 138))
             setPadding(0, dp(8), 0, dp(8))
@@ -127,6 +136,75 @@ class MainActivity : Activity() {
         })
     }
 
+    private fun showClipboardSync() {
+        // Clipboard access must originate from this focused Activity, not the background listener.
+        if (!hasWindowFocus()) return
+        val clip = runCatching { getSystemService(ClipboardManager::class.java).primaryClip }.getOrNull()
+        val text = clip?.takeIf { it.itemCount == 1 }?.getItemAt(0)?.text?.toString()
+        if (text == null || VoiceResultMessages.clipboardPreview("语音", text) == null) {
+            AlertDialog.Builder(this).setMessage("请先复制一段非空短文字. 超出单条长度的内容不会截断发送.")
+                .setPositiveButton("知道了", null).show()
+            return
+        }
+        Thread {
+            val choices = runCatching {
+                val store = SyncStore.get(this)
+                val deviceId = store.deviceId()
+                store.failedVoiceTasks(deviceId).map { task ->
+                    task to JSONObject(store.historyTaskPayload(deviceId, task)).getString("sender")
+                }
+            }.getOrDefault(emptyList())
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (choices.isEmpty()) {
+                    AlertDialog.Builder(this).setMessage("没有可补传的失败语音任务, 请检查配对或等待新语音.")
+                        .setPositiveButton("知道了", null).show()
+                } else {
+                    val labels = choices.map { (task, sender) ->
+                        "$sender · ${if (task.wechatUserId == 0) "主微信" else "分身微信"} · ${SimpleDateFormat("MM-dd HH:mm:ss", Locale.ROOT).format(Date(task.postTime))}"
+                    }.toTypedArray()
+                    AlertDialog.Builder(this).setTitle("选择这段文字对应的原语音")
+                        .setItems(labels) { _, index ->
+                            val (task, sender) = choices[index]
+                            confirmClipboardSync(task, sender, text)
+                        }.setNegativeButton("取消", null).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun confirmClipboardSync(task: HistoryForwardTask, sender: String, text: String) {
+        val preview = VoiceResultMessages.clipboardPreview(sender, text) ?: return
+        AlertDialog.Builder(this).setTitle("补传到 iPhone 的 $sender 会话").setMessage(text)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("同步") { _, _ ->
+                Thread {
+                    val message = runCatching {
+                        val store = SyncStore.get(this)
+                        check(store.paired())
+                        val deviceId = task.deviceId
+                        check(store.isCurrentDevice(deviceId))
+                        val id = SyncProtocol.uuidV7()
+                        val seq = store.nextSeq(deviceId)
+                        val createdAt = System.currentTimeMillis()
+                        val encryption = store.messageEncryptionContext(deviceId)
+                        val envelope = try {
+                            SyncProtocol.encrypt(encryption.a2iKey, id, deviceId, seq, createdAt, preview, task.wechatUserId)
+                        } finally { encryption.a2iKey.fill(0) }
+                        check(store.enqueue(deviceId, id, seq, createdAt, SyncProtocol.envelopeJson(envelope), wechatUserId = task.wechatUserId))
+                        SyncNetwork.enqueue(this)
+                        "文字已加密入队, 正在同步到 iPhone."
+                    }.getOrElse { "同步未能入队, 请检查配对与队列状态. 剪贴板内容仍保留." }
+                    runOnUiThread {
+                        if (!isFinishing && !isDestroyed) {
+                            AlertDialog.Builder(this).setMessage(message).setPositiveButton("知道了", null).show()
+                            refreshUi()
+                        }
+                    }
+                }.start()
+            }.show()
+    }
+
     override fun onResume() {
         super.onResume()
         WechatNotificationListenerService.requestReplyPolling(this)
@@ -162,6 +240,7 @@ class MainActivity : Activity() {
             通知监听: ${if (ProbeRuntime.listenerConnected) "已连接" else "未连接"}
             回复轮询: ${ProbeRuntime.lastReplyStatus}
             最近通知: $lastCapture
+            自动处理队列: ${ProbeRuntime.historyQueueStatus}
             ${pairingStatus.orEmpty()}
         """.trimIndent()
         lockscreenStatusView.text = """

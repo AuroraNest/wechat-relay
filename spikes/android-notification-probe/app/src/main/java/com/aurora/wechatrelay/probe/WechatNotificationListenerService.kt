@@ -11,10 +11,20 @@ import android.service.notification.StatusBarNotification
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class WechatNotificationListenerService : NotificationListenerService() {
     private val duplicateDetector = DuplicateDetector()
+    // ponytail: WeChat has no message ID here; only merge identical reposts within 250ms, use a message ID if available.
+    private val voiceDuplicateDetector = DuplicateDetector(250L)
     private val syncExecutor = Executors.newSingleThreadExecutor()
+    private val historyExecutor = Executors.newSingleThreadExecutor()
+    private val historyDrainScheduled = AtomicBoolean(false)
+    private val historyRecovered = AtomicBoolean(false)
+    private data class HistorySource(val sourceKey: String, val postTime: Long, val contentIntent: PendingIntent?, val kind: String = "history")
+    private val historySources = ConcurrentHashMap<String, HistorySource>()
     @Volatile private var replyExecutor: ExecutorService? = null
     @Volatile private var replyGeneration = 0L
     // ponytail: one newest notification cancels stale capture; per-conversation scheduling if throughput requires it.
@@ -27,6 +37,13 @@ class WechatNotificationListenerService : NotificationListenerService() {
         ProbeRuntime.listenerConnected = true
         scanRemoteInputCandidates()
         startReplyPolling()
+        syncExecutor.execute {
+            val store = SyncStore.get(this)
+            if (store.paired()) {
+                if (historyRecovered.compareAndSet(false, true)) store.recoverHistoryTasks(store.deviceId())
+                scheduleHistoryDrain()
+            }
+        }
         // Recover an active notification that the listener missed while its binding was unavailable.
         activeNotifications?.filter(::isSourceWechat)?.forEach(::onNotificationPosted)
         try {
@@ -65,12 +82,26 @@ class WechatNotificationListenerService : NotificationListenerService() {
                 val preview = NotificationSnapshot.preview(sbn)
                     ?: return recordSyncDiagnostic("PREVIEW_NULL")
                 val notificationIdentity = notificationIdentity(sbn, preview)
+                val historyNotification = ChatHistoryForwardPolicy.shouldForward(
+                    preview, NotificationSnapshot.conversationTitle(sbn),
+                    sbn.notification.flags and android.app.Notification.FLAG_GROUP_SUMMARY != 0,
+                    System.currentTimeMillis() - sbn.postTime,
+                )
+                val voiceNotification = VoiceTranscriptionPolicy.shouldTranscribe(preview, NotificationSnapshot.conversationTitle(sbn),
+                    sbn.notification.flags and android.app.Notification.FLAG_GROUP_SUMMARY != 0, System.currentTimeMillis() - sbn.postTime)
+                if (voiceNotification && voiceDuplicateDetector.isDuplicateCandidate(
+                        SyncProtocol.shortWindowDuplicateKey(sbn.key, sbn.userId, preview), android.os.SystemClock.elapsedRealtime(),
+                    )) {
+                    recordSyncDiagnostic("VOICE_NOTIFICATION_REPOST_IGNORED")
+                    return
+                }
                 latestCaptureIdentity = notificationIdentity
                 val imageNotification = ImageNotificationPolicy.shouldCapture(preview, sbn.notification.flags and android.app.Notification.FLAG_GROUP_SUMMARY != 0, System.currentTimeMillis() - sbn.postTime)
-                if (!imageNotification && isSyncDuplicate(sbn.key, sbn.userId, preview)) return
+                if (!imageNotification && !historyNotification && !voiceNotification && isSyncDuplicate(sbn.key, sbn.userId, preview)) return
                 val store = SyncStore.get(this)
                 val expectedDeviceId = store.deviceId()
                 if (store.hasQueuedNotificationIdentity(expectedDeviceId, notificationIdentity)) return
+                if (historyNotification || voiceNotification) historySources[notificationIdentity] = HistorySource(sbn.key, sbn.postTime, sbn.notification.contentIntent, if (voiceNotification) "voice" else "history")
                 try {
                     syncExecutor.execute {
                         try {
@@ -78,6 +109,7 @@ class WechatNotificationListenerService : NotificationListenerService() {
                                 queuePreview(store, expectedDeviceId, preview, notificationIdentity, sbn, captured.remoteInputCandidates.firstOrNull())
                             }
                         } catch (failure: Exception) {
+                            historySources.remove(notificationIdentity)
                             recordSyncDiagnostic("QUEUE_PREVIEW_FAILED", failure)
                         }
                     }
@@ -167,7 +199,14 @@ class WechatNotificationListenerService : NotificationListenerService() {
             val conversationSendCapable = replyTarget != null && accessibilityArmed &&
                 NotificationSnapshot.isConversationSendCandidate(sbn) && titleHash.isNotBlank() && wechatUserSerial >= 0L
             val queued = try {
-                store.enqueue(expectedDeviceId, id, seq, createdAt, SyncProtocol.envelopeJson(envelope), assetsJson, sbn.userId, replyTarget, conversationSendCapable)
+                // Share the persisted UI queue so voice and history operations cannot race for WeChat.
+                val historyForward = if (historySources.containsKey(notificationIdentity)) {
+                    HistoryForwardInput(notificationIdentity, sbn.key, wechatUserSerial, sbn.postTime,
+                        JSONObject().put("sender", preview.sender).put("conversationTitle", NotificationSnapshot.conversationTitle(sbn))
+                            .put("body", preview.body).put("kind", historySources.getValue(notificationIdentity).kind)
+                            .put("knownTexts", org.json.JSONArray()).toString())
+                } else null
+                store.enqueue(expectedDeviceId, id, seq, createdAt, SyncProtocol.envelopeJson(envelope), assetsJson, sbn.userId, replyTarget, conversationSendCapable, historyForward)
             } catch (failure: Exception) {
                 recordSyncDiagnostic("DB_ENQUEUE_FAILED", failure)
                 return
@@ -182,6 +221,8 @@ class WechatNotificationListenerService : NotificationListenerService() {
                 recordSyncDiagnostic("PERSISTED_IDENTITY_FAILED", failure)
                 return
             }
+            if (historySources.containsKey(notificationIdentity)) scheduleHistoryDrain()
+            else store.noteHistoryText(expectedDeviceId, sbn.key, sbn.postTime, ChatHistoryForwardPolicy.notificationBody(preview))
             when (SyncNetwork.uploadPending(this, expectedDeviceId)) {
                 SyncNetwork.UploadResult.Retry -> try {
                     SyncNetwork.enqueue(this)
@@ -195,7 +236,180 @@ class WechatNotificationListenerService : NotificationListenerService() {
         }
     }
 
+    private fun scheduleHistoryDrain() {
+        if (!historyDrainScheduled.compareAndSet(false, true)) return
+        try {
+            historyExecutor.execute {
+                val store = SyncStore.get(this)
+                var expectedDeviceId: String? = null
+                var activeTask: HistoryForwardTask? = null
+                try {
+                    if (!store.paired()) return@execute
+                    val deviceId = store.deviceId()
+                    expectedDeviceId = deviceId
+                    // Let immediately following notifications reach the encrypted text queue before opening WeChat.
+                    Thread.sleep(1_000)
+                    while (!Thread.currentThread().isInterrupted && store.isCurrentDevice(deviceId)) {
+                        val tasks = store.pendingHistoryTasks(deviceId)
+                        tasks.forEach {
+                            val kind = JSONObject(store.historyTaskPayload(deviceId, it)).optString("kind", "history")
+                            historySources.putIfAbsent(it.id, HistorySource(it.sourceKey, it.postTime, null, kind))
+                        }
+                        val task = tasks.firstOrNull() ?: break
+                        activeTask = task
+                        val payload = JSONObject(store.historyTaskPayload(deviceId, task))
+                        val voice = payload.optString("kind", "history") == "voice"
+                        val title = payload.getString("conversationTitle")
+                        val sender = payload.getString("sender")
+                        val freshnessTime = payload.optLong("manualRetryAt", task.postTime)
+                        store.historyTaskState(deviceId, task.id, SyncStore.HistoryRunning, "OPENING")
+                        val cachedResult = payload.optJSONObject("voiceResult")
+                        if (voice && cachedResult != null) {
+                            val completed = queueVoiceResult(task, title, sender, AccessibilityReplyResult(
+                                cachedResult.getString("status"), cachedResult.getString("stage"),
+                                transcript = cachedResult.optString("transcript").takeIf(String::isNotBlank)))
+                            historySources.remove(task.id)
+                            activeTask = null
+                            if (!completed) { Thread.sleep(10_000); break }
+                            continue
+                        }
+                        if (System.currentTimeMillis() - freshnessTime !in 0..120_000) {
+                            val completed = if (voice) queueVoiceResult(task, title, sender, AccessibilityReplyResult("FAILED", "SOURCE_EXPIRED"))
+                            else { store.historyTaskState(deviceId, task.id, SyncStore.HistoryFailed, "SOURCE_EXPIRED"); true }
+                            historySources.remove(task.id)
+                            activeTask = null
+                            if (!completed) { Thread.sleep(10_000); break }
+                            continue
+                        }
+                        val contentIntent = historySources[task.id]?.contentIntent?.takeIf { it.creatorPackage == NotificationSnapshot.WechatPackage }
+                        val isCurrent = { ProbeRuntime.listenerConnected && store.isCurrentDevice(deviceId) && System.currentTimeMillis() - freshnessTime in 0..120_000 &&
+                            historySources.none { (id, source) -> id != task.id && source.sourceKey == task.sourceKey && source.postTime == task.postTime } }
+                        val cardsAfter = { historySources.values.count { it.sourceKey == task.sourceKey && it.kind == (if (voice) "voice" else "history") && it.postTime > task.postTime } }
+                        val deadline = android.os.SystemClock.uptimeMillis() + 30_000
+                        var result: AccessibilityReplyResult
+                        do {
+                            result = if (voice) LockscreenAccessibilityReplyService.executeVoiceTranscription(
+                                contentIntent, Privacy.saltedHash(title, Privacy.salt(this)), title, sender,
+                                task.wechatUserId, task.wechatUserSerial, isCurrent, cardsAfter,
+                                { texts -> queueRecoveredHistoryTexts(task, title, sender, texts) },
+                                VoiceTranscriptionPolicy.notificationDuration(Preview(sender, payload.getString("body"), "text")),
+                            ) else LockscreenAccessibilityReplyService.executeHistoryForward(
+                                contentIntent, Privacy.saltedHash(title, Privacy.salt(this)), title, sender,
+                                task.wechatUserId, task.wechatUserSerial, isCurrent,
+                                { store.claimHistorySend(deviceId, task.id) }, cardsAfter,
+                                { texts -> queueRecoveredHistoryTexts(task, title, sender, texts) },
+                            )
+                            if (result.stage != "ACCESSIBILITY_BUSY" || !isCurrent() || android.os.SystemClock.uptimeMillis() >= deadline) break
+                            Thread.sleep(250)
+                        } while (isCurrent())
+                        val sending = store.findHistoryTask(deviceId, task.id)?.state == SyncStore.HistorySending
+                        val state = if (result.status == "HISTORY_FORWARDED") SyncStore.HistorySent
+                            else if (sending) SyncStore.HistoryUnknown else SyncStore.HistoryFailed
+                        val completed = if (voice) queueVoiceResult(task, title, sender, result)
+                        else { store.historyTaskState(deviceId, task.id, state, result.stage); true }
+                        historySources.remove(task.id)
+                        activeTask = null
+                        recordSyncDiagnostic("${if (voice) "VOICE" else "HISTORY"}_${result.stage}")
+                        if (!completed) { Thread.sleep(10_000); break }
+                    }
+                } catch (failure: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } catch (failure: Exception) {
+                    recordSyncDiagnostic("HISTORY_FORWARD_FAILED", failure)
+                } finally {
+                    activeTask?.let { task ->
+                        if (store.isCurrentDevice(task.deviceId)) {
+                            val state = store.findHistoryTask(task.deviceId, task.id)?.state
+                            if (state in setOf(SyncStore.HistoryRunning, SyncStore.HistorySending)) {
+                                store.historyTaskState(task.deviceId, task.id, if (state == SyncStore.HistorySending) SyncStore.HistoryUnknown else SyncStore.HistoryFailed, "WORKFLOW_INTERRUPTED")
+                            }
+                        }
+                        historySources.remove(task.id)
+                    }
+                    historyDrainScheduled.set(false)
+                    expectedDeviceId?.takeIf(store::isCurrentDevice)?.let { deviceId ->
+                        ProbeRuntime.historyQueueStatus = store.historyTaskCounts(deviceId).entries.joinToString { "${it.key}=${it.value}" }.ifEmpty { "空" }
+                        if (!historyExecutor.isShutdown && store.pendingHistoryTasks(deviceId).isNotEmpty()) scheduleHistoryDrain()
+                    }
+                }
+            }
+        } catch (failure: Exception) {
+            historyDrainScheduled.set(false)
+            recordSyncDiagnostic("HISTORY_EXECUTOR_UNAVAILABLE", failure)
+        }
+    }
+
+    private fun queueVoiceResult(task: HistoryForwardTask, title: String, sender: String, result: AccessibilityReplyResult): Boolean {
+        // Wait on the existing text executor so trailing-text recovery and result completion remain ordered.
+        return syncExecutor.submit<Boolean> {
+            val store = SyncStore.get(this)
+            if (!store.isCurrentDevice(task.deviceId)) return@submit true
+            store.cacheVoiceResult(task, result)
+            val succeeded = result.status == "VOICE_TRANSCRIBED" && !result.transcript.isNullOrBlank()
+            val previews = VoiceResultMessages.previews(sender, task.postTime, result.transcript.takeIf { succeeded }, result.stage)
+            val entries = previews.map { preview ->
+                val id = SyncProtocol.uuidV7()
+                val seq = store.nextSeq(task.deviceId)
+                val createdAt = System.currentTimeMillis()
+                val encryption = store.messageEncryptionContext(task.deviceId)
+                val envelope = try { SyncProtocol.encrypt(encryption.a2iKey, id, task.deviceId, seq, createdAt, preview, task.wechatUserId) }
+                    finally { encryption.a2iKey.fill(0) }
+                val target = ReplyTarget(id, task.sourceKey, task.postTime, -1, createdAt, task.wechatUserId, task.wechatUserSerial,
+                    ReplyRoutes.Accessibility, Privacy.saltedHash(title, Privacy.salt(this)))
+                SyncQueueItem(id, task.deviceId, seq, createdAt, SyncProtocol.envelopeJson(envelope), "[]", task.wechatUserId, true, true, SyncStore.Queued) to target
+            }
+            if (!store.completeVoiceTask(task, entries, succeeded, result.stage)) {
+                recordSyncDiagnostic("VOICE_RESULT_QUEUE_FULL")
+                SyncNetwork.enqueue(this)
+                return@submit false
+            }
+            recordSyncDiagnostic(if (succeeded) "VOICE_TRANSCRIPT_QUEUED" else "VOICE_FAILURE_QUEUED")
+            try {
+                if (SyncNetwork.uploadPending(this, task.deviceId) == SyncNetwork.UploadResult.Retry) SyncNetwork.enqueue(this)
+                else if (store.paired() && store.isCurrentDevice(task.deviceId)) recordSyncDiagnostic(if (succeeded) "VOICE_TRANSCRIPT_SERVER_ACCEPTED" else "VOICE_FAILURE_SERVER_ACCEPTED")
+            } catch (failure: Exception) {
+                recordSyncDiagnostic("VOICE_UPLOAD_RETRY", failure)
+                SyncNetwork.enqueue(this)
+            }
+            true
+        }.get()
+    }
+
+    private fun queueRecoveredHistoryTexts(task: HistoryForwardTask, title: String, sender: String, texts: List<String>) {
+        if (texts.isEmpty()) return
+        syncExecutor.execute {
+            val store = SyncStore.get(this)
+            try {
+                if (!store.isCurrentDevice(task.deviceId)) return@execute
+                val current = store.findHistoryTask(task.deviceId, task.id) ?: return@execute
+                val known = JSONObject(store.historyTaskPayload(task.deviceId, current)).optJSONArray("knownTexts")
+                val notified = (0 until (known?.length() ?: 0)).map { requireNotNull(known).getString(it) }
+                for ((index, text) in ChatHistoryForwardPolicy.missingTexts(texts, notified)) {
+                    val preview = SyncProtocol.normalizePreview(sender, text, "text")
+                    val id = SyncProtocol.uuidV7()
+                    val seq = store.nextSeq(task.deviceId)
+                    val createdAt = System.currentTimeMillis()
+                    val encryption = store.messageEncryptionContext(task.deviceId)
+                    val envelope = try { SyncProtocol.encrypt(encryption.a2iKey, id, task.deviceId, seq, createdAt, preview, task.wechatUserId) }
+                        finally { encryption.a2iKey.fill(0) }
+                    val target = ReplyTarget(id, task.sourceKey, task.postTime, -1, createdAt, task.wechatUserId, task.wechatUserSerial,
+                        ReplyRoutes.Accessibility, Privacy.saltedHash(title, Privacy.salt(this)))
+                    if (!store.enqueue(task.deviceId, id, seq, createdAt, SyncProtocol.envelopeJson(envelope), wechatUserId = task.wechatUserId,
+                            replyTarget = target, conversationSendCapable = true, historyRecovery = task.id to text)) {
+                        recordSyncDiagnostic("HISTORY_TEXT_QUEUE_REJECTED")
+                        break
+                    }
+                    recordSyncDiagnostic("HISTORY_TEXT_RECOVERED_$index")
+                }
+                if (SyncNetwork.uploadPending(this, task.deviceId) == SyncNetwork.UploadResult.Retry) SyncNetwork.enqueue(this)
+            } catch (failure: Exception) {
+                recordSyncDiagnostic("HISTORY_TEXT_RECOVERY_FAILED", failure)
+            }
+        }
+    }
+
     private fun recordSyncDiagnostic(stage: String, failure: Exception? = null) {
+        if (stage.startsWith("HISTORY_") || stage.startsWith("VOICE_")) ProbeRuntime.lastDiagnostic = stage
         try {
             val event = JSONObject()
                 .put("eventType", "syncDiagnostic")
@@ -240,6 +454,8 @@ class WechatNotificationListenerService : NotificationListenerService() {
         ProbeRuntime.listenerConnected = false
         stopReplyPolling()
         syncExecutor.shutdown()
+        historySources.clear()
+        historyExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -248,6 +464,10 @@ class WechatNotificationListenerService : NotificationListenerService() {
             ActionScanCandidates -> scanRemoteInputCandidates()
             ActionStartReplyPolling -> startReplyPolling()
             ActionReply -> ProbeRuntime.takeOneTimeReply()?.let(::executeOneTimeReply)
+            ActionRetryVoice -> syncExecutor.execute {
+                val store = SyncStore.get(this)
+                if (store.paired() && store.retryLatestFailedVoice(store.deviceId())) scheduleHistoryDrain()
+            }
         }
         stopSelf(startId)
         return START_NOT_STICKY
@@ -526,6 +746,7 @@ class WechatNotificationListenerService : NotificationListenerService() {
         private const val ActionScanCandidates = "com.aurora.wechatrelay.probe.SCAN_REMOTE_INPUT"
         private const val ActionStartReplyPolling = "com.aurora.wechatrelay.probe.START_REPLY_POLLING"
         private const val ActionReply = "com.aurora.wechatrelay.probe.ONE_TIME_REPLY"
+        private const val ActionRetryVoice = "com.aurora.wechatrelay.probe.RETRY_LATEST_VOICE"
         private const val ReplyPollFailureBackoffMillis = 5_000L
 
         fun requestCandidateScan(context: Context) {
@@ -534,6 +755,9 @@ class WechatNotificationListenerService : NotificationListenerService() {
 
         fun requestReplyPolling(context: Context) {
             context.startService(Intent(context, WechatNotificationListenerService::class.java).setAction(ActionStartReplyPolling))
+        }
+        fun requestLatestVoiceRetry(context: Context) {
+            context.startService(Intent(context, WechatNotificationListenerService::class.java).setAction(ActionRetryVoice))
         }
 
         fun requestOneTimeReply(context: Context, candidate: RemoteInputCandidate, replyText: String) {

@@ -16,6 +16,7 @@ object ProbeRuntime {
     @Volatile var lastCaptureMillis: Long? = null
     @Volatile var lastReplyStatus: String = "尚未启动"
     @Volatile var lastDiagnostic: String = "暂无异常"
+    @Volatile var historyQueueStatus: String = "尚未检查"
     @Volatile var remoteInputCandidates: List<RemoteInputCandidate> = emptyList()
 
     private var replyUsed = false

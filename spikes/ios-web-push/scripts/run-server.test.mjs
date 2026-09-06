@@ -10,8 +10,8 @@ test("development rejects production targets and keeps file keys stable", () => 
     STORAGE_KEY: "test-only", VAPID_PUBLIC_KEY: "test-only", VAPID_PRIVATE_KEY: "test-only"
   };
   const encode = (env) => Object.entries(env).map(([key, value]) => `${key}=${value}`).join("\n");
-  assert.deepEqual(serverEnvironment(encode(config), "development"), config);
-  assert.deepEqual(serverEnvironment(encode({ ...config, MYSQL_DEV_ROOT_PASSWORD: "test-only" }), "development"), config);
+  assert.deepEqual({ ...serverEnvironment(encode(config), "development") }, config);
+  assert.deepEqual({ ...serverEnvironment(encode({ ...config, MYSQL_DEV_ROOT_PASSWORD: "test-only" }), "development") }, config);
   assert.deepEqual(serverEnvironment(encode(config), "development"), serverEnvironment(encode(config), "development"));
   for (const change of [
     { NODE_ENV: "production" }, { MYSQL_HOST: "db.example.com" }, { MYSQL_PORT: "3306" },
@@ -19,7 +19,7 @@ test("development rejects production targets and keeps file keys stable", () => 
     { STORAGE_KEY: "" }, { MYSQL_PASSWORD: "" }
   ]) assert.throws(() => serverEnvironment(encode({ ...config, ...change }), "development"));
   const production = { ...config, NODE_ENV: "production", PUBLIC_ORIGIN: "https://relay.example.com" };
-  assert.deepEqual(serverEnvironment(encode(production), "production"), production);
+  assert.deepEqual({ ...serverEnvironment(encode(production), "production") }, production);
   assert.throws(() => serverEnvironment(encode(production), "development"));
   assert.throws(() => serverEnvironment(encode(config), "production"));
   assert.throws(() => serverEnvironment(encode(config), "unknown"));

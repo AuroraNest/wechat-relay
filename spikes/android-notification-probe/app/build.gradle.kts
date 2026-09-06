@@ -32,8 +32,8 @@ android {
         applicationId = "com.aurora.wechatrelay.probe"
         minSdk = 28
         targetSdk = 36
-        versionCode = 30
-        versionName = "0.6.13"
+        versionCode = 42
+        versionName = "0.6.25"
 
         buildConfigField("String", "RELAY_ORIGIN", "\"$relayOrigin\"")
 

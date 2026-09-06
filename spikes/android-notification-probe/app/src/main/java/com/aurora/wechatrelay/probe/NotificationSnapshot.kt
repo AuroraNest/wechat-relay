@@ -102,12 +102,16 @@ object NotificationSnapshot {
         category == Notification.CATEGORY_MESSAGE && !isGroupSummary
 
     fun conversationTitleHash(context: android.content.Context, sbn: StatusBarNotification): String {
+        val title = conversationTitle(sbn)
+        return title.takeIf(String::isNotEmpty)?.let { Privacy.saltedHash(it, Privacy.salt(context)) }.orEmpty()
+    }
+
+    fun conversationTitle(sbn: StatusBarNotification): String {
         val extras = sbn.notification.extras ?: Bundle.EMPTY
-        val title = LockscreenReplySelectors.normalizeTitle(
+        return LockscreenReplySelectors.normalizeTitle(
             extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)
                 ?: extras.getCharSequence(Notification.EXTRA_TITLE),
         )
-        return title.takeIf(String::isNotEmpty)?.let { Privacy.saltedHash(it, Privacy.salt(context)) }.orEmpty()
     }
 
     internal fun targetMatches(

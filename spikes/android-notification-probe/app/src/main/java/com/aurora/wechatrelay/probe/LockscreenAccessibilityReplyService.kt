@@ -2,6 +2,7 @@ package com.aurora.wechatrelay.probe
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.accessibilityservice.GestureDescription
 import android.app.Activity
 import android.app.KeyguardManager
 import android.app.PendingIntent
@@ -10,6 +11,7 @@ import android.content.pm.LauncherApps
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.os.Bundle
 import android.os.Build
@@ -29,17 +31,21 @@ data class AccessibilityReplyResult(
     val stage: String,
     val media: MediaCandidate? = null,
     val startedLocked: Boolean = false,
+    val transcript: String? = null,
 )
 
 class LockscreenAccessibilityReplyService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private val pinStore by lazy { LockscreenPinStore(this) }
     private val pinTick = Runnable { session?.let(::clickNextPinDigit) }
+    private val historyTick = Runnable { session?.let(::processWechatWindow) }
     @Volatile private var session: Session? = null
 
     private enum class Phase {
         Unlocking, FindingSearch, EnteringSearch, SelectingResult, OpeningWechat,
         OpeningImageViewer, WaitingOriginalView,
+        HistoryViewer, HistoryMenu, HistorySearch, HistoryResult, HistoryConfirm, HistoryClaiming, HistoryVerify, HistoryReturnSource,
+        VoiceMenu, VoiceWaitingTranscript, VoiceLongPressing, VoiceCopyMenu, VoiceClipboardReading,
         ReadyToClick, Verifying, Capturing, Finishing,
     }
 
@@ -58,6 +64,22 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         val expectedImageBounds: CaptureRect,
     )
 
+    private data class VoiceSourceSelection(
+        val windowId: Int,
+        val identity: String,
+        val selection: VoiceTranscriptionPolicy.PinnedVoiceSelection,
+        val row: AccessibilityNodeInfo,
+        val voice: AccessibilityNodeInfo,
+        val viewport: Rect,
+    )
+
+    private data class VoiceRowMarker(
+        val signature: String,
+        val row: AccessibilityNodeInfo,
+        val voice: AccessibilityNodeInfo,
+        val avatar: AccessibilityNodeInfo,
+    )
+
     private data class Session(
         val contentIntent: PendingIntent?,
         val expectedTitleHash: String,
@@ -67,6 +89,16 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         val replyText: CharArray?,
         val imageSender: CharArray?,
         val imageIsCurrent: (() -> Boolean)?,
+        val historySender: String?,
+        val historyIsCurrent: (() -> Boolean)?,
+        val historyClaimSend: (() -> Boolean)?,
+        val historyCardsAfter: (() -> Int)?,
+        val historyCaptureTexts: ((List<String>) -> Unit)?,
+        val voiceSender: String?,
+        val voiceExpectedDuration: String?,
+        val voiceIsCurrent: (() -> Boolean)?,
+        val voiceVoicesAfter: (() -> Int)?,
+        val voiceCaptureTexts: ((List<String>) -> Unit)?,
         val pin: CharArray,
         val startedLocked: Boolean,
         val completion: CountDownLatch,
@@ -97,9 +129,28 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         var originalViewDeadlineMillis: Long = 0L,
         var originalViewStableSinceMillis: Long = 0L,
         var capturedMedia: MediaCandidate? = null,
+        var historyCardHash: String? = null,
+        var historySourceIdentity: String? = null,
+        var historyStableSince: Long = 0L,
+        var historyCardTitle: String? = null,
+        var historyReportedTexts: List<String> = emptyList(),
+        var voiceSourceIdentity: String? = null,
+        var voiceSelection: VoiceTranscriptionPolicy.PinnedVoiceSelection? = null,
+        var voiceSourceNode: AccessibilityNodeInfo? = null,
+        var voiceWindowId: Int = -1,
+        var voiceSourceStableSince: Long = 0L,
+        var voiceTranscript: String? = null,
+        var voiceTranscriptStableSince: Long = 0L,
+        var voiceReportedTexts: List<String> = emptyList(),
+        var voiceCopyAt: Long = 0L,
+        var voiceWaitObservation: String? = null,
+        var voiceRevealAt: Long = 0L,
+        var unlockedForWorkflow: Boolean = false,
         @Volatile var result: AccessibilityReplyResult? = null,
     ) {
         val isImageCapture: Boolean get() = imageSender != null
+        val isHistoryForward: Boolean get() = historySender != null
+        val isVoiceTranscription: Boolean get() = voiceSender != null
     }
 
     override fun onServiceConnected() {
@@ -109,6 +160,15 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val active = session ?: return
+        if (active.isVoiceTranscription && active.phase == Phase.VoiceWaitingTranscript &&
+            event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            VoiceTranscriptionPolicy.isFailureDialog(event.packageName?.toString(), event.className?.toString(), event.text.map(CharSequence::toString)) &&
+            active.voiceIsCurrent?.invoke() == true
+        ) {
+            recordAccessibilityStage("VOICE_TRANSCRIPTION_FAILED")
+            finishSession("FAILED", "VOICE_TRANSCRIPTION_FAILED")
+            return
+        }
         when (event?.packageName?.toString()) {
             SystemUiPackage -> if (active.phase == Phase.Unlocking) schedulePinTick(active)
             NotificationSnapshot.WechatPackage -> if (active.phase in setOf(
@@ -120,6 +180,8 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                     Phase.WaitingOriginalView,
                     Phase.Verifying,
                     Phase.Capturing,
+                    Phase.HistoryViewer, Phase.HistoryMenu, Phase.HistorySearch, Phase.HistoryResult, Phase.HistoryConfirm, Phase.HistoryVerify, Phase.HistoryReturnSource,
+                    Phase.VoiceMenu, Phase.VoiceWaitingTranscript, Phase.VoiceCopyMenu,
                 )) {
                 processWechatWindow(active)
             }
@@ -149,6 +211,16 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         replyText: String?,
         imageSender: String? = null,
         imageIsCurrent: (() -> Boolean)? = null,
+        historySender: String? = null,
+        historyIsCurrent: (() -> Boolean)? = null,
+        historyClaimSend: (() -> Boolean)? = null,
+        historyCardsAfter: (() -> Int)? = null,
+        historyCaptureTexts: ((List<String>) -> Unit)? = null,
+        voiceSender: String? = null,
+        voiceExpectedDuration: String? = null,
+        voiceIsCurrent: (() -> Boolean)? = null,
+        voiceVoicesAfter: (() -> Int)? = null,
+        voiceCaptureTexts: ((List<String>) -> Unit)? = null,
     ): AccessibilityReplyResult {
         val keyguard = getSystemService(KeyguardManager::class.java)
         val userManager = getSystemService(UserManager::class.java)
@@ -163,7 +235,11 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
             (contentIntent != null && contentIntent.creatorPackage != NotificationSnapshot.WechatPackage) ||
             (contentIntent == null && (conversationTitle.isNullOrBlank() || !NotificationSnapshot.isAllowedWechatUserId(wechatUserId))) ||
             (isImageCapture && (contentIntent == null || imageSender.isNullOrEmpty() || imageIsCurrent == null || !NotificationSnapshot.isAllowedWechatUserId(wechatUserId))) ||
-            (!isImageCapture && replyText == null)
+            (historySender != null && (conversationTitle.isNullOrBlank() ||
+                historyIsCurrent == null || historyClaimSend == null || !NotificationSnapshot.isAllowedWechatUserId(wechatUserId))) ||
+            (voiceSender != null && (voiceSender.isEmpty() || conversationTitle.isNullOrBlank() || voiceIsCurrent == null || voiceVoicesAfter == null ||
+                !NotificationSnapshot.isAllowedWechatUserId(wechatUserId))) ||
+            (!isImageCapture && historySender == null && voiceSender == null && replyText == null)
         ) {
             return AccessibilityReplyResult("WECHAT_ACTION_CHANGED", "TARGET_PRECHECK_FAILED")
         }
@@ -200,6 +276,16 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                         replyText = replyText?.toCharArray(),
                         imageSender = imageSender?.toCharArray(),
                         imageIsCurrent = imageIsCurrent,
+                        historySender = historySender,
+                        historyIsCurrent = historyIsCurrent,
+                        historyClaimSend = historyClaimSend,
+                        historyCardsAfter = historyCardsAfter,
+                        historyCaptureTexts = historyCaptureTexts,
+                        voiceSender = voiceSender,
+                        voiceExpectedDuration = voiceExpectedDuration,
+                        voiceIsCurrent = voiceIsCurrent,
+                        voiceVoicesAfter = voiceVoicesAfter,
+                        voiceCaptureTexts = voiceCaptureTexts,
                         pin = pin,
                         startedLocked = startedLocked,
                         completion = completion,
@@ -285,6 +371,8 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
     }
 
     private fun workflowTimeoutStage(active: Session): String {
+        if (active.isHistoryForward) return "HISTORY_TIMEOUT_${active.phase.name.uppercase()}"
+        if (active.isVoiceTranscription) return "VOICE_TIMEOUT_${active.phase.name.uppercase()}"
         if (!active.isImageCapture) return "WORKFLOW_TIMEOUT"
         return when (active.phase) {
             Phase.Unlocking -> "WORKFLOW_TIMEOUT_UNLOCKING"
@@ -360,6 +448,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         val active = session ?: return false
         if (!active.cancellation.canAct() || active.phase != Phase.Unlocking) return false
         if (AccessibilityReplyPolicy.requiresPinEntry(getSystemService(KeyguardManager::class.java).isDeviceLocked)) return false
+        active.unlockedForWorkflow = true
         return try {
             val sent = active.cancellation.runIfActive {
                 if (active.contentIntent != null) {
@@ -371,6 +460,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
             } == true
             if (!sent) return false
             active.phase = if (active.contentIntent == null) Phase.FindingSearch else Phase.OpeningWechat
+            if (active.isHistoryForward || active.isVoiceTranscription) handler.postDelayed(historyTick, UiSettleMillis)
             handler.postDelayed({
                 if (session === active && active.phase !in setOf(
                         Phase.OpeningImageViewer,
@@ -379,8 +469,14 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                         Phase.Verifying,
                         Phase.Capturing,
                         Phase.Finishing,
+                        Phase.HistoryViewer, Phase.HistoryMenu, Phase.HistorySearch, Phase.HistoryResult, Phase.HistoryConfirm, Phase.HistoryClaiming, Phase.HistoryVerify, Phase.HistoryReturnSource,
+                        Phase.VoiceMenu, Phase.VoiceWaitingTranscript, Phase.VoiceLongPressing, Phase.VoiceCopyMenu, Phase.VoiceClipboardReading,
                     )) {
-                    finishSession("FAILED", if (active.isImageCapture) "WECHAT_WINDOW_TIMEOUT_OPENING_CHAT" else "WECHAT_WINDOW_TIMEOUT")
+                    finishSession("FAILED", when {
+                        active.isImageCapture -> "WECHAT_WINDOW_TIMEOUT_OPENING_CHAT"
+                        active.isVoiceTranscription -> "VOICE_WINDOW_TIMEOUT_OPENING_CHAT"
+                        else -> "WECHAT_WINDOW_TIMEOUT"
+                    })
                 }
             }, WechatWindowTimeoutMillis)
             true
@@ -464,6 +560,18 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
 
     private fun processWechatWindow(active: Session) {
         if (session !== active || !active.cancellation.canAct()) return
+        if (active.isHistoryForward) {
+            if (active.phase in setOf(Phase.FindingSearch, Phase.EnteringSearch, Phase.SelectingResult)) {
+                processConversationSearch(active, rootsForPackage(NotificationSnapshot.WechatPackage))
+            } else processHistoryForward(active)
+            return
+        }
+        if (active.isVoiceTranscription) {
+            if (active.phase in setOf(Phase.FindingSearch, Phase.EnteringSearch, Phase.SelectingResult)) {
+                processConversationSearch(active, rootsForPackage(NotificationSnapshot.WechatPackage))
+            } else processVoiceTranscription(active)
+            return
+        }
         val roots = rootsForPackage(NotificationSnapshot.WechatPackage)
         if (active.phase in setOf(Phase.FindingSearch, Phase.EnteringSearch, Phase.SelectingResult)) {
             processConversationSearch(active, roots)
@@ -971,6 +1079,484 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
 
     private fun Rect.toCaptureRect(): CaptureRect = CaptureRect(left, top, right, bottom)
 
+    private fun processHistoryForward(active: Session) {
+        if (session !== active || !active.cancellation.canAct() || active.phase == Phase.Finishing) return
+        if (!active.cancellation.isCommitted() && active.historyIsCurrent?.invoke() != true) {
+            finishSession("WECHAT_ACTION_CHANGED", "HISTORY_SOURCE_CHANGED")
+            return
+        }
+        val root = rootInActiveWindow?.takeIf { it.packageName?.toString() == NotificationSnapshot.WechatPackage }
+        val nodes = root?.let(::walk).orEmpty().filter { it.isVisibleToUser }
+        if (root != null) when (active.phase) {
+            Phase.OpeningWechat -> {
+                val card = historySourceCard(active, nodes)
+                if (card != null) {
+                    val hash = historyCardHash(walk(card)) ?: return finishSession("FAILED", "HISTORY_CARD_AMBIGUOUS")
+                    captureHistoryTrailingTexts(active, card, nodes)
+                    val identity = "${root.windowId}|$hash"
+                    val now = SystemClock.uptimeMillis()
+                    if (active.historySourceIdentity == null) {
+                        active.historySourceIdentity = identity
+                        active.historyStableSince = now
+                    } else if (active.historySourceIdentity != identity) {
+                        return finishSession("WECHAT_ACTION_CHANGED", "HISTORY_CARD_CHANGED")
+                    } else if (now - active.historyStableSince >= ViewerSettleMillis) {
+                        active.historyCardHash = hash
+                        active.historyCardTitle = walk(card).singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/obc" }?.text?.toString()
+                        active.phase = Phase.HistoryViewer
+                        recordAccessibilityStage("HISTORY_OPEN_CARD")
+                        if (active.cancellation.runIfActive { card.performAction(AccessibilityNodeInfo.ACTION_CLICK) } != true) {
+                            return finishSession("FAILED", "HISTORY_CARD_OPEN_FAILED")
+                        }
+                    }
+                } else if (active.historySourceIdentity != null) {
+                    // A notification can briefly rebuild the list. Keep the pinned identity and restart settling.
+                    active.historyStableSince = SystemClock.uptimeMillis()
+                }
+            }
+            Phase.HistoryViewer -> {
+                if (isHistoryViewer(active, nodes)) {
+                    val more = nodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/fq" &&
+                        it.contentDescription?.toString() == "更多信息" && it.isClickable && it.isEnabled }
+                    if (more != null) {
+                        active.phase = Phase.HistoryMenu
+                        if (active.cancellation.runIfActive { more.performAction(AccessibilityNodeInfo.ACTION_CLICK) } != true) {
+                            return finishSession("FAILED", "HISTORY_VIEWER_MENU_FAILED")
+                        }
+                    }
+                }
+            }
+            Phase.HistoryMenu -> {
+                val controls = nodes.filter { it.viewIdResourceName == "com.tencent.mm:id/obc" && it.text?.toString() == "发送给朋友" }
+                    .mapNotNull(::clickableAncestor).distinctBy(::nodeIdentity)
+                if (controls.size > 1) return finishSession("FAILED", "HISTORY_MENU_AMBIGUOUS")
+                controls.singleOrNull()?.let { control ->
+                    active.phase = Phase.HistorySearch
+                    if (active.cancellation.runIfActive { control.performAction(AccessibilityNodeInfo.ACTION_CLICK) } != true) {
+                        return finishSession("FAILED", "HISTORY_MENU_CLICK_FAILED")
+                    }
+                }
+            }
+            Phase.HistorySearch -> {
+                val noticeTitle = nodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/jlo" }
+                val noticeBody = nodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/jlg" }
+                val acknowledge = nodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/mm_alert_ok_btn" && it.isClickable && it.isEnabled }
+                if (ChatHistoryForwardPolicy.isForwardTranslationNotice(noticeTitle?.text, noticeBody?.text, acknowledge?.text)) {
+                    if (active.cancellation.runIfActive { acknowledge?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true } != true) {
+                        return finishSession("FAILED", "HISTORY_NOTICE_DISMISS_FAILED")
+                    }
+                    recordAccessibilityStage("HISTORY_TRANSLATION_NOTICE_DISMISSED")
+                }
+                if (nodes.any { it.viewIdResourceName == "android:id/text1" && it.text?.toString() == "选择聊天" }) {
+                    val input = nodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/k13" && it.isEditable && it.isEnabled }
+                    if (input != null) {
+                        val arguments = Bundle().apply {
+                            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, ChatHistoryForwardPolicy.TargetGroup)
+                        }
+                        active.phase = Phase.HistoryResult
+                        if (active.cancellation.runIfActive { input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments) } != true) {
+                            return finishSession("FAILED", "HISTORY_SEARCH_FAILED")
+                        }
+                    }
+                }
+            }
+            Phase.HistoryResult -> {
+                val input = nodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/k13" && it.isEditable }
+                if (input?.text?.toString() == ChatHistoryForwardPolicy.TargetGroup) {
+                    val results = nodes.filter { it.viewIdResourceName == "com.tencent.mm:id/kbq" && it.text?.toString() == ChatHistoryForwardPolicy.TargetGroup }
+                        .mapNotNull(::clickableAncestor).distinctBy(::nodeIdentity)
+                    if (results.size > 1) return finishSession("FAILED", "HISTORY_GROUP_AMBIGUOUS")
+                    val result = results.singleOrNull()
+                    if (result != null) {
+                        val groupCount = walk(result).count { it.viewIdResourceName == "com.tencent.mm:id/vh8" &&
+                            Regex("\\([1-9]\\d*人\\)").matches(it.text?.toString().orEmpty()) }
+                        if (groupCount != 1) return finishSession("FAILED", "HISTORY_RESULT_NOT_GROUP")
+                        active.phase = Phase.HistoryConfirm
+                        if (active.cancellation.runIfActive { result.performAction(AccessibilityNodeInfo.ACTION_CLICK) } != true) {
+                            return finishSession("FAILED", "HISTORY_GROUP_CLICK_FAILED")
+                        }
+                    }
+                }
+            }
+            Phase.HistoryConfirm -> {
+                val send = nodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/b08" && it.text?.toString() == "发送" && it.isClickable && it.isEnabled }
+                if (send != null) {
+                    val recipients = nodes.filter { it.viewIdResourceName == "com.tencent.mm:id/kbq" }
+                    if (recipients.size != 1 || !ChatHistoryForwardPolicy.matchesChatTitle(recipients.single().text, ChatHistoryForwardPolicy.TargetGroup) ||
+                        historyCardHash(nodes) != active.historyCardHash) {
+                        return finishSession("FAILED", "HISTORY_CONFIRM_MISMATCH")
+                    }
+                    active.phase = Phase.HistoryClaiming
+                    val windowId = root.windowId
+                    // Persist SENDING off the main thread, then re-read the dialog before the irreversible click.
+                    ImageExecutor.execute {
+                        val claimed = runCatching { active.historyClaimSend?.invoke() == true }.getOrDefault(false)
+                        handler.post {
+                            if (session !== active || active.phase != Phase.HistoryClaiming || !active.cancellation.canAct()) return@post
+                            val currentRoot = rootInActiveWindow?.takeIf { it.packageName?.toString() == NotificationSnapshot.WechatPackage && it.windowId == windowId }
+                            val currentNodes = currentRoot?.let(::walk).orEmpty().filter { it.isVisibleToUser }
+                            val currentRecipient = currentNodes.filter { it.viewIdResourceName == "com.tencent.mm:id/kbq" }
+                            val currentSend = currentNodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/b08" && it.text?.toString() == "发送" && it.isClickable && it.isEnabled }
+                            if (!claimed || currentSend == null || currentRecipient.size != 1 ||
+                                !ChatHistoryForwardPolicy.matchesChatTitle(currentRecipient.single().text, ChatHistoryForwardPolicy.TargetGroup) ||
+                                historyCardHash(currentNodes) != active.historyCardHash) {
+                                finishSession("FAILED", "HISTORY_SEND_UNCERTAIN_NO_RETRY")
+                                return@post
+                            }
+                            active.phase = Phase.HistoryVerify
+                            active.clickAt = System.currentTimeMillis()
+                            if (!active.cancellation.commitIfActive { active.historyIsCurrent?.invoke() == true && currentSend.performAction(AccessibilityNodeInfo.ACTION_CLICK) }) {
+                                finishSession("FAILED", "HISTORY_SEND_UNCERTAIN_NO_RETRY")
+                            }
+                        }
+                    }
+                }
+            }
+            Phase.HistoryVerify -> {
+                if (nodes.none { it.viewIdResourceName == "com.tencent.mm:id/b08" } && isHistoryViewer(active, nodes)) {
+                    active.phase = Phase.HistoryReturnSource
+                    active.clickAt = System.currentTimeMillis()
+                    if (!performGlobalAction(GLOBAL_ACTION_BACK)) return finishSession("FAILED", "HISTORY_RETURN_SOURCE_FAILED")
+                }
+                if (System.currentTimeMillis() - active.clickAt >= AcceptanceTimeoutMillis) {
+                    return finishSession("FAILED", "HISTORY_ACCEPTANCE_UNCERTAIN_NO_RETRY")
+                }
+            }
+            Phase.HistoryReturnSource -> {
+                val card = historySourceCard(active, nodes)
+                if (card != null && historyCardHash(walk(card)) == active.historyCardHash) {
+                    captureHistoryTrailingTexts(active, card, nodes)
+                    return finishSession("HISTORY_FORWARDED", "FORWARD_ACCEPTED")
+                }
+                if (System.currentTimeMillis() - active.clickAt >= AcceptanceTimeoutMillis) return finishSession("FAILED", "HISTORY_RETURN_SOURCE_TIMEOUT")
+            }
+            else -> Unit
+        }
+        if (!handler.hasCallbacks(historyTick)) handler.postDelayed(historyTick, AcceptancePollMillis)
+    }
+
+    private fun historySourceCard(active: Session, nodes: List<AccessibilityNodeInfo>): AccessibilityNodeInfo? {
+        val titles = nodes.filter { it.viewIdResourceName in setOf("com.tencent.mm:id/obn", "android:id/text1") &&
+            Rect().also(it::getBoundsInScreen).bottom <= WechatChatTopPx }.mapNotNull { it.text?.toString()?.takeIf(String::isNotBlank) }.distinct()
+        if (!ChatHistoryForwardPolicy.sourceTitleMatches(titles, active.conversationTitle.concatToString(), active.historySender.orEmpty())) return null
+        val input = nodes.singleOrNull(::isBottomComposerInput) ?: return null
+        val bottom = Rect().also(input::getBoundsInScreen).top
+        val rows = nodes.filter { it.viewIdResourceName == ImageCapturePolicy.RowViewId }.sortedBy { Rect().also(it::getBoundsInScreen).top }
+        val historyFlags = rows.map { row -> walk(row).any { it.viewIdResourceName == "com.tencent.mm:id/nec" && it.text?.toString() == "聊天记录" } }
+        val index = ChatHistoryForwardPolicy.latestHistoryIndex(historyFlags, active.historyCardsAfter?.invoke() ?: 0) ?: return null
+        val row = rows[index]
+        val rowNodes = walk(row).filter { it.isVisibleToUser }
+        val avatar = rowNodes.singleOrNull { it.viewIdResourceName == ImageCapturePolicy.AvatarViewId &&
+            it.contentDescription?.toString() == "${active.historySender}头像" } ?: return null
+        val avatarBounds = Rect().also(avatar::getBoundsInScreen)
+        // With a hidden title, only a direct sender is accepted; the notification intent and incoming avatar must agree.
+        if (avatarBounds.centerX() >= resources.displayMetrics.widthPixels / 2) return null
+        val card = rowNodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/st6" && it.isEnabled && it.isClickable } ?: return null
+        val bounds = Rect().also(card::getBoundsInScreen)
+        if (bounds.top < WechatChatTopPx || bounds.bottom > bottom || bounds.left < avatarBounds.right) return null
+        return card.takeIf { historyCardHash(walk(it)) != null }
+    }
+
+    private fun isHistoryViewer(active: Session, nodes: List<AccessibilityNodeInfo>): Boolean =
+        nodes.any { it.viewIdResourceName == "com.tencent.mm:id/jlt" } &&
+            nodes.count { it.viewIdResourceName == "android:id/text1" && it.text?.toString() == active.historyCardTitle } == 1
+
+    private fun captureHistoryTrailingTexts(active: Session, card: AccessibilityNodeInfo, nodes: List<AccessibilityNodeInfo>) {
+        val row = messageRowAncestor(card) ?: return
+        val bottom = Rect().also(row::getBoundsInScreen).bottom
+        val trailing = nodes.filter { it.viewIdResourceName == ImageCapturePolicy.RowViewId && Rect().also(it::getBoundsInScreen).top >= bottom }
+            .sortedBy { Rect().also(it::getBoundsInScreen).top }
+        val texts = trailing.takeWhile { candidate -> walk(candidate).none { it.viewIdResourceName == "com.tencent.mm:id/nec" && it.text?.toString() == "聊天记录" } }
+            .mapNotNull { candidate ->
+                val rowNodes = walk(candidate).filter { it.isVisibleToUser }
+                val avatar = rowNodes.singleOrNull { it.viewIdResourceName == ImageCapturePolicy.AvatarViewId && it.contentDescription?.toString() == "${active.historySender}头像" }
+                if (avatar == null || Rect().also(avatar::getBoundsInScreen).centerX() >= resources.displayMetrics.widthPixels / 2) return@mapNotNull null
+                rowNodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/bkl" }?.text?.toString()?.takeIf(String::isNotBlank)
+            }
+        if (texts != active.historyReportedTexts) {
+            active.historyReportedTexts = texts
+            active.historyCaptureTexts?.invoke(texts)
+        }
+    }
+
+    private fun historyCardHash(nodes: List<AccessibilityNodeInfo>): String? {
+        if (nodes.count { it.viewIdResourceName == "com.tencent.mm:id/nec" && it.text?.toString() == "聊天记录" } != 1) return null
+        val title = nodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/obc" }?.text?.toString()?.takeIf(String::isNotBlank) ?: return null
+        val preview = nodes.singleOrNull { it.viewIdResourceName == "com.tencent.mm:id/cu2" }?.text?.toString() ?: return null
+        return Privacy.saltedHash("${title.length}:$title$preview", Privacy.salt(this))
+    }
+
+    private fun processVoiceTranscription(active: Session) {
+        if (session !== active || !active.cancellation.canAct() || active.phase == Phase.Finishing) return
+        if (runCatching { active.voiceIsCurrent?.invoke() == true }.getOrDefault(false).not()) {
+            finishSession("WECHAT_ACTION_CHANGED", "VOICE_SOURCE_CHANGED")
+            return
+        }
+        val root = rootInActiveWindow?.takeIf { it.packageName?.toString() == NotificationSnapshot.WechatPackage }
+        val nodes = root?.let(::walk).orEmpty().filter { it.isVisibleToUser }
+        if (root == null && active.phase == Phase.VoiceWaitingTranscript) recordVoiceWait(active, "NO_WECHAT_ROOT")
+        if (root != null) when (active.phase) {
+            Phase.OpeningWechat -> {
+                val source = currentVoiceSource(active, root, nodes)
+                if (source != null) {
+                    val now = SystemClock.uptimeMillis()
+                    if (active.voiceSourceIdentity == null) {
+                        active.voiceSourceIdentity = source.identity
+                        active.voiceSelection = source.selection
+                        active.voiceWindowId = source.windowId
+                        active.voiceSourceStableSince = now
+                        captureVoiceTrailingTexts(active, source, nodes)
+                    } else if (!matchesPinnedVoice(active, source)) {
+                        // No action yet: opening a conversation can scroll older rows out of view.
+                        active.voiceSourceIdentity = source.identity
+                        active.voiceSelection = source.selection
+                        active.voiceWindowId = source.windowId
+                        active.voiceSourceStableSince = now
+                    } else if (now - active.voiceSourceStableSince >= VoiceSourceSettleMillis) {
+                        active.voiceSourceNode = source.voice
+                        if (walk(source.row).any { it.isVisibleToUser && it.viewIdResourceName in setOf(VoiceTranscriptViewId, VoiceTranscriptContainerViewId) }) {
+                            active.phase = Phase.VoiceWaitingTranscript
+                            active.clickAt = now
+                        } else {
+                            active.phase = Phase.VoiceMenu
+                            recordAccessibilityStage("VOICE_LONG_CLICK")
+                            if (active.cancellation.runIfActive {
+                                    source.voice.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
+                                } != true) {
+                                return finishSession("FAILED", "VOICE_LONG_CLICK_FAILED")
+                            }
+                        }
+                    }
+                } else if (active.voiceSourceIdentity != null) {
+                    active.voiceSourceStableSince = SystemClock.uptimeMillis()
+                }
+            }
+            Phase.VoiceMenu -> {
+                // The popup can have its own window. Revalidate the pinned source after it closes.
+                if (active.voiceSelection == null) return finishSession("WECHAT_ACTION_CHANGED", "VOICE_SOURCE_CHANGED")
+                val controls = nodes.filter { it.viewIdResourceName == "com.tencent.mm:id/obc" &&
+                    it.text?.toString() == "转文字" }
+                    .mapNotNull(::clickableAncestor)
+                    .distinctBy(::nodeIdentity)
+                if (controls.size > 1) return finishSession("WECHAT_ACTION_CHANGED", "VOICE_MENU_AMBIGUOUS")
+                controls.singleOrNull()?.let { control ->
+                    active.phase = Phase.VoiceWaitingTranscript
+                    active.voiceTranscriptStableSince = 0L
+                    active.clickAt = SystemClock.uptimeMillis()
+                    if (active.cancellation.runIfActive {
+                            control.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        } != true) {
+                        return finishSession("FAILED", "VOICE_MENU_CLICK_FAILED")
+                    }
+                    recordAccessibilityStage("VOICE_TRANSCRIPTION_REQUESTED")
+                }
+            }
+            Phase.VoiceWaitingTranscript -> {
+                val source = currentVoiceSource(active, root, nodes)
+                if (source == null) recordVoiceWait(active, "NO_SOURCE")
+                if (source == null && SystemClock.uptimeMillis() - maxOf(active.clickAt, active.voiceRevealAt) >= VoiceSourceReturnTimeoutMillis) {
+                    return finishSession("WECHAT_ACTION_CHANGED", "VOICE_SOURCE_CHANGED")
+                }
+                if (source != null && !matchesPinnedVoice(active, source, allowClippedHistory = true)) {
+                    return finishSession("WECHAT_ACTION_CHANGED", "VOICE_SOURCE_CHANGED")
+                }
+                if (source != null) {
+                    captureVoiceTrailingTexts(active, source, nodes)
+                    val transcriptNodes = walk(source.row).filter {
+                        it.isVisibleToUser && it.viewIdResourceName == VoiceTranscriptViewId
+                    }.mapNotNull { it.text?.toString()?.trim()?.takeIf(String::isNotBlank) }
+                    if (transcriptNodes.size > 1) return finishSession("WECHAT_ACTION_CHANGED", "VOICE_TRANSCRIPT_AMBIGUOUS")
+                    val current = transcriptNodes.singleOrNull()
+                    val containerCount = walk(source.row).count { it.isVisibleToUser && it.viewIdResourceName == VoiceTranscriptContainerViewId }
+                    recordVoiceWait(active, "SOURCE_TEXT_${current != null}_CONTAINERS_$containerCount")
+                    if (current == null && SystemClock.uptimeMillis() - active.clickAt >= 2_000L) {
+                        val container = walk(source.row).singleOrNull {
+                            it.isVisibleToUser && it.viewIdResourceName == VoiceTranscriptContainerViewId
+                        }
+                        if (container != null) {
+                            active.voiceCopyAt = System.currentTimeMillis()
+                            if (container.performAction(AccessibilityNodeInfo.ACTION_COPY)) {
+                                return readVoiceClipboard(active)
+                            }
+                            val bounds = Rect().also(container::getBoundsInScreen)
+                            if (!source.viewport.contains(bounds)) {
+                                if (active.voiceRevealAt == 0L) {
+                                    active.voiceRevealAt = SystemClock.uptimeMillis()
+                                    if (!source.row.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id)) {
+                                        return finishSession("FAILED", "VOICE_TRANSCRIPT_REVEAL_FAILED")
+                                    }
+                                    recordAccessibilityStage("VOICE_TRANSCRIPT_REVEAL_REQUESTED")
+                                } else if (SystemClock.uptimeMillis() - active.voiceRevealAt >= VoiceSourceReturnTimeoutMillis) {
+                                    return finishSession("FAILED", "VOICE_TRANSCRIPT_OUTSIDE_VIEWPORT")
+                                }
+                                if (!handler.hasCallbacks(historyTick)) handler.postDelayed(historyTick, AcceptancePollMillis)
+                                return
+                            }
+                            active.phase = Phase.VoiceLongPressing
+                            recordAccessibilityStage("VOICE_TEXT_LONG_CLICK")
+                            val gesture = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(
+                                Path().apply { moveTo(bounds.exactCenterX(), bounds.exactCenterY()) }, 0, 650,
+                            )).build()
+                            if (!dispatchGesture(gesture, object : GestureResultCallback() {
+                                override fun onCompleted(gestureDescription: GestureDescription?) {
+                                    if (session !== active || active.phase != Phase.VoiceLongPressing || !active.cancellation.canAct()) return
+                                    active.phase = Phase.VoiceCopyMenu
+                                    active.clickAt = SystemClock.uptimeMillis()
+                                    recordAccessibilityStage("VOICE_TEXT_LONG_CLICK_COMPLETED")
+                                    processVoiceTranscription(active)
+                                }
+
+                                override fun onCancelled(gestureDescription: GestureDescription?) {
+                                    if (session === active && active.phase == Phase.VoiceLongPressing) finishSession("FAILED", "VOICE_TEXT_LONG_CLICK_CANCELLED")
+                                }
+                            }, handler)) return finishSession("FAILED", "VOICE_TEXT_LONG_CLICK_FAILED")
+                        }
+                    }
+                    if (current != null && VoiceTranscriptionPolicy.isKnownFailureText(current)) {
+                        return finishSession("FAILED", "VOICE_TRANSCRIPTION_FAILED")
+                    }
+                    val now = SystemClock.uptimeMillis()
+                    if (current != active.voiceTranscript) {
+                        active.voiceTranscript = current
+                        active.voiceTranscriptStableSince = now
+                    } else if (VoiceTranscriptionPolicy.hasStableTranscript(
+                            current, active.voiceTranscript, active.voiceTranscriptStableSince, now, VoiceTranscriptSettleMillis,
+                        )) {
+                        return finishSession("VOICE_TRANSCRIBED", "TRANSCRIPT_CAPTURED")
+                    }
+                }
+            }
+            Phase.VoiceCopyMenu -> {
+                val source = currentVoiceSource(active, root, nodes)
+                if (source != null && !matchesPinnedVoice(active, source, allowClippedHistory = true)) return finishSession("WECHAT_ACTION_CHANGED", "VOICE_SOURCE_CHANGED")
+                val allNodes = rootsForPackage(NotificationSnapshot.WechatPackage).flatMap(::walk).filter { it.isVisibleToUser }
+                val copy = allNodes.filter { it.text?.toString() == "复制" || it.contentDescription?.toString() == "复制" }
+                    .mapNotNull(::clickableAncestor).distinctBy(::nodeIdentity)
+                if (copy.size > 1) return finishSession("WECHAT_ACTION_CHANGED", "VOICE_COPY_AMBIGUOUS")
+                if (copy.size == 1) {
+                    active.voiceCopyAt = System.currentTimeMillis()
+                    if (copy.single().performAction(AccessibilityNodeInfo.ACTION_CLICK)) return readVoiceClipboard(active)
+                    return finishSession("FAILED", "VOICE_COPY_CLICK_FAILED")
+                }
+                if (SystemClock.uptimeMillis() - active.clickAt >= 1_000L && source != null) {
+                    val container = walk(source.row).singleOrNull { it.viewIdResourceName == VoiceTranscriptContainerViewId }
+                    active.voiceCopyAt = System.currentTimeMillis()
+                    if (container?.performAction(AccessibilityNodeInfo.ACTION_COPY) == true) return readVoiceClipboard(active)
+                    return finishSession("FAILED", "VOICE_COPY_CONTROL_UNAVAILABLE")
+                }
+            }
+            else -> Unit
+        }
+        if (!handler.hasCallbacks(historyTick)) handler.postDelayed(historyTick, AcceptancePollMillis)
+    }
+
+    private fun recordVoiceWait(active: Session, observation: String) {
+        if (active.voiceWaitObservation == observation) return
+        active.voiceWaitObservation = observation
+        recordAccessibilityStage("VOICE_WAIT_$observation")
+    }
+
+    private fun readVoiceClipboard(active: Session) {
+        active.phase = Phase.VoiceClipboardReading
+        recordAccessibilityStage("VOICE_COPY_REQUESTED")
+        VoiceClipboardActivity.start(this, active.voiceCopyAt,
+            { session === active && active.cancellation.canAct() && active.voiceIsCurrent?.invoke() == true },
+        ) { text ->
+            if (session !== active || active.phase != Phase.VoiceClipboardReading) return@start
+            if (text.isNullOrBlank() || VoiceTranscriptionPolicy.isKnownFailureText(text)) {
+                finishSession("FAILED", "VOICE_CLIPBOARD_INVALID")
+            } else {
+                active.voiceTranscript = text
+                finishSession("VOICE_TRANSCRIBED", "CLIPBOARD_CAPTURED")
+            }
+        }
+    }
+
+    private fun currentVoiceSource(
+        active: Session,
+        root: AccessibilityNodeInfo,
+        nodes: List<AccessibilityNodeInfo>,
+    ): VoiceSourceSelection? {
+        val titles = nodes.filter { it.viewIdResourceName in setOf("com.tencent.mm:id/obn", "android:id/text1") &&
+            Rect().also(it::getBoundsInScreen).bottom <= WechatChatTopPx }
+            .mapNotNull { it.text?.toString()?.takeIf(String::isNotBlank) }
+            .distinct()
+        val sender = active.voiceSender ?: return null
+        if (!ChatHistoryForwardPolicy.sourceTitleMatches(titles, active.conversationTitle.concatToString(), sender)) return null
+        val composer = nodes.singleOrNull(::isBottomComposerInput) ?: return null
+        val bottom = Rect().also(composer::getBoundsInScreen).top
+        val viewport = Rect(0, WechatChatTopPx, resources.displayMetrics.widthPixels, bottom)
+        val rows = nodes.filter { it.viewIdResourceName == ImageCapturePolicy.RowViewId }
+            .filter { row ->
+                val bounds = Rect().also(row::getBoundsInScreen)
+                VoiceTranscriptionPolicy.intersectsViewport(bounds.top, bounds.bottom, viewport.top, viewport.bottom)
+            }
+            .sortedBy { Rect().also(it::getBoundsInScreen).top }
+        val sources = rows.mapNotNull { voiceRowMarker(it, viewport) }
+        val voicesAfter = runCatching { active.voiceVoicesAfter?.invoke() }.getOrNull() ?: return null
+        val selection = VoiceTranscriptionPolicy.pinVoiceSelection(sources.map(VoiceRowMarker::signature), voicesAfter)
+            ?: return null
+        val source = sources[selection.selectedIndex]
+        if (source.avatar.contentDescription?.toString() != "${sender}头像") return null
+        if (active.voiceExpectedDuration != null && walk(source.row).singleOrNull { it.viewIdResourceName == VoiceDurationViewId }?.text?.toString() != active.voiceExpectedDuration) return null
+        return VoiceSourceSelection(root.windowId, source.signature, selection, source.row, source.voice, viewport)
+    }
+
+    private fun incomingVoiceNode(row: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+        voiceRowMarker(row)?.voice
+
+    private fun voiceRowMarker(row: AccessibilityNodeInfo, viewport: Rect? = null): VoiceRowMarker? {
+        val rowNodes = walk(row).filter { it.isVisibleToUser &&
+            (viewport == null || Rect.intersects(viewport, Rect().also(it::getBoundsInScreen))) }
+        val voice = rowNodes.singleOrNull { node ->
+            node.isEnabled && node.viewIdResourceName == VoiceBubbleViewId
+        } ?: return null
+        val avatar = rowNodes.singleOrNull { it.viewIdResourceName == ImageCapturePolicy.AvatarViewId } ?: return null
+        if (Rect().also(avatar::getBoundsInScreen).centerX() >= resources.displayMetrics.widthPixels / 2) return null
+        val duration = rowNodes.singleOrNull { it.viewIdResourceName == VoiceDurationViewId }
+            ?.text?.toString()?.takeIf(VoiceTranscriptionPolicy::isVoiceDuration) ?: return null
+        // WeChat clears the voice description after conversion/read; avatar, duration and row order remain stable.
+        return VoiceRowMarker("${avatar.contentDescription}|$duration", row, voice, avatar)
+    }
+
+    private fun matchesPinnedVoice(active: Session, source: VoiceSourceSelection, allowClippedHistory: Boolean = false): Boolean =
+        source.windowId == active.voiceWindowId && source.identity == active.voiceSourceIdentity &&
+            (!allowClippedHistory || active.voiceSourceNode == source.voice) &&
+            active.voiceSelection?.let { VoiceTranscriptionPolicy.matchesPinnedVoice(
+                it, source.selection.signatures, source.selection.voicesAfter,
+                sameVoiceNode = allowClippedHistory && active.voiceSourceNode == source.voice,
+            ) } == true
+
+    private fun captureVoiceTrailingTexts(
+        active: Session,
+        source: VoiceSourceSelection,
+        nodes: List<AccessibilityNodeInfo>,
+    ) {
+        val sourceBottom = Rect().also(source.row::getBoundsInScreen).bottom
+        val sender = active.voiceSender ?: return
+        val texts = ArrayList<String>()
+        val trailing = nodes.filter { it.viewIdResourceName == ImageCapturePolicy.RowViewId &&
+            Rect().also(it::getBoundsInScreen).top >= sourceBottom }
+            .sortedBy { Rect().also(it::getBoundsInScreen).top }
+        for (row in trailing) {
+            if (incomingVoiceNode(row) != null) break
+            val rowNodes = walk(row).filter { it.isVisibleToUser }
+            val avatar = rowNodes.singleOrNull { it.viewIdResourceName == ImageCapturePolicy.AvatarViewId &&
+                it.contentDescription?.toString() == "${sender}头像" } ?: break
+            if (Rect().also(avatar::getBoundsInScreen).centerX() >= resources.displayMetrics.widthPixels / 2) break
+            val text = rowNodes.singleOrNull { it.viewIdResourceName == VoiceDurationViewId }
+                ?.text?.toString()?.trim()?.takeIf(String::isNotBlank) ?: break
+            if (!text.startsWith("[") && !VoiceTranscriptionPolicy.isVoiceDuration(text) &&
+                text != active.voiceTranscript && !VoiceTranscriptionPolicy.isKnownFailureText(text)) {
+                texts += text
+            }
+        }
+        if (texts != active.voiceReportedTexts) {
+            active.voiceReportedTexts = texts
+            active.voiceCaptureTexts?.invoke(texts)
+        }
+    }
+
     private fun processConversationSearch(active: Session, roots: List<AccessibilityNodeInfo>) {
         if (roots.isEmpty()) return
         val nodes = roots.flatMap(::walk)
@@ -1129,14 +1715,20 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         val active = session ?: return
         if (active.phase == Phase.Finishing) return
         handler.removeCallbacks(pinTick)
+        handler.removeCallbacks(historyTick)
         val terminalStatus = if (active.cancellation.canAct()) status else "FAILED"
         val terminalStage = active.cancellation.stage() ?: stage
         active.phase = Phase.Finishing
+        VoiceClipboardActivity.cancel()
         UnlockGateActivity.closeGate()
         val currentlyLocked = getSystemService(KeyguardManager::class.java).isDeviceLocked
         val currentForegroundPackage = runCatching(::foregroundPackage).getOrNull()
-        val shouldRequestHome = if (active.isImageCapture) {
-            !active.startedLocked && terminalStatus == "IMAGE_CAPTURED" && currentForegroundPackage == NotificationSnapshot.WechatPackage
+        val shouldRequestHome = if (active.isVoiceTranscription) {
+            VoiceTranscriptionPolicy.shouldRequestHome(active.startedLocked, active.unlockedForWorkflow,
+                currentForegroundPackage == NotificationSnapshot.WechatPackage || currentForegroundPackage == packageName)
+        } else if (active.isImageCapture || active.isHistoryForward) {
+            !active.startedLocked && terminalStatus in setOf("IMAGE_CAPTURED", "HISTORY_FORWARDED", "VOICE_TRANSCRIBED") &&
+                currentForegroundPackage == NotificationSnapshot.WechatPackage
         } else AccessibilityReplyPolicy.shouldRequestHome(
                 active.startedLocked,
                 terminalStatus,
@@ -1172,16 +1764,24 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
 
     private fun completeSession(active: Session, status: String, stage: String, finalized: Boolean) {
         if (session !== active) return
-        if (status == "SENT_TO_WECHAT" && finalized) {
-            if (active.startedLocked) successfulLockedRunAwaitingAck = true
+        if (active.isHistoryForward && ChatHistoryForwardPolicy.canFinalizeHistoryAttempt(active.startedLocked, active.unlockedForWorkflow, finalized)) {
+            if (!pinStore.completeSuccessfulFinalization()) recordAccessibilityStage("HISTORY_ATTEMPT_FINALIZE_FAILED")
+        }
+        if (active.isVoiceTranscription && VoiceTranscriptionPolicy.canFinalizeVoiceAttempt(active.startedLocked, active.unlockedForWorkflow, finalized)) {
+            if (!pinStore.completeSuccessfulFinalization()) recordAccessibilityStage("VOICE_ATTEMPT_FINALIZE_FAILED")
+        }
+        if (status in setOf("SENT_TO_WECHAT", "HISTORY_FORWARDED") && finalized) {
+            if (active.startedLocked && !active.isHistoryForward) successfulLockedRunAwaitingAck = true
             active.result = AccessibilityReplyResult(status, stage, startedLocked = active.startedLocked)
         } else if (status == "IMAGE_CAPTURED" && finalized && active.capturedMedia != null) {
             active.result = AccessibilityReplyResult(status, stage, active.capturedMedia, active.startedLocked)
+        } else if (status == "VOICE_TRANSCRIBED" && finalized && !active.voiceTranscript.isNullOrBlank()) {
+            active.result = AccessibilityReplyResult(status, stage, startedLocked = active.startedLocked, transcript = active.voiceTranscript)
         } else {
             active.capturedMedia?.bytes?.fill(0)
             active.result = AccessibilityReplyResult(
-                if (status == "SENT_TO_WECHAT" || status == "IMAGE_CAPTURED") "FAILED" else status,
-                if (status == "SENT_TO_WECHAT" || status == "IMAGE_CAPTURED") "FINALIZATION_FAILED" else stage,
+                if (status in setOf("SENT_TO_WECHAT", "IMAGE_CAPTURED", "HISTORY_FORWARDED", "VOICE_TRANSCRIBED")) "FAILED" else status,
+                if (status in setOf("SENT_TO_WECHAT", "IMAGE_CAPTURED", "HISTORY_FORWARDED", "VOICE_TRANSCRIBED")) "FINALIZATION_FAILED" else stage,
                 startedLocked = active.startedLocked,
             )
         }
@@ -1214,8 +1814,15 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         private const val ViewerSettleMillis = 450L
         private const val OriginalViewTimeoutMillis = 5_000L
         private const val OriginalViewSettleMillis = 1_000L
+        private const val VoiceSourceSettleMillis = 450L
+        private const val VoiceSourceReturnTimeoutMillis = 3_000L
+        private const val VoiceTranscriptSettleMillis = 450L
         private const val WechatChatTopPx = 284
         private const val TitleRegionFraction = 0.45f
+        private const val VoiceBubbleViewId = "com.tencent.mm:id/brp"
+        private const val VoiceDurationViewId = "com.tencent.mm:id/bkl"
+        private const val VoiceTranscriptViewId = "com.tencent.mm:id/brv"
+        private const val VoiceTranscriptContainerViewId = "com.tencent.mm:id/bru"
         private val SendLabels = setOf("发送", "Send")
         private val SearchLabels = setOf("搜索", "Search")
         private val ImageExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "relay-image-capture") }
@@ -1249,6 +1856,27 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
             replyText = null,
             imageSender = sender,
             imageIsCurrent = isCurrent,
+        ) ?: AccessibilityReplyResult("REMOTE_INPUT_UNSUPPORTED", "ACCESSIBILITY_NOT_LIVE")
+
+        fun executeHistoryForward(
+            contentIntent: PendingIntent?, expectedTitleHash: String, conversationTitle: String, sender: String,
+            wechatUserId: Int, wechatUserSerial: Long, isCurrent: () -> Boolean, claimSend: () -> Boolean,
+            cardsAfter: () -> Int, captureTexts: (List<String>) -> Unit,
+        ): AccessibilityReplyResult = liveService?.executeBlocking(
+            contentIntent, expectedTitleHash, conversationTitle, wechatUserId, wechatUserSerial, null,
+            historySender = sender, historyIsCurrent = isCurrent, historyClaimSend = claimSend,
+            historyCardsAfter = cardsAfter, historyCaptureTexts = captureTexts,
+        ) ?: AccessibilityReplyResult("REMOTE_INPUT_UNSUPPORTED", "ACCESSIBILITY_NOT_LIVE")
+
+        fun executeVoiceTranscription(
+            contentIntent: PendingIntent?, expectedTitleHash: String, conversationTitle: String, sender: String,
+            wechatUserId: Int, wechatUserSerial: Long, isCurrent: () -> Boolean, voicesAfter: () -> Int,
+            captureTexts: (List<String>) -> Unit, expectedDuration: String? = null,
+        ): AccessibilityReplyResult = liveService?.executeBlocking(
+            contentIntent, expectedTitleHash, conversationTitle, wechatUserId, wechatUserSerial, null,
+            voiceSender = sender, voiceIsCurrent = isCurrent, voiceVoicesAfter = voicesAfter,
+            voiceExpectedDuration = expectedDuration,
+            voiceCaptureTexts = captureTexts,
         ) ?: AccessibilityReplyResult("REMOTE_INPUT_UNSUPPORTED", "ACCESSIBILITY_NOT_LIVE")
 
         fun requiresGateDismiss(): Boolean = liveService?.session?.startedLocked == true

@@ -2,3 +2,14 @@ node_modules
 dist
 data
 .env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.log
+*.jsonl
+*.db
+*.sqlite*

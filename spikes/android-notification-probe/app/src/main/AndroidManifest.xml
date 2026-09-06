@@ -24,6 +24,10 @@
             android:showWhenLocked="true"
             android:theme="@style/Theme.NotificationProbe.UnlockGate"
             android:turnScreenOn="true" />
+        <activity
+            android:name=".VoiceClipboardActivity"
+            android:excludeFromRecents="true"
+            android:exported="false" />
 
         <service
             android:name=".WechatNotificationListenerService"
