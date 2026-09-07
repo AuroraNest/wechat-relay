@@ -28,7 +28,7 @@ class ApiError extends Error {
 }
 
 const elements = Object.fromEntries(
-  ["imageDialog", "saveImage", "closeImage", "fullImage", "messages", "emptyMessages", "clearMessages", "settingsDialog", "openSettings", "closeSettings", "status", "token", "body", "delay", "scenario", "network", "screen", "ios", "events", "subscribe", "createPairing", "pairingStatus", "copyPairing", "pairingCode", "send", "resend", "refresh", "unregister", "fault", "clearKey"]
+  ["imageDialog", "saveImage", "closeImage", "fullImage", "messages", "emptyMessages", "clearMessages", "settingsDialog", "openSettings", "closeSettings", "relayPolicyStatus", "relayEnabled", "relayScheduleEnabled", "relayScheduleFields", "relayStart", "relayEnd", "saveRelayPolicy", "status", "token", "body", "delay", "scenario", "network", "screen", "ios", "events", "subscribe", "createPairing", "pairingStatus", "copyPairing", "pairingCode", "send", "resend", "refresh", "unregister", "fault", "clearKey"]
     .map((id) => [id, document.getElementById(id)])
 );
 
@@ -48,8 +48,13 @@ elements.unregister.addEventListener("click", () => run(unregisterWorker));
 elements.fault.addEventListener("click", () => run(toggleFault));
 elements.clearKey.addEventListener("click", () => run(clearKey));
 elements.clearMessages.addEventListener("click", () => run(clearMessages));
-elements.openSettings.addEventListener("click", () => elements.settingsDialog.showModal());
+elements.openSettings.addEventListener("click", () => {
+  elements.settingsDialog.showModal();
+  void run(loadRelayPolicy);
+});
 elements.closeSettings.addEventListener("click", () => elements.settingsDialog.close());
+elements.relayScheduleEnabled.addEventListener("change", updateRelayScheduleControls);
+elements.saveRelayPolicy.addEventListener("click", () => run(saveRelayPolicy));
 elements.closeImage.addEventListener("click", () => elements.imageDialog.close());
 elements.imageDialog.addEventListener("close", () => {
   if (viewerBlobUrl) URL.revokeObjectURL(viewerBlobUrl);
@@ -82,6 +87,54 @@ document.addEventListener("visibilitychange", () => {
     inboxStreamController?.abort();
   }
 });
+
+updateRelayScheduleControls();
+
+async function loadRelayPolicy() {
+  const pairId = await activePairId();
+  const ackToken = await pairGet("ackToken", pairId);
+  assertFeature(ackToken && pairId, "PAIRING_MISSING");
+  renderRelayPolicy(await api("/api/v1/relay-policy", { headers: pairHeaders(ackToken, pairId) }));
+}
+
+async function saveRelayPolicy() {
+  const pairId = await activePairId();
+  const ackToken = await pairGet("ackToken", pairId);
+  assertFeature(ackToken && pairId, "PAIRING_MISSING");
+  const weekdays = [...document.querySelectorAll('[name="relayWeekday"]:checked')].map((input) => Number(input.value));
+  if (elements.relayScheduleEnabled.checked) assertFeature(weekdays.length > 0, "请选择至少一天");
+  const policy = await api("/api/v1/relay-policy", {
+    method: "PUT",
+    headers: pairHeaders(ackToken, pairId),
+    body: {
+      enabled: elements.relayEnabled.checked,
+      scheduleEnabled: elements.relayScheduleEnabled.checked,
+      weekdays: weekdays.length ? weekdays : [1, 2, 3, 4, 5],
+      start: elements.relayStart.value,
+      end: elements.relayEnd.value,
+      timezone: "Asia/Shanghai"
+    }
+  });
+  renderRelayPolicy(policy);
+}
+
+function renderRelayPolicy(policy) {
+  elements.relayEnabled.checked = policy.enabled === true;
+  elements.relayScheduleEnabled.checked = policy.scheduleEnabled === true;
+  elements.relayStart.value = policy.start;
+  elements.relayEnd.value = policy.end;
+  const weekdays = new Set(policy.weekdays);
+  for (const input of document.querySelectorAll('[name="relayWeekday"]')) input.checked = weekdays.has(Number(input.value));
+  updateRelayScheduleControls();
+  elements.relayPolicyStatus.dataset.state = policy.active ? "success" : "loading";
+  elements.relayPolicyStatus.textContent = policy.active
+    ? "当前正在转发."
+    : policy.enabled ? `当前按计划暂停, ${policy.end} 后恢复.` : "当前已手动暂停.";
+}
+
+function updateRelayScheduleControls() {
+  elements.relayScheduleFields.disabled = !elements.relayScheduleEnabled.checked;
+}
 
 function resumeInboxWatch() {
   inboxStreamRetryCount = 0;

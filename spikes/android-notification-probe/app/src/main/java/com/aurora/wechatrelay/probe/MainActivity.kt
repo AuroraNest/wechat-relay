@@ -229,6 +229,7 @@ class MainActivity : Activity() {
         val granted = notificationManager.isNotificationListenerAccessGranted(listener)
         if (granted) requestListenerRebind(listener)
         val paired = SyncStore.get(this).paired()
+        val relayActive = SyncStore.get(this).relayPolicy().active()
         val lastCapture = ProbeRuntime.lastCaptureMillis?.let(::formatTime) ?: "本次启动后暂无"
         val pinStatus = LockscreenPinStore(this).status(
             accessibilityLive = LockscreenAccessibilityReplyService.isLive(),
@@ -239,6 +240,7 @@ class MainActivity : Activity() {
             通知权限: ${if (granted) "已授权" else "未授权"}
             通知监听: ${if (ProbeRuntime.listenerConnected) "已连接" else "未连接"}
             回复轮询: ${ProbeRuntime.lastReplyStatus}
+            消息转发: ${if (relayActive) "已开启" else "已暂停"}
             最近通知: $lastCapture
             自动处理队列: ${ProbeRuntime.historyQueueStatus}
             ${pairingStatus.orEmpty()}

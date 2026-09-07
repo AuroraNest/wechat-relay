@@ -35,6 +35,13 @@ import { createClient, type RedisClientType } from "redis";
 import { pool, transaction, verifySchema } from "./mysql.js";
 import { classifyRequestError } from "./errors.js";
 import {
+  DEFAULT_RELAY_POLICY,
+  relayActive,
+  relayPolicyJson,
+  validateRelayPolicy,
+  type RelayPolicy,
+} from "./relay-policy.js";
+import {
   buildDeclarativePayload,
   validateTestPushRequest,
   type PreviewEnvelope,
@@ -283,6 +290,10 @@ async function route(
   }
   if (request.method === "POST" && url.pathname === "/api/v1/android/pair")
     return pairAndroid(request, response);
+  if (request.method === "GET" && url.pathname === "/api/v1/relay-policy")
+    return getBrowserRelayPolicy(request, response);
+  if (request.method === "PUT" && url.pathname === "/api/v1/relay-policy")
+    return updateBrowserRelayPolicy(request, response);
   if (request.method === "POST" && url.pathname === "/api/v1/android/messages")
     return uploadAndroidMessage(request, response);
   if (request.method === "POST" && url.pathname === "/api/v1/replies")
@@ -588,9 +599,10 @@ async function getAndroidReply(
       if (response.destroyed) return;
       reply = await claimReply(signed.deviceId);
     }
-    if (!reply) return json(response, 200, { reply: null });
+    const relayPolicy = relayPolicyJson(await loadRelayPolicy(signed.pairId));
+    if (!reply) return json(response, 200, { reply: null, relayPolicy });
     event("REPLY_DELIVERED_TO_ANDROID", { replyId: reply.id });
-    json(response, 200, { reply });
+    json(response, 200, { reply, relayPolicy });
   } finally {
     wake.cancel();
   }
@@ -681,6 +693,9 @@ async function uploadAndroidMessage(
     );
     if (!lockedDevice) throw new Error("DEVICE_UNKNOWN");
     await consumeAndroidNonce(connection, message.deviceId, nonce, now);
+    const policy = await loadRelayPolicy(lockedDevice.pair_id, connection);
+    if (!relayActive(policy))
+      return { idempotent: false, pairId: lockedDevice.pair_id, dropped: true };
     const existing = await dbOne<{ body_hash: Buffer }>(
       connection,
       "SELECT body_hash FROM messages WHERE id = ?",
@@ -689,7 +704,7 @@ async function uploadAndroidMessage(
     if (existing) {
       if (!timingSafeBufferEqual(existing.body_hash, bodyHash))
         throw new Error("MESSAGE_ID_CONFLICT");
-      return { idempotent: true, pairId: lockedDevice.pair_id };
+      return { idempotent: true, pairId: lockedDevice.pair_id, dropped: false };
     }
     const sequence = await dbOne<{ max_seq: string | number | null }>(
       connection,
@@ -724,8 +739,12 @@ async function uploadAndroidMessage(
       "INSERT INTO push_outbox(message_id, payload, queued_at) VALUES (?, ?, ?)",
       [message.id, payload, now],
     );
-    return { idempotent: false, pairId: lockedDevice.pair_id };
+    return { idempotent: false, pairId: lockedDevice.pair_id, dropped: false };
   });
+  if (stored.dropped) {
+    event("ANDROID_MESSAGE_DROPPED_BY_POLICY", { deviceId: message.deviceId });
+    return json(response, 202, { id: message.id, dropped: true });
+  }
   if (stored.idempotent)
     return json(response, 202, { id: message.id, idempotent: true });
   for (const asset of message.assets ?? [])
@@ -737,6 +756,46 @@ async function uploadAndroidMessage(
   messageEvents.emit("stored", stored.pairId, message.seq);
   void sendOutbox(message.id);
   json(response, 202, { id: message.id, idempotent: false });
+}
+
+async function getBrowserRelayPolicy(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const { pairId } = await authorizeBrowserPair(request, false);
+  response.setHeader("Cache-Control", "no-store");
+  json(response, 200, relayPolicyJson(await loadRelayPolicy(pairId)));
+}
+
+async function updateBrowserRelayPolicy(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const { pairId } = await authorizeBrowserPair(request, true);
+  const policy = validateRelayPolicy((await bodyJson(request)).json);
+  await dbRun(
+    pool,
+    "INSERT INTO relay_policies(pair_id, enabled, schedule_enabled, weekdays_mask, start_minutes, end_minutes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE enabled = VALUES(enabled), schedule_enabled = VALUES(schedule_enabled), weekdays_mask = VALUES(weekdays_mask), start_minutes = VALUES(start_minutes), end_minutes = VALUES(end_minutes), updated_at = VALUES(updated_at)",
+    [pairId, policy.enabled ? 1 : 0, policy.scheduleEnabled ? 1 : 0, policy.weekdaysMask, policy.startMinutes, policy.endMinutes, policy.updatedAt],
+  );
+  const device = await dbOne<{ device_id: string }>(pool, "SELECT device_id FROM devices WHERE pair_id = ?", [pairId]);
+  if (device) replyEvents.emit("queued", device.device_id);
+  event("RELAY_POLICY_UPDATED", { pairId, active: relayActive(policy) });
+  response.setHeader("Cache-Control", "no-store");
+  json(response, 200, relayPolicyJson(policy));
+}
+
+async function loadRelayPolicy(pairId: string, connection: Pool | PoolConnection = pool): Promise<RelayPolicy> {
+  const row = await dbOne<{
+    enabled: string | number;
+    schedule_enabled: string | number;
+    weekdays_mask: string | number;
+    start_minutes: string | number;
+    end_minutes: string | number;
+    updated_at: string | number;
+  }>(connection, "SELECT enabled, schedule_enabled, weekdays_mask, start_minutes, end_minutes, updated_at FROM relay_policies WHERE pair_id = ?", [pairId]);
+  return row ? {
+    enabled: dbInteger(row.enabled) === 1,
+    scheduleEnabled: dbInteger(row.schedule_enabled) === 1,
+    weekdaysMask: dbInteger(row.weekdays_mask),
+    startMinutes: dbInteger(row.start_minutes),
+    endMinutes: dbInteger(row.end_minutes),
+    updatedAt: dbInteger(row.updated_at),
+  } : { ...DEFAULT_RELAY_POLICY };
 }
 
 async function waitBrowserMessage(

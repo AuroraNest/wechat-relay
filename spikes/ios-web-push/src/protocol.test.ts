@@ -59,10 +59,14 @@ test("Android pairing keeps its Token and action in the default-open flow", asyn
   assert.match(pairingSection, /<summary>设备连接<\/summary>/);
   assert.match(pairingSection, /<input id="token"/);
   assert.match(pairingSection, /<button id="createPairing"/);
-  assert.match(page, /href="\/style\.css\?v=image-view-1"/);
-  assert.match(page, /src="\/app\.js\?v=image-view-1"/);
+  assert.match(page, /href="\/style\.css\?v=relay-policy-1"/);
+  assert.match(page, /src="\/app\.js\?v=relay-policy-1"/);
   assert.match(app, /elements\.token\.focus\(\)/);
   assert.match(app, /setPairingStatus\("loading"/);
+  assert.match(page, /id="relayEnabled"/);
+  assert.match(page, /id="relayScheduleEnabled"/);
+  assert.match(page, /name="relayWeekday"[\s\S]*?value="1"[\s\S]*?checked/);
+  assert.match(app, /api\("\/api\/v1\/relay-policy"/);
 });
 
 test("Nginx separates control, data, and long-lived protocol traffic", async () => {

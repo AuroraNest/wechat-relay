@@ -7,9 +7,11 @@ const browser = await chromium.launch({channel:'chrome', headless:true});
 try {
 const page = await browser.newPage({viewport:{width:390,height:844}});
 let demoAsset;
+let relayPolicy={enabled:true,scheduleEnabled:false,weekdays:[1,2,3,4,5],start:'09:30',end:'18:00',timezone:'Asia/Shanghai',active:true,updatedAt:1};
 const errors=[];page.on('pageerror', e=>errors.push(e.message));
 await page.route('http://localhost:4179/**', async route=>{
  const path=new URL(route.request().url()).pathname;
+ if(path==='/api/v1/relay-policy') {if(route.request().method()==='PUT'){relayPolicy={...relayPolicy,...route.request().postDataJSON(),active:false,updatedAt:2};}return route.fulfill({contentType:'application/json',body:JSON.stringify(relayPolicy)});}
  if(path==='/api/v1/assets/demo-image') return route.fulfill({contentType:'application/json',body:JSON.stringify(demoAsset)});
  if(path==='/api/v1/assets/expired-image') return route.fulfill({status:404,body:'{}'});
  if(path==='/sw.js') return route.fulfill({contentType:'text/javascript',body:''});
@@ -66,8 +68,11 @@ await page.locator('.conversation-back').click();
 await page.locator('.conversation-row').waitFor();
 await page.getByRole('button',{name:'设置',exact:true}).click();
 assert.ok(await page.locator('#settingsDialog').isVisible());
+await page.locator('#relayScheduleEnabled').check();
+await page.getByRole('button',{name:'保存转发设置',exact:true}).click();
+await page.getByText('当前按计划暂停, 18:00 后恢复.',{exact:true}).waitFor();
 await page.getByRole('button',{name:'完成',exact:true}).click();
 await page.setViewportSize({width:1280,height:900});
 await page.screenshot({path:'/tmp/relay-list-desktop.png'});
-assert.deepEqual(errors,[]);console.log('PASS: identity, render, composer bottom at 390x844/390x420, draft refresh, older history, back, settings, desktop, encrypted image rendering/viewer/download, expired image status, no page errors');
+assert.deepEqual(errors,[]);console.log('PASS: identity, render, composer bottom at 390x844/390x420, draft refresh, older history, back, relay settings, desktop, encrypted image rendering/viewer/download, expired image status, no page errors');
 } finally { await browser.close(); }

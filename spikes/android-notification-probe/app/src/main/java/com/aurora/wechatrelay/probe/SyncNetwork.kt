@@ -31,6 +31,7 @@ data class ReplyCommand(
     val pairId: String?,
     val replyEnvelope: Envelope,
 )
+data class ReplyPollResult(val relayPolicy: RelayPolicy, val reply: ReplyCommand?)
 
 internal class PairingGate {
     private val inFlight = AtomicBoolean(false)
@@ -106,12 +107,19 @@ object SyncNetwork {
                 val connection = signedConnection(signing, "POST", "/api/v1/android/messages", body)
                 try {
                     writeJson(connection, body)
-                    val result = uploadResultForHttpStatus(connection.responseCode)
+                    val responseCode = connection.responseCode
+                    val result = uploadResultForHttpStatus(responseCode)
+                    val dropped = result == UploadResult.Complete && connection.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }.let(::JSONObject).optBoolean("dropped")
                     if (!store.isCurrentDevice(signing.deviceId)) return UploadResult.Complete
                     when (result) {
                         UploadResult.Complete -> {
                             store.state(signing.deviceId, item.id, SyncStore.ServerAccepted)
-                            if (assetsJson != "[]") runCatching {
+                            if (dropped) ProbeStore(context).append(JSONObject()
+                                .put("eventType", "syncDiagnostic")
+                                .put("capturedAt", System.currentTimeMillis())
+                                .put("stage", "RELAY_MESSAGE_DROPPED")
+                                .toString())
+                            else if (assetsJson != "[]") runCatching {
                                 val assets = org.json.JSONArray(assetsJson)
                                 for (index in 0 until assets.length()) {
                                     val asset = assets.getJSONObject(index)
@@ -145,7 +153,7 @@ object SyncNetwork {
     }
 
     /** Performs one server-side long poll. The service owns retry pacing and listener lifetime. */
-    fun pollReply(context: Context, expectedDeviceId: String): ReplyCommand? {
+    fun pollReply(context: Context, expectedDeviceId: String): ReplyPollResult {
         val store = SyncStore.get(context)
         check(store.paired())
         val connection = signedConnection(store.requestSigningContext(expectedDeviceId), "GET", RepliesPath, ByteArray(0), ReplyPollReadTimeoutMillis)
@@ -153,12 +161,13 @@ object SyncNetwork {
             val responseCode = connection.responseCode
             if (responseCode !in 200..299) throw IllegalStateException("HTTP_$responseCode")
             val root = connection.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }.let(::JSONObject)
-            if (root.isNull("reply")) return null
+            val relayPolicy = RelayPolicy.fromJson(root.getJSONObject("relayPolicy"))
+            if (root.isNull("reply")) return ReplyPollResult(relayPolicy, null)
             val reply = root.getJSONObject("reply")
             val version = reply.getInt("v")
             require(version == 1 || version == 2 || version == 3)
             val envelope = reply.getJSONObject("replyEnvelope")
-            return ReplyCommand(
+            return ReplyPollResult(relayPolicy, ReplyCommand(
                 v = version,
                 id = reply.getString("id"),
                 targetMessageId = reply.getString("targetMessageId"),
@@ -175,7 +184,7 @@ object SyncNetwork {
                 ),
             ).also {
                 require(it.id.isNotBlank() && it.targetMessageId.isNotBlank() && it.deviceId.isNotBlank() && it.createdAt > 0L && NotificationSnapshot.isAllowedWechatUserId(it.wechatUserId))
-            }
+            })
         } finally {
             connection.disconnect()
         }

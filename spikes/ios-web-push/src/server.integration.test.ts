@@ -83,6 +83,23 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   assert.notEqual(a.pairId, b.pairId);
   assert.notEqual(a.deviceId, b.deviceId);
 
+  const defaultPolicy = await browserJson<{ enabled: boolean; scheduleEnabled: boolean; weekdays: number[] }>("/api/v1/relay-policy", sessionB, b.pairId);
+  assert.equal(defaultPolicy.enabled, true);
+  assert.equal(defaultPolicy.scheduleEnabled, false);
+  assert.deepEqual(defaultPolicy.weekdays, [1, 2, 3, 4, 5]);
+  const policyPoll = fetch(`${origin}/api/v1/android/replies`, {
+    headers: signedHeaders(b, "", "GET", "/api/v1/android/replies"),
+  });
+  await delay(50);
+  const pausedPolicy = await updateRelayPolicy(sessionB, b.pairId, false, true);
+  assert.equal(pausedPolicy.active, false);
+  const polled = await (await policyPoll).json() as { reply: null; relayPolicy: { enabled: boolean } };
+  assert.equal(polled.reply, null);
+  assert.equal(polled.relayPolicy.enabled, false);
+  await uploadMessage(b, { v: 4, seq: 1, wechatUserId: 999, replyCapable: false, expectedDropped: true });
+  assert.equal((await browserJson<{ enabled: boolean }>("/api/v1/relay-policy", sessionA, a.pairId)).enabled, true);
+  await updateRelayPolicy(sessionB, b.pairId, true, false);
+
   assert.equal((await fetch(`${origin}/api/status`, {
     headers: { "X-AWR-Test-Token": testToken },
   })).status, 400);
@@ -331,7 +348,7 @@ interface DeviceFixture {
 
 async function applyMigrations(admin: Connection, database: string): Promise<void> {
   await admin.query(`USE \`${database}\``);
-  for (const name of ["001-baseline.sql", "002-multi-pair-browser-sessions.sql", "003-message-reply-capability.sql", "004-conversation-send-capability.sql"])
+  for (const name of ["001-baseline.sql", "002-multi-pair-browser-sessions.sql", "003-message-reply-capability.sql", "004-conversation-send-capability.sql", "005-relay-policy.sql"])
     await admin.query(await readFile(new URL(`../scripts/migrations/${name}`, import.meta.url), "utf8"));
 }
 
@@ -429,7 +446,7 @@ async function pairDevice(ackToken: string, token = testToken): Promise<DeviceFi
 
 async function uploadMessage(
   device: DeviceFixture,
-  options: { v: 1 | 3 | 4 | 5; seq: number; wechatUserId: 0 | 999; replyCapable?: boolean; conversationSendCapable?: boolean; assetId?: string; assetWidth?: number; assetHeight?: number; assetBytes?: number; expectedError?: string },
+  options: { v: 1 | 3 | 4 | 5; seq: number; wechatUserId: 0 | 999; replyCapable?: boolean; conversationSendCapable?: boolean; assetId?: string; assetWidth?: number; assetHeight?: number; assetBytes?: number; expectedError?: string; expectedDropped?: boolean },
 ): Promise<{ id: string }> {
   const id = randomUUID();
   const createdAt = Date.now();
@@ -478,9 +495,24 @@ async function uploadMessage(
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), { error: options.expectedError });
   } else {
-    assert.equal(response.status, 202, await response.text());
+    if (options.expectedDropped) {
+      assert.equal(response.status, 202);
+      assert.deepEqual(await response.json(), { id, dropped: true });
+    } else {
+      assert.equal(response.status, 202, await response.text());
+    }
   }
   return { id };
+}
+
+async function updateRelayPolicy(ackToken: string, pairId: string, enabled: boolean, scheduleEnabled: boolean): Promise<{ active: boolean }> {
+  const response = await fetch(`${origin}/api/v1/relay-policy`, {
+    method: "PUT",
+    headers: { ...browserHeaders(ackToken, pairId, true), "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled, scheduleEnabled, weekdays: [1, 2, 3, 4, 5], start: "09:30", end: "18:00", timezone: "Asia/Shanghai" }),
+  });
+  await assertResponseStatus(response, 200);
+  return await response.json() as { active: boolean };
 }
 
 async function submitReply(

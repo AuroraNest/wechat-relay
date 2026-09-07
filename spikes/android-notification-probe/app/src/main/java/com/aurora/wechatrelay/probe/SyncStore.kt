@@ -166,6 +166,28 @@ class SyncStore private constructor(context: Context) {
     @Synchronized
     fun isCurrentDevice(expectedDeviceId: String): Boolean = preferences.getString(DeviceId, null) == expectedDeviceId
     @Synchronized
+    fun relayPolicy(): RelayPolicy = RelayPolicy(
+        preferences.getBoolean(RelayEnabled, RelayPolicy.Default.enabled),
+        preferences.getBoolean(RelayScheduleEnabled, RelayPolicy.Default.scheduleEnabled),
+        preferences.getInt(RelayWeekdaysMask, RelayPolicy.Default.weekdaysMask),
+        preferences.getInt(RelayStartMinutes, RelayPolicy.Default.startMinutes),
+        preferences.getInt(RelayEndMinutes, RelayPolicy.Default.endMinutes),
+        preferences.getLong(RelayPolicyUpdatedAt, RelayPolicy.Default.updatedAt),
+    )
+    @Synchronized
+    fun saveRelayPolicy(expectedDeviceId: String, policy: RelayPolicy) {
+        check(isCurrentDevice(expectedDeviceId))
+        if (policy.updatedAt < preferences.getLong(RelayPolicyUpdatedAt, 0L)) return
+        check(preferences.edit()
+            .putBoolean(RelayEnabled, policy.enabled)
+            .putBoolean(RelayScheduleEnabled, policy.scheduleEnabled)
+            .putInt(RelayWeekdaysMask, policy.weekdaysMask)
+            .putInt(RelayStartMinutes, policy.startMinutes)
+            .putInt(RelayEndMinutes, policy.endMinutes)
+            .putLong(RelayPolicyUpdatedAt, policy.updatedAt)
+            .commit())
+    }
+    @Synchronized
     fun messageEncryptionContext(expectedDeviceId: String): MessageEncryptionContext {
         check(isCurrentDevice(expectedDeviceId))
         return MessageEncryptionContext(expectedDeviceId, unwrap(requireNotNull(preferences.getString(WrappedA2i, null))))
@@ -463,6 +485,12 @@ class SyncStore private constructor(context: Context) {
                 .remove(PendingReplyDeviceId)
                 .remove(PendingReplyId)
                 .remove(PendingReplyStatus)
+                .remove(RelayEnabled)
+                .remove(RelayScheduleEnabled)
+                .remove(RelayWeekdaysMask)
+                .remove(RelayStartMinutes)
+                .remove(RelayEndMinutes)
+                .remove(RelayPolicyUpdatedAt)
                 .commit(),
         )
         if (replacedDeviceId != null) runCatching {
@@ -496,7 +524,7 @@ class SyncStore private constructor(context: Context) {
     companion object {
         const val Queued = "QUEUED"; const val Uploading = "UPLOADING"; const val ServerAccepted = "SERVER_ACCEPTED"
         const val HistoryQueued = "QUEUED"; const val HistoryRunning = "RUNNING"; const val HistorySending = "SENDING"; const val HistorySent = "SENT"; const val HistoryFailed = "FAILED"; const val HistoryUnknown = "UNKNOWN"
-        private const val QueueCap = 1000; private const val DeviceId = "device_id"; private const val Sequence = "seq"; private const val SigningAlias = "signing_alias"; private const val WrappedA2i = "wrapped_a2i"; private const val WrappedI2a = "wrapped_i2a"; private const val QueuedNotificationIdentities = "queued_notification_identities"; private const val PendingReplyDeviceId = "pending_reply_device_id"; private const val PendingReplyId = "pending_reply_id"; private const val PendingReplyStatus = "pending_reply_status"; private const val WrapAlias = "awrelay_phase1_wrap"
+        private const val QueueCap = 1000; private const val DeviceId = "device_id"; private const val Sequence = "seq"; private const val SigningAlias = "signing_alias"; private const val WrappedA2i = "wrapped_a2i"; private const val WrappedI2a = "wrapped_i2a"; private const val QueuedNotificationIdentities = "queued_notification_identities"; private const val PendingReplyDeviceId = "pending_reply_device_id"; private const val PendingReplyId = "pending_reply_id"; private const val PendingReplyStatus = "pending_reply_status"; private const val RelayEnabled = "relay_enabled"; private const val RelayScheduleEnabled = "relay_schedule_enabled"; private const val RelayWeekdaysMask = "relay_weekdays_mask"; private const val RelayStartMinutes = "relay_start_minutes"; private const val RelayEndMinutes = "relay_end_minutes"; private const val RelayPolicyUpdatedAt = "relay_policy_updated_at"; private const val WrapAlias = "awrelay_phase1_wrap"
         private val HistoryTaskStates = setOf(HistoryQueued, HistoryRunning, HistorySending, HistorySent, HistoryFailed, HistoryUnknown)
         // ponytail: arbitrary old identities may be evicted at 64; upgrade to Room UNIQUE identity if replay volume exceeds it.
         private const val MaxQueuedNotificationIdentities = 64

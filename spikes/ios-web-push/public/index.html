@@ -9,8 +9,8 @@
   <title>Aurora Relay</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="apple-touch-icon" href="/icon-192.png">
-  <link rel="stylesheet" href="/style.css?v=image-view-1">
-  <script src="/app.js?v=image-view-1" type="module"></script>
+  <link rel="stylesheet" href="/style.css?v=relay-policy-1">
+  <script src="/app.js?v=relay-policy-1" type="module"></script>
 </head>
 <body>
   <main class="app-shell">
@@ -42,6 +42,39 @@
         <button id="closeSettings" class="header-button" type="button">完成</button>
       </header>
       <div class="settings-scroll">
+        <details class="settings-group disclosure-card relay-card" open>
+          <summary>消息转发</summary>
+          <div class="disclosure-content">
+            <p id="relayPolicyStatus" class="pairing-status" aria-live="polite">完成配对后可从这里控制小米手机.</p>
+            <label class="toggle-row" for="relayEnabled">
+              <span><strong>允许转发</strong><small>关闭后立即暂停, 直到手动重新开启.</small></span>
+              <input id="relayEnabled" type="checkbox" checked>
+            </label>
+            <label class="toggle-row" for="relayScheduleEnabled">
+              <span><strong>自动暂停</strong><small>按中国标准时间重复执行.</small></span>
+              <input id="relayScheduleEnabled" type="checkbox">
+            </label>
+            <fieldset id="relayScheduleFields" class="schedule-fields">
+              <legend>暂停时间</legend>
+              <div class="weekday-picker" aria-label="暂停星期">
+                <label><input name="relayWeekday" type="checkbox" value="1" checked>一</label>
+                <label><input name="relayWeekday" type="checkbox" value="2" checked>二</label>
+                <label><input name="relayWeekday" type="checkbox" value="3" checked>三</label>
+                <label><input name="relayWeekday" type="checkbox" value="4" checked>四</label>
+                <label><input name="relayWeekday" type="checkbox" value="5" checked>五</label>
+                <label><input name="relayWeekday" type="checkbox" value="6">六</label>
+                <label><input name="relayWeekday" type="checkbox" value="7">日</label>
+              </div>
+              <div class="time-range">
+                <label for="relayStart">开始<input id="relayStart" type="time" value="09:30"></label>
+                <label for="relayEnd">结束<input id="relayEnd" type="time" value="18:00"></label>
+              </div>
+            </fieldset>
+            <button id="saveRelayPolicy" class="primary-button" type="button">保存转发设置</button>
+            <p class="relay-note">暂停期间的新消息不会保存或在恢复后补发.</p>
+          </div>
+        </details>
+
         <details class="settings-group disclosure-card connect-card" open>
           <summary>设备连接</summary>
           <div class="disclosure-content connect-content">

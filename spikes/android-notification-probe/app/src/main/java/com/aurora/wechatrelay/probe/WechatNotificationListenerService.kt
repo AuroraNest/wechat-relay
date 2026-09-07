@@ -70,6 +70,10 @@ class WechatNotificationListenerService : NotificationListenerService() {
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         if (!isSourceWechat(sbn)) return
         startReplyPolling()
+        if (!SyncStore.get(this).relayPolicy().active()) {
+            recordSyncDiagnostic("RELAY_PAUSED")
+            return
+        }
 
         try {
             val captured = NotificationSnapshot.capture(this, sbn)
@@ -251,6 +255,13 @@ class WechatNotificationListenerService : NotificationListenerService() {
                     Thread.sleep(1_000)
                     while (!Thread.currentThread().isInterrupted && store.isCurrentDevice(deviceId)) {
                         val tasks = store.pendingHistoryTasks(deviceId)
+                        if (!store.relayPolicy().active()) {
+                            tasks.forEach { task ->
+                                store.historyTaskState(deviceId, task.id, SyncStore.HistoryFailed, "RELAY_PAUSED")
+                                historySources.remove(task.id)
+                            }
+                            break
+                        }
                         tasks.forEach {
                             val kind = JSONObject(store.historyTaskPayload(deviceId, it)).optString("kind", "history")
                             historySources.putIfAbsent(it.id, HistorySource(it.sourceKey, it.postTime, null, kind))
@@ -282,7 +293,7 @@ class WechatNotificationListenerService : NotificationListenerService() {
                             continue
                         }
                         val contentIntent = historySources[task.id]?.contentIntent?.takeIf { it.creatorPackage == NotificationSnapshot.WechatPackage }
-                        val isCurrent = { ProbeRuntime.listenerConnected && store.isCurrentDevice(deviceId) && System.currentTimeMillis() - freshnessTime in 0..120_000 &&
+                        val isCurrent = { ProbeRuntime.listenerConnected && store.isCurrentDevice(deviceId) && store.relayPolicy().active() && System.currentTimeMillis() - freshnessTime in 0..120_000 &&
                             historySources.none { (id, source) -> id != task.id && source.sourceKey == task.sourceKey && source.postTime == task.postTime } }
                         val cardsAfter = { historySources.values.count { it.sourceKey == task.sourceKey && it.kind == (if (voice) "voice" else "history") && it.postTime > task.postTime } }
                         val deadline = android.os.SystemClock.uptimeMillis() + 30_000
@@ -305,7 +316,10 @@ class WechatNotificationListenerService : NotificationListenerService() {
                         val sending = store.findHistoryTask(deviceId, task.id)?.state == SyncStore.HistorySending
                         val state = if (result.status == "HISTORY_FORWARDED") SyncStore.HistorySent
                             else if (sending) SyncStore.HistoryUnknown else SyncStore.HistoryFailed
-                        val completed = if (voice) queueVoiceResult(task, title, sender, result)
+                        val completed = if (!store.relayPolicy().active()) {
+                            store.historyTaskState(deviceId, task.id, SyncStore.HistoryFailed, "RELAY_PAUSED")
+                            true
+                        } else if (voice) queueVoiceResult(task, title, sender, result)
                         else { store.historyTaskState(deviceId, task.id, state, result.stage); true }
                         historySources.remove(task.id)
                         activeTask = null
@@ -551,7 +565,9 @@ class WechatNotificationListenerService : NotificationListenerService() {
             while (replySessionActive(generation, expectedDeviceId)) {
                 try {
                     flushPendingReplyAck(expectedDeviceId)
-                    val command = SyncNetwork.pollReply(this, expectedDeviceId)
+                    val result = SyncNetwork.pollReply(this, expectedDeviceId)
+                    SyncStore.get(this).saveRelayPolicy(expectedDeviceId, result.relayPolicy)
+                    val command = result.reply
                     // A command belongs to the device generation that authenticated this long poll.
                     if (command != null && replySessionActive(generation, expectedDeviceId)) {
                         recordSyncDiagnostic("REPLY_COMMAND_RECEIVED")

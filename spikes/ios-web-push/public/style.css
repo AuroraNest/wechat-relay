@@ -244,6 +244,23 @@ h2 {
 .pairing-status[data-state="success"] { border-color: #77c68a; background: #f0fbf2; color: #1f6c35; }
 .pairing-status[data-state="error"] { border-color: #dc6b6b; background: #fff3f3; color: #a52f2f; }
 
+.toggle-row { display: flex; align-items: center; gap: 16px; min-height: 64px; margin: 0; border-bottom: 1px solid #e5e5e7; color: #1d1d1f; }
+.toggle-row span { display: grid; gap: 3px; margin-right: auto; }
+.toggle-row strong { font-size: 16px; }
+.toggle-row small, .relay-note { color: #6e6e73; font-size: 13px; line-height: 1.4; }
+.toggle-row input { width: 24px; min-height: 24px; margin: 0; accent-color: #07c160; }
+.schedule-fields { margin: 18px 0; padding: 0; border: 0; }
+.schedule-fields:disabled { opacity: .45; }
+.schedule-fields legend { margin-bottom: 10px; color: #6e6e73; font-size: 14px; }
+.weekday-picker { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; margin-bottom: 12px; }
+.weekday-picker label { display: grid; min-height: 38px; margin: 0; place-items: center; border-radius: 10px; background: #f5f5f7; color: #1d1d1f; }
+.weekday-picker input { position: absolute; width: 1px; min-height: 1px; margin: 0; opacity: 0; }
+.weekday-picker label:has(input:checked) { background: #0071e3; color: #fff; }
+.time-range { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.time-range label { margin: 0; }
+.time-range input { margin: 6px 0 0; }
+.relay-note { margin: 12px 2px 0; text-align: center; }
+
 .primary-button[aria-busy="true"] { cursor: progress; opacity: .72; }
 input[aria-invalid="true"] { border-color: #dc6b6b; box-shadow: 0 0 0 4px rgba(220, 107, 107, .14); }
 

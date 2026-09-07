@@ -6,11 +6,22 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.charset.StandardCharsets
+import java.time.Instant
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 class ProbeCoreTest {
+    @Test
+    fun relayPolicyPausesOnlyInsideConfiguredChinaTimeWindow() {
+        val policy = RelayPolicy(true, true, 31, 570, 1080, 1L)
+        assertTrue(policy.active(Instant.parse("2026-09-07T01:29:00Z").toEpochMilli()))
+        assertFalse(policy.active(Instant.parse("2026-09-07T01:30:00Z").toEpochMilli()))
+        assertTrue(policy.active(Instant.parse("2026-09-07T10:00:00Z").toEpochMilli()))
+        assertTrue(policy.active(Instant.parse("2026-09-06T02:00:00Z").toEpochMilli()))
+        assertFalse(policy.copy(enabled = false, scheduleEnabled = false).active())
+    }
+
     @Test
     fun keyguardDismissWaitsForFocusedVisibleGateAndRefocusDoesNotRepeatIt() {
         assertFalse(UnlockGatePolicy.shouldRequestDismiss(false, false, false))
