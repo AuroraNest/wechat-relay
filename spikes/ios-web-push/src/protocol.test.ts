@@ -30,6 +30,7 @@ test("message id and AAD must match", () => {
 
 test("request error classification exposes only intentional client errors", () => {
   assert.deepEqual(classifyRequestError(new Error("REPLY_UNSUPPORTED")), { status: 400, code: "REPLY_UNSUPPORTED" });
+  assert.deepEqual(classifyRequestError(new Error("CONTACTS_SNAPSHOT_STALE")), { status: 409, code: "CONTACTS_SNAPSHOT_STALE" });
   assert.deepEqual(classifyRequestError(new Error("PAYLOAD_TOO_LARGE:2900")), { status: 400, code: "PAYLOAD_TOO_LARGE" });
   assert.deepEqual(classifyRequestError(new Error("ER_BAD_FIELD_ERROR: database detail")), { status: 500, code: "INTERNAL_ERROR" });
   assert.deepEqual(classifyRequestError(new Error("INVALID_DATABASE_INTEGER")), { status: 500, code: "INTERNAL_ERROR" });

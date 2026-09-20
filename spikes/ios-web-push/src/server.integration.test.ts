@@ -142,6 +142,96 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   assert.equal(activeNativeStatus.pushRegistered, true);
   assert.equal(typeof activeNativeStatus.lastSeenAt, "number");
 
+  const offlineCapturedAt = Date.now() - 3 * 86_400_000;
+  const contacts0 = contactsSnapshot(native, 0, offlineCapturedAt);
+  const contacts0Body = JSON.stringify(contacts0);
+  const contacts0Headers = signedHeaders(native, contacts0Body, "POST", "/api/v1/android/contacts");
+  const firstContacts = await postContacts(contacts0Body, contacts0Headers);
+  assert.equal(firstContacts.status, 201);
+  assert.deepEqual(await firstContacts.json(), { id: contacts0.id, idempotent: false });
+  const replayedContacts = await postContacts(contacts0Body, contacts0Headers);
+  assert.equal(replayedContacts.status, 400);
+  assert.deepEqual(await replayedContacts.json(), { error: "REPLAYED_NONCE" });
+  const retryContacts = await postContacts(
+    contacts0Body,
+    signedHeaders(native, contacts0Body, "POST", "/api/v1/android/contacts"),
+  );
+  assert.equal(retryContacts.status, 200);
+  assert.deepEqual(await retryContacts.json(), { id: contacts0.id, idempotent: true });
+
+  const newerContacts0 = contactsSnapshot(native, 0, offlineCapturedAt + 1);
+  const newerContacts0Body = JSON.stringify(newerContacts0);
+  await assertResponseStatus(
+    await postContacts(newerContacts0Body, signedHeaders(native, newerContacts0Body, "POST", "/api/v1/android/contacts")),
+    201,
+  );
+  const staleContacts = contactsSnapshot(native, 0, offlineCapturedAt);
+  const staleContactsBody = JSON.stringify(staleContacts);
+  const staleContactsResponse = await postContacts(staleContactsBody, signedHeaders(native, staleContactsBody, "POST", "/api/v1/android/contacts"));
+  assert.equal(staleContactsResponse.status, 409);
+  assert.deepEqual(await staleContactsResponse.json(), { error: "CONTACTS_SNAPSHOT_STALE" });
+
+  const contacts999 = contactsSnapshot(native, 999, Date.now());
+  const contacts999Body = JSON.stringify(contacts999);
+  await assertResponseStatus(
+    await postContacts(contacts999Body, signedHeaders(native, contacts999Body, "POST", "/api/v1/android/contacts")),
+    201,
+  );
+  const conflictingId = contactsSnapshot(native, 0, Date.now());
+  conflictingId.id = contacts999.id;
+  conflictingId.contactsEnvelope.aad = `AWR1|A2I_CONTACTS|1|${conflictingId.id}|${native.deviceId}|${conflictingId.capturedAt}|${conflictingId.wechatUserId}`;
+  const conflictingIdBody = JSON.stringify(conflictingId);
+  const conflictingIdResponse = await postContacts(conflictingIdBody, signedHeaders(native, conflictingIdBody, "POST", "/api/v1/android/contacts"));
+  assert.equal(conflictingIdResponse.status, 409);
+  assert.deepEqual(await conflictingIdResponse.json(), { error: "CONTACTS_ID_CONFLICT" });
+  const badAad = contactsSnapshot(native, 999, Date.now());
+  badAad.contactsEnvelope.aad = "AWR1|A2I_CONTACTS|1|wrong";
+  const badAadBody = JSON.stringify(badAad);
+  const badAadResponse = await postContacts(badAadBody, signedHeaders(native, badAadBody, "POST", "/api/v1/android/contacts"));
+  assert.equal(badAadResponse.status, 400);
+  assert.deepEqual(await badAadResponse.json(), { error: "INVALID_CONTACTS_ENVELOPE" });
+  const badProfile = { ...contactsSnapshot(native, 0, Date.now()), wechatUserId: 1 };
+  const badProfileBody = JSON.stringify(badProfile);
+  const badProfileResponse = await postContacts(badProfileBody, signedHeaders(native, badProfileBody, "POST", "/api/v1/android/contacts"));
+  assert.equal(badProfileResponse.status, 400);
+  assert.deepEqual(await badProfileResponse.json(), { error: "INVALID_CONTACTS_SNAPSHOT" });
+  const overLimit = contactsSnapshot(native, 999, Date.now());
+  overLimit.contactsEnvelope.ct = randomBytes(1_048_576 + 17).toString("base64url");
+  const overLimitBody = JSON.stringify(overLimit);
+  const overLimitResponse = await postContacts(overLimitBody, signedHeaders(native, overLimitBody, "POST", "/api/v1/android/contacts"));
+  assert.equal(overLimitResponse.status, 400);
+  assert.deepEqual(await overLimitResponse.json(), { error: "INVALID_CONTACTS_ENVELOPE" });
+
+  const contactsResponse = await fetch(`${origin}/api/v1/ios/contacts`, {
+    headers: browserHeaders(nativeSession, native.pairId),
+  });
+  await assertResponseStatus(contactsResponse, 200);
+  const storedContacts = await contactsResponse.json() as { snapshots: Array<{ id: string; wechatUserId: number; contactsEnvelope: { ct: string } }> };
+  assert.deepEqual(
+    storedContacts.snapshots.map((snapshot) => ({ id: snapshot.id, wechatUserId: snapshot.wechatUserId })),
+    [
+      { id: newerContacts0.id, wechatUserId: 0 },
+      { id: contacts999.id, wechatUserId: 999 },
+    ],
+  );
+  const contactsRows = await db.query<(mysql.RowDataPacket & { envelope_json: string; body_hash: Buffer })[]>(
+    "SELECT envelope_json, body_hash FROM contacts_snapshots WHERE device_id = ? ORDER BY wechat_user_id",
+    [native.deviceId],
+  );
+  assert.equal(contactsRows[0].length, 2);
+  assert.equal(contactsRows[0][0]!.envelope_json.includes("Alice"), false);
+  assert.equal(contactsRows[0][0]!.body_hash.length, 32);
+  const webContacts = await fetch(`${origin}/api/v1/ios/contacts`, {
+    headers: browserHeaders(sessionA, a.pairId),
+  });
+  assert.equal(webContacts.status, 400);
+  assert.deepEqual(await webContacts.json(), { error: "INVALID_IOS_SESSION" });
+  const crossPairContacts = await fetch(`${origin}/api/v1/ios/contacts`, {
+    headers: browserHeaders(nativeSession, a.pairId),
+  });
+  assert.equal(crossPairContacts.status, 400);
+  assert.deepEqual(await crossPairContacts.json(), { error: "PAIRING_MISMATCH" });
+
   await updateIosPush(nativeSession, native.pairId, invalidApnsToken, "sandbox", true);
   const rejectedNativeMessage = await uploadMessage(native, {
     v: 4,
@@ -160,6 +250,20 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   );
   assert.equal(Number(rejectedOutbox?.attempts), 1);
   assert.equal(rejectedOutbox?.sent_at, null);
+
+  const replacementNative = await pairDevice(nativeSession);
+  assert.notEqual(replacementNative.deviceId, native.deviceId);
+  const oldDeviceSnapshot = contactsSnapshot(native, 0, Date.now());
+  const oldDeviceSnapshotBody = JSON.stringify(oldDeviceSnapshot);
+  await assertResponseStatus(
+    await postContacts(oldDeviceSnapshotBody, signedHeaders(native, oldDeviceSnapshotBody, "POST", "/api/v1/android/contacts")),
+    201,
+  );
+  const replacementContacts = await fetch(`${origin}/api/v1/ios/contacts`, {
+    headers: browserHeaders(nativeSession, replacementNative.pairId),
+  });
+  await assertResponseStatus(replacementContacts, 200);
+  assert.deepEqual(await replacementContacts.json(), { snapshots: [] });
 
   const defaultPolicy = await browserJson<{ enabled: boolean; scheduleEnabled: boolean; weekdays: number[] }>("/api/v1/relay-policy", sessionB, b.pairId);
   assert.equal(defaultPolicy.enabled, true);
@@ -426,7 +530,7 @@ interface DeviceFixture {
 
 async function applyMigrations(admin: Connection, database: string): Promise<void> {
   await admin.query(`USE \`${database}\``);
-  for (const name of ["001-baseline.sql", "002-multi-pair-browser-sessions.sql", "003-message-reply-capability.sql", "004-conversation-send-capability.sql", "005-relay-policy.sql"])
+  for (const name of ["001-baseline.sql", "002-multi-pair-browser-sessions.sql", "003-message-reply-capability.sql", "004-conversation-send-capability.sql", "005-relay-policy.sql", "006-contacts-snapshots.sql"])
     await admin.query(await readFile(new URL(`../scripts/migrations/${name}`, import.meta.url), "utf8"));
 }
 
@@ -714,6 +818,57 @@ function signedHeaders(device: DeviceFixture, body: string, method: "GET" | "POS
       dsaEncoding: "der",
     }).toString("base64url"),
   };
+}
+
+interface ContactsSnapshotFixture {
+  v: 1;
+  id: string;
+  deviceId: string;
+  wechatUserId: 0 | 999;
+  capturedAt: number;
+  contactsEnvelope: {
+    alg: "A256GCM";
+    kid: "phase1-contacts";
+    iv: string;
+    aad: string;
+    ct: string;
+  };
+}
+
+function contactsSnapshot(
+  device: DeviceFixture,
+  wechatUserId: 0 | 999,
+  capturedAt: number,
+): ContactsSnapshotFixture {
+  const id = uuidV7();
+  return {
+    v: 1,
+    id,
+    deviceId: device.deviceId,
+    wechatUserId,
+    capturedAt,
+    contactsEnvelope: {
+      alg: "A256GCM",
+      kid: "phase1-contacts",
+      iv: randomBytes(12).toString("base64url"),
+      aad: `AWR1|A2I_CONTACTS|1|${id}|${device.deviceId}|${capturedAt}|${wechatUserId}`,
+      ct: randomBytes(64).toString("base64url"),
+    },
+  };
+}
+
+function uuidV7(): string {
+  const random = randomBytes(9).toString("hex");
+  const timestamp = Date.now().toString(16).padStart(12, "0").slice(-12);
+  return `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${random.slice(0, 3)}-8${random.slice(3, 6)}-${random.slice(6)}`;
+}
+
+async function postContacts(body: string, headers: Record<string, string>): Promise<Response> {
+  return fetch(`${origin}/api/v1/android/contacts`, {
+    method: "POST",
+    headers,
+    body,
+  });
 }
 
 function browserHeaders(ackToken: string, pairId: string, includeOrigin = false): Record<string, string> {

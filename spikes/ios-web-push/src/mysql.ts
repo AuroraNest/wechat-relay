@@ -24,7 +24,7 @@ export const pool: Pool = mysql.createPool({
   bigNumberStrings: true,
 });
 
-const requiredSchemaVersion = 5;
+const requiredSchemaVersion = 6;
 const requiredColumns: Record<string, readonly string[]> = {
   schema_migrations: ["version", "name", "applied_at"],
   pairings: ["pair_id", "secret_hash", "expires_at", "consumed_at"],
@@ -35,6 +35,7 @@ const requiredColumns: Record<string, readonly string[]> = {
   replies: ["id", "pair_id", "target_message_id", "device_id", "wechat_user_id", "created_at", "envelope_json", "status", "status_at", "queued_at"],
   browser_sessions: ["session_id", "ack_token_hash", "subscription_envelope", "pair_id", "created_at", "updated_at", "invalidated_at"],
   relay_policies: ["pair_id", "enabled", "schedule_enabled", "weekdays_mask", "start_minutes", "end_minutes", "updated_at"],
+  contacts_snapshots: ["id", "device_id", "wechat_user_id", "captured_at", "body_hash", "envelope_json", "received_at"],
 };
 
 export async function verifySchema(): Promise<void> {

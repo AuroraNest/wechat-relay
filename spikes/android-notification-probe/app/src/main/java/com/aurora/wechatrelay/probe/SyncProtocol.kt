@@ -59,11 +59,40 @@ object SyncProtocol {
         return Envelope("A256GCM", "phase1-asset", encode(iv), aad, encode(cipher.doFinal(bytes)))
     }
 
+    fun encryptContacts(
+        key: ByteArray,
+        id: String,
+        deviceId: String,
+        capturedAt: Long,
+        wechatUserId: Int,
+        contacts: List<String>,
+        iv: ByteArray = ByteArray(12).also(random::nextBytes),
+    ): Envelope {
+        require(key.size == 32 && NotificationSnapshot.isAllowedWechatUserId(wechatUserId))
+        require(id == id.lowercase() && ContactsId.matches(id) && iv.size == 12)
+        require(contacts.distinct().size == contacts.size)
+        contacts.forEach { name -> require(name.isNotEmpty() && name == name.trim() && name.toByteArray(StandardCharsets.UTF_8).size <= ContactsPageAssembly.MaxNameBytes) }
+        val plaintext = ContactsPageAssembly.contactsJson(contacts).toByteArray(StandardCharsets.UTF_8)
+        require(plaintext.size <= ContactsPageAssembly.MaxPlaintextBytes)
+        val aad = a2iContactsAad(id, deviceId, capturedAt, wechatUserId)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        cipher.updateAAD(aad.toByteArray(StandardCharsets.UTF_8))
+        val ciphertext = try { cipher.doFinal(plaintext) } finally { plaintext.fill(0) }
+        require(ciphertext.size <= ContactsPendingStore.MaxCiphertextBytes)
+        return Envelope("A256GCM", "phase1-contacts", encode(iv), aad, encode(ciphertext))
+    }
+
     fun a2iAad(id: String, deviceId: String, seq: Long, createdAt: Long, wechatUserId: Int? = null): String =
         if (wechatUserId == null) "AWR1|A2I|$id|$deviceId|$seq|$createdAt" else "AWR1|A2I|$id|$deviceId|$seq|$createdAt|$wechatUserId"
 
     fun a2iAssetAad(assetId: String, deviceId: String, seq: Long, createdAt: Long, wechatUserId: Int? = null): String =
         if (wechatUserId == null) "AWR1|A2I_ASSET|$assetId|$deviceId|$seq|$createdAt" else "AWR1|A2I_ASSET|$assetId|$deviceId|$seq|$createdAt|$wechatUserId"
+
+    fun a2iContactsAad(id: String, deviceId: String, capturedAt: Long, wechatUserId: Int): String {
+        require(id == id.lowercase() && ContactsId.matches(id) && NotificationSnapshot.isAllowedWechatUserId(wechatUserId))
+        return "AWR1|A2I_CONTACTS|1|$id|$deviceId|$capturedAt|$wechatUserId"
+    }
 
     fun i2aAad(replyId: String, deviceId: String, targetMessageId: String, createdAt: Long, wechatUserId: Int? = null): String =
         if (wechatUserId == null) "AWR1|I2A|$replyId|$deviceId|$targetMessageId|$createdAt" else "AWR1|I2A|$replyId|$deviceId|$targetMessageId|$createdAt|$wechatUserId"
@@ -188,4 +217,6 @@ object SyncProtocol {
         }
         append('"')
     }
+
+    private val ContactsId = Regex("[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 }

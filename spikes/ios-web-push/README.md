@@ -24,6 +24,8 @@ npm run dev
 
 `.env.development` 是 `npm run dev` 唯一读取的环境文件. 启动前会校验 `NODE_ENV=development`, `MYSQL_HOST=127.0.0.1`, `MYSQL_PORT=23306`, `MYSQL_DATABASE=wechat_relay_dev`, `DATA_DIR=data/development`, 并要求 `REDIS_URL` 为空. `npm run dev:db` 使用 `compose.development.yml` 创建独立 MySQL 8.4 volume. 初始迁移只会在新 volume 创建时导入. 已有 volume 应按版本应用增量迁移, 不要为重新初始化迁移删除数据.
 
+联系人快照要求 schema v6. 对已有数据库先应用 `scripts/migrations/006-contacts-snapshots.sql`; 表只保存每个 Android device 和 profile 的最新 AES-GCM 密文信封及校验元数据.
+
 开发 Origin 只能用于本机检查. 若要在 iPhone 上安装 PWA 或接收 Web Push, 请配置自己的 HTTPS Origin, 并将它写入 development 配置的 `PUBLIC_ORIGIN`.
 
 ## 生产自托管
@@ -54,12 +56,14 @@ npm run start:production
 
 APNs 是可选能力. 不配置时服务仍可为原生 App 创建 session, 完成配对并提供消息和回复 API. 未注册 device token 或 APNs 未配置时, Push outbox 保持待发送, 不会伪造成功或发起外部重试. 配置 APNs 时, `APNS_TEAM_ID`, `APNS_KEY_ID` 和 `APNS_PRIVATE_KEY_PATH` 必须同时存在. 私钥路径指向 Git 外的 Apple `.p8` 文件. `APNS_TOPIC` 默认是 `com.auroramaple.wechatrelay`, 只由服务端配置, 客户端不能提交 topic, host 或私钥.
 
-原生 App 的新增 API 如下. 每次调用都必须发送与 `PUBLIC_ORIGIN` 完全相同的 `Origin`:
+原生 session, push 和 status 请求必须发送与 `PUBLIC_ORIGIN` 完全相同的 `Origin`. 其余 API 如下:
 
 - `POST /api/v1/ios/sessions`: 使用 `X-AWR-Test-Token` 和 JSON object 创建 session. 可选字段为 `environment` 和 `previewEnabled`, 默认分别为 `sandbox` 和 `false`. 返回 `{ackToken}`.
 - `POST /api/v1/pairings`: 继续使用既有 `X-AWR-Test-Token` 和 `X-AWR-Ack-Token` 流程.
 - `PUT /api/v1/ios/push`: 使用 `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id`, 提交 `{deviceToken,environment,previewEnabled}`. `deviceToken` 可以是 `null`.
 - `GET /api/v1/ios/status`: 使用 `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id`, 返回配对, Android 最近签名请求时间及 Push 状态.
+- `POST /api/v1/android/contacts`: 使用既有 Android 签名请求头, 提交 v1 contacts envelope. 服务端验证 `AWR1|A2I_CONTACTS|1|{id}|{deviceId}|{capturedAt}|{wechatUserId}` AAD, 但不读取联系人明文.
+- `GET /api/v1/ios/contacts`: 仅 native session 使用 `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id` 读取当前 pair 的至多两个 profile snapshot. 重配对后旧 device 的快照不可读取.
 
 当 `previewEnabled=false` 时, APNs payload 不含 `previewEnvelope`. 通知扩展应从受认证的消息 API 获取完整密文记录. APNs 返回无效 token 时, 服务端只清除该原生 destination 的 token, 不撤销 session 或配对.
 

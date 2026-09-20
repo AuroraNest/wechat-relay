@@ -21,11 +21,7 @@ struct DevicesView: View {
                 statusRow("iPhone 注册", value: model.device?.pushRegistered == true ? "已注册" : "尚未注册", symbol: "iphone", ready: model.device?.pushRegistered == true)
                 NavigationLink { DiagnosticsView() } label: { Label("连接诊断", systemImage: "waveform.path.ecg") }
             }
-            Section {
-                NavigationLink { NotificationSettingsView() } label: { Label("通知与权限", systemImage: "bell.badge") }
-                NavigationLink { RelayPolicyView() } label: { Label("转发设置", systemImage: "arrow.triangle.2.circlepath") }
-            } footer: { Text("Android 的通知读取、无障碍和电池限制, 请在 Android 中继 App 上确认. 此处只展示服务器能够确认的状态.") }
-        }.navigationTitle("设备").refreshable { await model.refresh() }
+        }.navigationTitle("设备与连接").refreshable { await model.refresh() }
     }
     private func statusRow(_ title: String, value: String, symbol: String, ready: Bool) -> some View {
         HStack { Label(title, systemImage: symbol); Spacer(); Text(value).font(.subheadline).foregroundStyle(ready ? Color.secondary : .orange) }
@@ -76,7 +72,7 @@ struct SettingsView: View {
             Section {
                 NavigationLink { RelayPolicyView() } label: { Label("转发与时间段", systemImage: "clock") }
                 NavigationLink { NotificationSettingsView() } label: { Label("通知与隐私", systemImage: "bell.badge") }
-                NavigationLink { DiagnosticsView() } label: { Label("连接诊断", systemImage: "waveform.path.ecg") }
+                NavigationLink { DevicesView() } label: { Label("设备与连接", systemImage: "iphone.gen3.radiowaves.left.and.right") }
             }
             Section {
                 Button { clear = true } label: { Label("清空本机记录", systemImage: "trash") }

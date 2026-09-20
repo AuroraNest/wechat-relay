@@ -18,6 +18,15 @@ struct Conversation: Identifiable {
     let unread: Int
 }
 
+struct RelayFriend: Identifiable, Hashable {
+    let name: String
+    let wechatUserId: Int
+    let capturedAt: Int64
+
+    var id: String { "\(wechatUserId):\(name)" }
+    var profileLabel: String { wechatUserId == 999 ? "微信 2" : "微信" }
+}
+
 struct OutgoingMessage: Codable, Identifiable {
     let request: RelayReplyRequest
     let conversationID: String
@@ -26,11 +35,40 @@ struct OutgoingMessage: Codable, Identifiable {
     var id: UUID { request.id }
 }
 
+private struct CachedContacts: Codable {
+    let id: UUID
+    let deviceId: String
+    let wechatUserId: Int
+    let capturedAt: Int64
+    let contacts: [RelayContact]
+}
+
 private struct InboxSnapshot: Codable {
     var messages: [RelayMessage] = []
     var outgoing: [OutgoingMessage] = []
     var readThrough: [String: Int] = [:]
     var clearedThrough: Int = 0
+    var contacts: [CachedContacts] = []
+
+    enum CodingKeys: String, CodingKey { case messages, outgoing, readThrough, clearedThrough, contacts }
+
+    init(messages: [RelayMessage] = [], outgoing: [OutgoingMessage] = [], readThrough: [String: Int] = [:], clearedThrough: Int = 0, contacts: [CachedContacts] = []) {
+        self.messages = messages
+        self.outgoing = outgoing
+        self.readThrough = readThrough
+        self.clearedThrough = clearedThrough
+        self.contacts = contacts
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        messages = try values.decode([RelayMessage].self, forKey: .messages)
+        outgoing = try values.decode([OutgoingMessage].self, forKey: .outgoing)
+        readThrough = try values.decode([String: Int].self, forKey: .readThrough)
+        clearedThrough = try values.decode(Int.self, forKey: .clearedThrough)
+        // Cache versions before Friends did not have this key.
+        contacts = try values.decodeIfPresent([CachedContacts].self, forKey: .contacts) ?? []
+    }
 }
 
 @MainActor
@@ -51,6 +89,10 @@ final class RelayAppModel: ObservableObject {
     @Published private(set) var isRefreshing = false
     @Published private(set) var isSavingPolicy = false
     @Published private(set) var hasMore = false
+    @Published private(set) var friends: [RelayFriend] = []
+    @Published private(set) var contactsProblem: String?
+    @Published private(set) var contactsAvailable: Bool?
+    @Published private(set) var isRefreshingContacts = false
     @Published var problem: String?
     @Published var selectedTab = 0
     @Published var conversationPath: [String] = []
@@ -94,6 +136,10 @@ final class RelayAppModel: ObservableObject {
             guard let latest = values.max(by: { $0.message.seq < $1.message.seq }) else { return nil }
             return Conversation(id: id, latest: latest, unread: values.filter { $0.message.seq > (snapshot.readThrough[id] ?? 0) }.count)
         }.sorted { $0.latest.message.seq > $1.latest.message.seq }
+    }
+
+    var friendsCapturedAt: Date? {
+        snapshot.contacts.map(\.capturedAt).max().map { Date(timeIntervalSince1970: Double($0) / 1_000) }
     }
 
     var stateTitle: String {
@@ -141,6 +187,9 @@ final class RelayAppModel: ObservableObject {
         pairing = newPairing
         problem = nil
         snapshot = InboxSnapshot()
+        friends = []
+        contactsAvailable = nil
+        contactsProblem = nil
         pushDirty = true
         await refresh()
     }
@@ -210,6 +259,35 @@ final class RelayAppModel: ObservableObject {
         } catch { problem = Self.describe(error) }
     }
 
+    func refreshContacts() async {
+        guard !isDemo, let session, !isRefreshingContacts, cacheReadable else { return }
+        isRefreshingContacts = true
+        defer { isRefreshingContacts = false }
+        do {
+            let api = try RelayAPI(origin: session.origin)
+            let currentDevice = try await api.deviceStatus(session: session)
+            guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
+            device = currentDevice
+            lastStatusCheck = Date()
+            guard currentDevice.paired, let currentDeviceID = currentDevice.deviceId,
+                  currentDeviceID.range(of: "^[A-Za-z0-9_-]{16,128}$", options: .regularExpression) != nil else {
+                throw RelayError.invalidResponse
+            }
+            let snapshots = try await api.contacts(session: session)
+            guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
+            try mergeContacts(snapshots, currentDeviceID: currentDeviceID, session: session)
+            contactsAvailable = true
+            contactsProblem = nil
+        } catch is CancellationError {
+        } catch RelayError.httpStatus(404) {
+            // Older Relay servers do not expose contacts. Keep message synchronization independent.
+            contactsAvailable = false
+            contactsProblem = nil
+        } catch {
+            if !Task.isCancelled { contactsProblem = Self.describe(error) }
+        }
+    }
+
     private func merge(_ messages: [RelayMessage]) throws {
         guard let session else { return }
         var unique = Dictionary(uniqueKeysWithValues: snapshot.messages.map { ($0.id, $0) })
@@ -219,6 +297,60 @@ final class RelayAppModel: ObservableObject {
         }
         snapshot.messages = unique.values.sorted { $0.seq < $1.seq }
         items = try snapshot.messages.map { InboxItem(message: $0, preview: try RelayCrypto.decryptPreview($0, messageKey: session.messageKey)) }
+    }
+
+    private func mergeContacts(_ incoming: [RelayContactSnapshot], currentDeviceID: String, session: RelaySession) throws {
+        guard incoming.count <= 2, Set(incoming.map(\.wechatUserId)).count == incoming.count else {
+            throw RelayError.invalidResponse
+        }
+        let decoded = try incoming.map { snapshot -> (RelayContactSnapshot, RelayContactsPayload) in
+            guard snapshot.deviceId == currentDeviceID else { throw RelayError.invalidResponse }
+            return (snapshot, try RelayCrypto.decryptContacts(snapshot, messageKey: session.messageKey))
+        }
+        var cached: [Int: CachedContacts] = [:]
+        for local in snapshot.contacts where cached[local.wechatUserId]?.capturedAt ?? .min < local.capturedAt {
+            cached[local.wechatUserId] = local
+        }
+        var changed = false
+        for (remote, payload) in decoded {
+            if let local = cached[remote.wechatUserId] {
+                if remote.capturedAt < local.capturedAt { continue }
+                if remote.capturedAt == local.capturedAt {
+                    guard remote.id == local.id, remote.deviceId == local.deviceId else { throw RelayError.invalidResponse }
+                    continue
+                }
+            }
+            cached[remote.wechatUserId] = CachedContacts(id: remote.id, deviceId: remote.deviceId, wechatUserId: remote.wechatUserId, capturedAt: remote.capturedAt, contacts: payload.contacts)
+            changed = true
+        }
+        guard changed else { return }
+        let previousContacts = snapshot.contacts
+        snapshot.contacts = cached.values.sorted { $0.wechatUserId < $1.wechatUserId }
+        do {
+            try saveCache()
+        } catch {
+            snapshot.contacts = previousContacts
+            throw error
+        }
+        refreshFriends()
+    }
+
+    private func refreshFriends() {
+        friends = snapshot.contacts.flatMap { snapshot in
+            snapshot.contacts.map { RelayFriend(name: $0.name, wechatUserId: snapshot.wechatUserId, capturedAt: snapshot.capturedAt) }
+        }.sorted {
+            let comparison = $0.name.localizedStandardCompare($1.name)
+            if comparison == .orderedSame { return $0.wechatUserId < $1.wechatUserId }
+            return comparison == .orderedAscending
+        }
+    }
+
+    func conversationID(for friend: RelayFriend) -> String? {
+        items.last(where: { $0.message.wechatUserId == friend.wechatUserId && $0.preview.sender == friend.name })?.conversationID
+    }
+
+    func avatarItem(for friend: RelayFriend) -> InboxItem? {
+        items.last(where: { $0.message.wechatUserId == friend.wechatUserId && $0.preview.sender == friend.name && $0.message.assets.contains(where: { $0.kind == .avatar }) })
     }
 
     func markRead(_ conversationID: String) {
@@ -356,7 +488,7 @@ final class RelayAppModel: ObservableObject {
         let cutoff = max(snapshot.clearedThrough, snapshot.messages.map(\.seq).max() ?? 0)
         let previous = snapshot
         let wasReadable = cacheReadable
-        snapshot = InboxSnapshot(clearedThrough: cutoff)
+        snapshot = InboxSnapshot(clearedThrough: cutoff, contacts: snapshot.contacts)
         cacheReadable = true
         do { try saveCache() } catch { snapshot = previous; cacheReadable = wasReadable; throw error }
         items = []; outgoing = []; imageCache.removeAllObjects(); hasMore = false
@@ -373,7 +505,8 @@ final class RelayAppModel: ObservableObject {
         }
         session = nil; pairing = nil; device = nil
         isDemo = false
-        snapshot = InboxSnapshot(); items = []; outgoing = []; conversationPath = []
+        snapshot = InboxSnapshot(); items = []; outgoing = []; friends = []; conversationPath = []
+        contactsAvailable = nil; contactsProblem = nil
         imageCache.removeAllObjects(); problem = nil; cacheReadable = true
         lastStatusCheck = .distantPast
         UNUserNotificationCenter.current().removeAllDeliveredNotifications()
@@ -414,6 +547,7 @@ final class RelayAppModel: ObservableObject {
         let data = try AES.GCM.open(box, using: SymmetricKey(data: session.messageKey), authenticating: Data("AWR1|IOS_CACHE|\(session.pairId)".utf8))
         snapshot = try JSONDecoder().decode(InboxSnapshot.self, from: data)
         try merge([])
+        refreshFriends()
         outgoing = snapshot.outgoing
         nextCursor = snapshot.messages.map(\.seq).min()
         hasMore = nextCursor != nil && snapshot.clearedThrough == 0
@@ -459,6 +593,12 @@ final class RelayAppModel: ObservableObject {
                 snapshot.messages.append(try RelayMessage(messageId: id, deviceId: deviceID, seq: seq, createdAt: timestamp, wechatUserId: row.2, replyCapable: true, conversationSendCapable: true, previewEnvelope: envelope, assets: [], receivedAt: timestamp))
             }
             try merge([])
+            snapshot.contacts = [
+                CachedContacts(id: try UUIDv7.make(now: Date()), deviceId: "demo_android_0001", wechatUserId: 0, capturedAt: Int64(Date().timeIntervalSince1970 * 1_000), contacts: [try RelayContact(name: "林一"), try RelayContact(name: "陈默"), try RelayContact(name: "文件传输助手"), try RelayContact(name: "王珊")]),
+                CachedContacts(id: try UUIDv7.make(now: Date()), deviceId: "demo_android_0001", wechatUserId: 999, capturedAt: Int64(Date().timeIntervalSince1970 * 1_000), contacts: [try RelayContact(name: "小周"), try RelayContact(name: "赵晨")])
+            ]
+            refreshFriends()
+            contactsAvailable = true
             device = RelayDeviceStatus(paired: true, deviceId: "demo_android_0001", lastSeenAt: Int64(Date().timeIntervalSince1970 * 1_000), serverTime: Int64(Date().timeIntervalSince1970 * 1_000), pushConfigured: true, pushRegistered: true)
             lastSync = Date()
         } catch { problem = Self.describe(error) }

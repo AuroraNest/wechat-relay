@@ -57,6 +57,20 @@ const tables = [
   },
 ];
 
+const contactsSnapshotsTable = {
+  name: "contacts_snapshots",
+  columns: [
+    "id",
+    "device_id",
+    "wechat_user_id",
+    "captured_at",
+    "body_hash",
+    "envelope_json",
+    "received_at",
+  ],
+  orderBy: ["id"],
+};
+
 function quoted(values) {
   return values.map((value) => `\`${value}\``).join(", ");
 }
@@ -99,6 +113,12 @@ async function verify(connection, sourceRows) {
 }
 
 const sqlite = new DatabaseSync(sourcePath, { readOnly: true });
+if (
+  sqlite
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'contacts_snapshots'")
+    .get()
+)
+  tables.push(contactsSnapshotsTable);
 const sourceRows = new Map();
 let sqliteTransactionStarted = false;
 let mysqlTransactionStarted = false;

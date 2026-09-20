@@ -22,6 +22,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.io.FileInputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -74,6 +75,11 @@ class MainActivity : Activity() {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         })
         actions.addView(button("重新配对") { showPairingEntry() })
+        actions.addView(button("同步好友") { showContactsScanProfiles() })
+        actions.addView(button("取消好友同步") {
+            LockscreenAccessibilityReplyService.cancelContactsScan()
+            statusView.postDelayed({ refreshUi() }, 150)
+        })
         actions.addView(button("补传语音转写到原会话") { showClipboardSync() })
         actions.addView(button("重试最近失败语音") {
             AlertDialog.Builder(this).setMessage("将重新打开最近失败语音的微信会话并读取转写. 请确认该会话没有更新的语音, 或发送一条新语音触发自动处理.")
@@ -173,6 +179,30 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    private fun showContactsScanProfiles() {
+        // The clone profile serial is read from Room, which must not run on the UI thread.
+        Thread {
+            val profiles = runCatching { ContactsProfileResolver.installed(this) }.getOrDefault(emptyList())
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (profiles.isEmpty()) {
+                    AlertDialog.Builder(this).setMessage("未发现可启动的主微信或分身微信.")
+                        .setPositiveButton("知道了", null).show()
+                    return@runOnUiThread
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("选择要完整同步的微信")
+                    .setItems(profiles.map(ContactsProfile::label).toTypedArray()) { _, index ->
+                        val status = LockscreenAccessibilityReplyService.startContactsScan(profiles[index])
+                        Toast.makeText(this, status, Toast.LENGTH_SHORT).show()
+                        statusView.postDelayed({ refreshUi() }, 300)
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+        }.start()
+    }
+
     private fun confirmClipboardSync(task: HistoryForwardTask, sender: String, text: String) {
         val preview = VoiceResultMessages.clipboardPreview(sender, text) ?: return
         AlertDialog.Builder(this).setTitle("补传到 iPhone 的 $sender 会话").setMessage(text)
@@ -243,6 +273,7 @@ class MainActivity : Activity() {
             消息转发: ${if (relayActive) "已开启" else "已暂停"}
             最近通知: $lastCapture
             自动处理队列: ${ProbeRuntime.historyQueueStatus}
+            联系人同步: ${ProbeRuntime.contactsScanStatus}${if (ProbeRuntime.contactsScanCount > 0) " (${ProbeRuntime.contactsScanCount}位)" else ""}${ProbeRuntime.contactsScanCapturedAt?.let { " · ${formatTime(it)}" }.orEmpty()}
             ${pairingStatus.orEmpty()}
         """.trimIndent()
         lockscreenStatusView.text = """

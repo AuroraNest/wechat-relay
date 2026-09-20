@@ -1,3 +1,4 @@
+import Foundation
 import Photos
 import RelayCore
 import SwiftUI
@@ -74,6 +75,154 @@ struct AvatarView: View {
             .task(id: item.id) {
                 if let metadata = item.message.assets.first(where: { $0.kind == .avatar }) { image = try? await model.image(for: metadata, in: item.message) }
             }
+    }
+}
+
+struct FriendsView: View {
+    @EnvironmentObject private var model: RelayAppModel
+    @State private var search = ""
+
+    private var filteredFriends: [RelayFriend] {
+        model.friends.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }
+    }
+
+    private var sections: [(initial: String, friends: [RelayFriend])] {
+        Dictionary(grouping: filteredFriends) { friend in
+            indexInitial(friend.name)
+        }.map { initial, friends in
+            (initial, friends.sorted {
+                let comparison = $0.name.localizedStandardCompare($1.name)
+                return comparison == .orderedSame ? $0.wechatUserId < $1.wechatUserId : comparison == .orderedAscending
+            })
+        }.sorted {
+            if $0.initial == "#" { return false }
+            if $1.initial == "#" { return true }
+            return $0.initial.localizedStandardCompare($1.initial) == .orderedAscending
+        }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                if let capturedAt = model.friendsCapturedAt {
+                    Label("已同步 \(model.friends.count) 位好友 · \(capturedAt.formatted(date: .abbreviated, time: .shortened))", systemImage: "person.2")
+                        .font(.footnote).foregroundStyle(.secondary)
+                } else {
+                    Label("首次同步请在小米 Relay 点击同步好友.", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Text("好友名单来自已同步的微信通讯录.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                if model.isRefreshingContacts { ProgressView("正在同步好友") }
+            }
+            if let problem = model.contactsProblem {
+                Section { Label(problem, systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(.orange) }
+            }
+            ForEach(sections, id: \.initial) { section in
+                Section(section.initial) {
+                    ForEach(section.friends) { friend in
+                        NavigationLink { FriendDetailView(friend: friend) } label: {
+                            HStack(spacing: 13) {
+                                FriendAvatarView(friend: friend)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(friend.name).font(.body)
+                                    if model.friends.filter({ $0.name == friend.name }).count > 1 {
+                                        Text(friend.profileLabel).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                            }.padding(.vertical, 4)
+                        }
+                    }
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("好友")
+        .searchable(text: $search, prompt: "搜索好友")
+        .overlay {
+            if filteredFriends.isEmpty {
+                ContentUnavailableView(emptyTitle, systemImage: "person.2", description: Text(emptyDescription))
+            }
+        }
+        .task { await model.refreshContacts() }
+        .refreshable { await model.refreshContacts() }
+    }
+
+    private var emptyTitle: String {
+        if !search.isEmpty { return "没有找到好友" }
+        if model.contactsAvailable == false { return "服务尚未支持好友同步" }
+        return "好友会来到这里"
+    }
+
+    private var emptyDescription: String {
+        if !search.isEmpty { return "试试其他名字." }
+        if model.contactsAvailable == false { return "升级 Relay 服务后, 可同步微信通讯录好友名单." }
+        return "首次同步请在小米 Relay 点击同步好友."
+    }
+
+    private func indexInitial(_ name: String) -> String {
+        let latin = name.applyingTransform(.toLatin, reverse: false)?.folding(options: .diacriticInsensitive, locale: .current) ?? name
+        guard let scalar = latin.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(with: .current).unicodeScalars.first,
+              (65...90).contains(scalar.value) else { return "#" }
+        return String(scalar)
+    }
+}
+
+struct FriendAvatarView: View {
+    @EnvironmentObject private var model: RelayAppModel
+    let friend: RelayFriend
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14).fill(Color.relayGreen.opacity(friend.wechatUserId == 999 ? 0.07 : 0.12))
+                if let image { Image(uiImage: image).resizable().scaledToFill() }
+                else { Text(String(friend.name.prefix(1))).font(.system(size: 20, weight: .medium)).foregroundStyle(Color.relayGreen) }
+            }.frame(width: 46, height: 46).clipShape(RoundedRectangle(cornerRadius: 14))
+            if friend.wechatUserId == 999 { Text("2").font(.system(size: 9, weight: .bold)).foregroundStyle(.white).padding(4).background(Color.relayGreen, in: Circle()).offset(x: 3, y: 3) }
+        }
+        .accessibilityHidden(true)
+        .task(id: friend.id) {
+            image = nil
+            guard let source = model.avatarItem(for: friend),
+                  let metadata = source.message.assets.first(where: { $0.kind == .avatar }) else { return }
+            image = try? await model.image(for: metadata, in: source.message)
+        }
+    }
+}
+
+struct FriendDetailView: View {
+    @EnvironmentObject private var model: RelayAppModel
+    let friend: RelayFriend
+
+    var body: some View {
+        if let conversationID = model.conversationID(for: friend) {
+            ConversationView(conversationID: conversationID)
+        } else {
+            detail
+        }
+    }
+
+    private var detail: some View {
+        List {
+            Section {
+                HStack(spacing: 16) {
+                    FriendAvatarView(friend: friend)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(friend.name).font(.title3.weight(.semibold))
+                        Text(friend.profileLabel).font(.subheadline).foregroundStyle(.secondary)
+                    }
+                }.padding(.vertical, 8)
+            }
+            Section {
+                Label("尚无已接收的聊天记录", systemImage: "clock")
+            } footer: {
+                Text("Relay 不能从这里发起新的微信会话. 收到该好友的新消息后, 可在消息页查看和回复.")
+            }
+        }
+        .navigationTitle("好友资料")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 

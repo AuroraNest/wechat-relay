@@ -210,7 +210,7 @@ object SyncNetwork {
     internal fun uploadResultForHttpStatus(responseCode: Int): UploadResult =
         if (responseCode in 200..299) UploadResult.Complete else UploadResult.Retry
 
-    private fun signedConnection(signing: RequestSigningContext, method: String, path: String, body: ByteArray, readTimeout: Int = 15_000): HttpsURLConnection {
+    internal fun signedConnection(signing: RequestSigningContext, method: String, path: String, body: ByteArray, readTimeout: Int = 15_000): HttpsURLConnection {
         val timestamp = System.currentTimeMillis().toString()
         val nonce = ByteArray(16).also(SecureRandom()::nextBytes).let(SyncProtocol::encode)
         val canonical = SyncProtocol.canonicalRequest(method, path, timestamp, nonce, body)

@@ -69,6 +69,52 @@ public struct RelayPreview: Codable, Sendable, Equatable {
     }
 }
 
+public struct RelayContact: Codable, Sendable, Equatable, Identifiable {
+    public let name: String
+
+    public var id: String { name }
+
+    public init(name: String) throws {
+        guard RelayValidation.isContactName(name) else { throw RelayError.invalidValue("contact name") }
+        self.name = name
+    }
+}
+
+public struct RelayContactsPayload: Codable, Sendable, Equatable {
+    public let v: Int
+    public let contacts: [RelayContact]
+
+    public init(v: Int, contacts: [RelayContact]) throws {
+        guard v == 1, contacts.count <= 10_000,
+              Set(contacts.map(\.name)).count == contacts.count else {
+            throw RelayError.invalidValue("contacts payload")
+        }
+        self.v = v
+        self.contacts = contacts
+    }
+}
+
+public struct RelayContactSnapshot: Codable, Sendable, Equatable, Identifiable {
+    public let v: Int
+    public let id: UUID
+    public let deviceId: String
+    public let wechatUserId: Int
+    public let capturedAt: Int64
+    public let contactsEnvelope: RelayEncryptedEnvelope
+
+    public init(v: Int, id: UUID, deviceId: String, wechatUserId: Int, capturedAt: Int64, contactsEnvelope: RelayEncryptedEnvelope) throws {
+        guard v == 1, RelayValidation.isUUIDv7(id), RelayValidation.isDeviceId(deviceId), RelayValidation.isWechatUserId(wechatUserId), capturedAt > 0 else {
+            throw RelayError.invalidValue("contact snapshot")
+        }
+        self.v = v
+        self.id = id
+        self.deviceId = deviceId
+        self.wechatUserId = wechatUserId
+        self.capturedAt = capturedAt
+        self.contactsEnvelope = contactsEnvelope
+    }
+}
+
 public struct RelayAssetMetadata: Codable, Sendable, Equatable, Identifiable {
     public let id: UUID
     public let kind: Kind
@@ -291,10 +337,17 @@ enum RelayOrigin {
 
 enum RelayValidation {
     static func isUUID(_ value: String) -> Bool { UUID(uuidString: value) != nil }
+    static func isUUIDv7(_ value: UUID) -> Bool {
+        let parts = value.uuidString.lowercased().split(separator: "-")
+        return parts.count == 5 && parts[2].first == "7" && ["8", "9", "a", "b"].contains(parts[3].first.map(String.init) ?? "")
+    }
     static func isWechatUserId(_ value: Int) -> Bool { value == 0 || value == 999 }
     static func isDeviceId(_ value: String) -> Bool {
         let pattern = "^[A-Za-z0-9_-]{16,128}$"
         return value.range(of: pattern, options: .regularExpression) != nil
+    }
+    static func isContactName(_ value: String) -> Bool {
+        !value.isEmpty && value == value.trimmingCharacters(in: .whitespacesAndNewlines) && value.lengthOfBytes(using: .utf8) <= 512
     }
     static func isImageMIMEType(_ value: String) -> Bool { ["image/jpeg", "image/png", "image/webp"].contains(value.lowercased()) }
     static func isValidAssetSize(width: Int, height: Int) -> Bool { width >= 1 && height >= 1 && width <= 16_384 && height <= 16_384 && width <= 64_000_000 / height }

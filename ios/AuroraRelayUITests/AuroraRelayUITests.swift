@@ -9,7 +9,7 @@ final class AuroraRelayUITests: XCTestCase {
         app.launch()
     }
 
-    func testDemoInboxReplyDeviceAndSettings() throws {
+    func testDemoInboxReplyFriendsAndSettings() throws {
         XCTAssertTrue(app.staticTexts["演示模式 · 虚构数据"].waitForExistence(timeout: 5))
         attachScreenshot("演示收件箱")
 
@@ -27,16 +27,25 @@ final class AuroraRelayUITests: XCTestCase {
         attachScreenshot("演示回复")
 
         app.navigationBars.buttons.firstMatch.tap()
-        let deviceTab = app.tabBars.buttons["设备"]
-        XCTAssertTrue(deviceTab.waitForExistence(timeout: 3))
-        deviceTab.tap()
+        let friendsTab = app.tabBars.buttons["好友"]
+        XCTAssertTrue(friendsTab.waitForExistence(timeout: 3))
+        friendsTab.tap()
+        XCTAssertTrue(app.staticTexts["王珊"].waitForExistence(timeout: 3))
+        app.searchFields["搜索好友"].tap()
+        app.searchFields["搜索好友"].typeText("王珊")
+        app.staticTexts["王珊"].tap()
+        XCTAssertTrue(app.staticTexts["尚无已接收的聊天记录"].waitForExistence(timeout: 3))
+        attachScreenshot("好友资料")
+
+        app.navigationBars.buttons.firstMatch.tap()
+        app.tabBars.buttons["设置"].tap()
+        app.staticTexts["设备与连接"].tap()
         XCTAssertTrue(app.staticTexts["Android 已配对"].waitForExistence(timeout: 3))
         app.staticTexts["连接诊断"].tap()
         XCTAssertTrue(app.staticTexts["设备配对"].waitForExistence(timeout: 3))
         attachScreenshot("设备诊断")
-
         app.navigationBars.buttons.firstMatch.tap()
-        app.tabBars.buttons["设置"].tap()
+        app.navigationBars.buttons.firstMatch.tap()
         app.staticTexts["转发与时间段"].tap()
         let schedule = app.switches["仅在指定时间转发"]
         XCTAssertTrue(schedule.waitForExistence(timeout: 3))
@@ -68,6 +77,14 @@ final class AuroraRelayUITests: XCTestCase {
         app.buttons["生成配对码"].tap()
         XCTAssertTrue(app.staticTexts["请填写完整的 HTTPS 服务地址, 不带路径或参数."].waitForExistence(timeout: 3))
         attachScreenshot("服务地址校验")
+    }
+
+    func testFriendWithExistingConversationOpensChat() throws {
+        app.tabBars.buttons["好友"].tap()
+        let friend = app.staticTexts["林一"].firstMatch
+        XCTAssertTrue(friend.waitForExistence(timeout: 3))
+        friend.tap()
+        XCTAssertTrue(app.textFields["输入回复"].waitForExistence(timeout: 3))
     }
 
     private func attachScreenshot(_ name: String) {

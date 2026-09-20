@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "plaintext": "{\"v\":1,\"contacts\":[{\"name\":\"测试好友 A\"},{\"name\":\"Example B\"}]}",
+  "snapshot": {
+    "v": 1,
+    "id": "019d2f1a-7b4c-7d10-8c21-1c77be6a91b0",
+    "deviceId": "device-id-0000001",
+    "wechatUserId": 999,
+    "capturedAt": 1788148800000,
+    "contactsEnvelope": {
+      "alg": "A256GCM",
+      "kid": "phase1-contacts",
+      "iv": "ICEiIyQlJicoKSor",
+      "aad": "AWR1|A2I_CONTACTS|1|019d2f1a-7b4c-7d10-8c21-1c77be6a91b0|device-id-0000001|1788148800000|999",
+      "ct": "qRjQUlapNix5Eyy6oHuAivJzt-el7gKDCdRWMK8_1eHaGwChM8C6UTS8TO90cj2mg0eJrKAeaBmvDw9xKZJI_6V7sPJGZLLukD9mRDX-i9uukg8"
+    }
+  }
+}

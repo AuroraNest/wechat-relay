@@ -83,6 +83,22 @@ public final class RelayAPI: NSObject, @unchecked Sendable {
         try await request(path: "/api/v1/ios/status", session: relaySession)
     }
 
+    public func contacts(session relaySession: RelaySession) async throws -> [RelayContactSnapshot] {
+        let response: RelayContactsResponse = try await request(path: "/api/v1/ios/contacts", session: relaySession)
+        guard response.snapshots.count <= 2,
+              Set(response.snapshots.map(\.wechatUserId)).count == response.snapshots.count else {
+            throw RelayError.invalidResponse
+        }
+        for snapshot in response.snapshots {
+            guard snapshot.v == 1, RelayValidation.isUUIDv7(snapshot.id), RelayValidation.isDeviceId(snapshot.deviceId),
+                  RelayValidation.isWechatUserId(snapshot.wechatUserId), snapshot.capturedAt > 0 else {
+                throw RelayError.invalidResponse
+            }
+            try RelayCrypto.validateContactsEnvelope(snapshot)
+        }
+        return response.snapshots
+    }
+
     public func updatePush(session relaySession: RelaySession, token: String?, environment: RelayPushEnvironment, previewEnabled: Bool) async throws {
         let body = RelayPushRequest(deviceToken: token, environment: environment, previewEnabled: previewEnabled)
         let _: EmptyResponse = try await request(path: "/api/v1/ios/push", method: "PUT", session: relaySession, body: try encodedBody(body))
@@ -169,6 +185,7 @@ public struct RelayMessageWaitResult: Codable, Sendable, Equatable {
 
 private struct RelaySessionResponse: Decodable { let ackToken: String }
 private struct RelayPairingResponse: Decodable { let pairId: String; let pairSecret: String; let expiresAt: Int64 }
+private struct RelayContactsResponse: Decodable { let snapshots: [RelayContactSnapshot] }
 private struct RelayPushRequest: Encodable {
     let deviceToken: String?
     let environment: RelayPushEnvironment

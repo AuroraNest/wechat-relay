@@ -1,3 +1,8 @@
+const conflictErrorCodes = new Set([
+  "CONTACTS_ID_CONFLICT",
+  "CONTACTS_SNAPSHOT_STALE",
+]);
+
 const clientErrorCodes = new Set([
   "ACK_NOT_SENT",
   "ASSET_EXPIRED",
@@ -56,10 +61,13 @@ const clientErrorCodes = new Set([
   "REPLY_UNSUPPORTED",
   "TARGET_MESSAGE_NOT_FOUND",
   "UNAUTHORIZED",
+  "INVALID_CONTACTS_ENVELOPE",
+  "INVALID_CONTACTS_SNAPSHOT",
 ]);
 
-export function classifyRequestError(error: unknown): { status: 400 | 500; code: string } {
+export function classifyRequestError(error: unknown): { status: 400 | 409 | 500; code: string } {
   const code = error instanceof Error ? (error.message.split(":", 1)[0] ?? "") : "";
+  if (conflictErrorCodes.has(code)) return { status: 409, code };
   return clientErrorCodes.has(code)
     ? { status: 400, code }
     : { status: 500, code: "INTERNAL_ERROR" };

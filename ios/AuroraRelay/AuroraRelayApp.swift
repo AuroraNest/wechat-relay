@@ -37,8 +37,8 @@ struct RelayTabs: View {
         TabView(selection: $model.selectedTab) {
             NavigationStack(path: $model.conversationPath) { InboxView() }
                 .tabItem { Label("消息", systemImage: "bubble.left.and.bubble.right") }.tag(0)
-            NavigationStack { DevicesView() }
-                .tabItem { Label("设备", systemImage: "iphone.gen3.radiowaves.left.and.right") }.tag(1)
+            NavigationStack { FriendsView() }
+                .tabItem { Label("好友", systemImage: "person.2") }.tag(1)
             NavigationStack { SettingsView() }
                 .tabItem { Label("设置", systemImage: "gearshape") }.tag(2)
         }

@@ -39,7 +39,9 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
     private val pinStore by lazy { LockscreenPinStore(this) }
     private val pinTick = Runnable { session?.let(::clickNextPinDigit) }
     private val historyTick = Runnable { session?.let(::processWechatWindow) }
+    private val contactsTick = Runnable { contactScan?.let(::processContactsScan) }
     @Volatile private var session: Session? = null
+    @Volatile private var contactScan: ContactScan? = null
 
     private enum class Phase {
         Unlocking, FindingSearch, EnteringSearch, SelectingResult, OpeningWechat,
@@ -153,12 +155,45 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         val isVoiceTranscription: Boolean get() = voiceSender != null
     }
 
+    private enum class ContactsPhase { Launching, ResettingTop, Reading, Encrypting }
+
+    private data class ContactsView(
+        val names: List<CharSequence>,
+        val footerCount: Int?,
+        val signature: Int,
+    )
+
+    private data class ContactScan(
+        val profile: ContactsProfile,
+        val deviceId: String,
+        val startedAtMillis: Long,
+        val assembly: ContactsPageAssembly = ContactsPageAssembly(),
+        @Volatile var cancelled: Boolean = false,
+        var phase: ContactsPhase = ContactsPhase.Launching,
+        var resetSignature: Int? = null,
+        var resetSignatureSinceMillis: Long = 0L,
+        var stableSignature: Int? = null,
+        var stableSignatureSinceMillis: Long = 0L,
+        var topResetAttempts: Int = 0,
+        var scrolls: Int = 0,
+    )
+
     override fun onServiceConnected() {
         liveService = this
         ProbeRuntime.accessibilityConnected = true
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        val contacts = contactScan
+        if (contacts != null) {
+            if (contacts.phase != ContactsPhase.Launching && event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+                event.packageName?.toString() != NotificationSnapshot.WechatPackage
+            ) {
+                failContactsScan(contacts, "WINDOW_CHANGED")
+            } else if (event?.packageName?.toString() == NotificationSnapshot.WechatPackage) {
+                scheduleContactsTick(contacts)
+            }
+        }
         val active = session ?: return
         if (active.isVoiceTranscription && active.phase == Phase.VoiceWaitingTranscript &&
             event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
@@ -189,6 +224,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
+        contactScan?.let { failContactsScan(it, "ACCESSIBILITY_INTERRUPTED") }
         val active = session ?: return
         if (active.cancellation.cancel("ACCESSIBILITY_INTERRUPTED")) {
             finishSession("FAILED", "ACCESSIBILITY_INTERRUPTED")
@@ -198,6 +234,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
     override fun onDestroy() {
         ProbeRuntime.accessibilityConnected = false
         if (liveService === this) liveService = null
+        contactScan?.let { failContactsScan(it, "ACCESSIBILITY_DISCONNECTED") }
         finishSession("FAILED", "ACCESSIBILITY_DISCONNECTED")
         super.onDestroy()
     }
@@ -222,6 +259,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         voiceVoicesAfter: (() -> Int)? = null,
         voiceCaptureTexts: ((List<String>) -> Unit)? = null,
     ): AccessibilityReplyResult {
+        preemptContactsScan()
         val keyguard = getSystemService(KeyguardManager::class.java)
         val userManager = getSystemService(UserManager::class.java)
         val isImageCapture = imageSender != null
@@ -556,6 +594,253 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         val activity = activities.singleOrNull { it.componentName.packageName == NotificationSnapshot.WechatPackage }
             ?: throw IllegalStateException("WECHAT_LAUNCHER_AMBIGUOUS")
         launcherApps.startMainActivity(activity.componentName, user, null, null)
+    }
+
+    private fun startContactsScan(profile: ContactsProfile): String {
+        val keyguard = getSystemService(KeyguardManager::class.java)
+        val users = getSystemService(UserManager::class.java)
+        if (!users.isUserUnlocked) return "用户自开机后尚未解锁"
+        if (keyguard.isDeviceLocked) return "请先手动解锁手机"
+        val store = SyncStore.get(this)
+        if (!store.paired()) return "请先完成配对"
+        if (!ContactsProfileResolver.isAvailable(this, profile)) return "所选微信不可用"
+        synchronized(this) {
+            if (session != null || contactScan != null) return "当前 Accessibility 正忙"
+            contactScan = ContactScan(profile, store.deviceId(), System.currentTimeMillis())
+        }
+        ProbeRuntime.contactsScanStatus = "正在打开${profile.label}通讯录"
+        ProbeRuntime.contactsScanCount = 0
+        ProbeRuntime.contactsPendingId = null
+        handler.post {
+            val active = contactScan ?: return@post
+            try {
+                // WeChat 8.0.77 on Xiaomi exposes the ids below. Stop on any selector drift.
+                launchWechatMain(active.profile.wechatUserId, active.profile.userSerial)
+                scheduleContactsTick(active)
+            } catch (_: RuntimeException) {
+                failContactsScan(active, "WECHAT_LAUNCH_FAILED")
+            }
+        }
+        return "已开始扫描, 请勿切换界面"
+    }
+
+    private fun processContactsScan(active: ContactScan) {
+        if (contactScan !== active || active.cancelled) return
+        val now = System.currentTimeMillis()
+        if (now - active.startedAtMillis > ContactsWorkflowTimeoutMillis) {
+            failContactsScan(active, "SCAN_TIMEOUT")
+            return
+        }
+        if (foregroundPackage() != NotificationSnapshot.WechatPackage) {
+            if (active.phase == ContactsPhase.Launching && now - active.startedAtMillis < ContactsLaunchTimeoutMillis) scheduleContactsTick(active)
+            else failContactsScan(active, "WINDOW_CHANGED")
+            return
+        }
+        val roots = rootsForPackage(NotificationSnapshot.WechatPackage)
+        if (roots.size != 1) {
+            if (active.phase == ContactsPhase.Launching && now - active.startedAtMillis < ContactsLaunchTimeoutMillis) scheduleContactsTick(active)
+            else failContactsScan(active, "WECHAT_WINDOW_AMBIGUOUS")
+            return
+        }
+        val nodes = walk(roots.single())
+        val contactsTabs = nodes.filter { it.isVisibleToUser && it.viewIdResourceName == ContactsTabViewId && it.text?.toString()?.trim() == ContactsTitle }
+        if (contactsTabs.size != 1) {
+            if (active.phase == ContactsPhase.Launching && now - active.startedAtMillis < ContactsLaunchTimeoutMillis) scheduleContactsTick(active)
+            else failContactsScan(active, "CONTACTS_TAB_CHANGED")
+            return
+        }
+        val tab = contactsTabs.single()
+        if (!tab.isSelected) {
+            if (active.phase != ContactsPhase.Launching) {
+                failContactsScan(active, "CONTACTS_TAB_LEFT")
+                return
+            }
+            val target = clickableAncestor(tab) ?: tab
+            if (!target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                failContactsScan(active, "CONTACTS_TAB_CLICK_FAILED")
+                return
+            }
+            scheduleContactsTick(active)
+            return
+        }
+        val contactsTitle = nodes.filter { it.isVisibleToUser && it.viewIdResourceName == AndroidTitleViewId && it.text?.toString()?.trim() == ContactsTitle }
+        if (contactsTitle.size != 1) {
+            failContactsScan(active, "CONTACTS_SURFACE_CHANGED")
+            return
+        }
+        val recycler = nodes.singleOrNull { it.isVisibleToUser && it.viewIdResourceName == ContactsRecyclerViewId }
+        if (recycler == null) {
+            failContactsScan(active, "CONTACTS_LIST_CHANGED")
+            return
+        }
+        val view = contactsView(nodes) ?: run {
+            failContactsScan(active, "CONTACTS_ROWS_CHANGED")
+            return
+        }
+        when (active.phase) {
+            ContactsPhase.Launching -> {
+                active.phase = ContactsPhase.ResettingTop
+                active.resetSignature = null
+                active.resetSignatureSinceMillis = 0L
+                scheduleContactsTick(active)
+            }
+            ContactsPhase.ResettingTop -> {
+                if (active.resetSignature != view.signature) {
+                    active.resetSignature = view.signature
+                    active.resetSignatureSinceMillis = now
+                }
+                if (isContactsTop(nodes) && ContactsScanPolicy.stableFor(active.resetSignature, active.resetSignatureSinceMillis, view.signature, now, ContactsStableMillis)) {
+                    active.assembly.confirmTop()
+                    active.phase = ContactsPhase.Reading
+                    active.stableSignature = null
+                    active.stableSignatureSinceMillis = 0L
+                    scheduleContactsTick(active)
+                } else {
+                    active.topResetAttempts += 1
+                    if (active.topResetAttempts > MaxContactsTopResetAttempts) {
+                        failContactsScan(active, "CONTACTS_TOP_PROOF_MISSING")
+                    } else {
+                        recycler.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
+                        scheduleContactsTick(active)
+                    }
+                }
+            }
+            ContactsPhase.Reading -> {
+                if (active.stableSignature != view.signature) {
+                    active.stableSignature = view.signature
+                    active.stableSignatureSinceMillis = now
+                }
+                if (!ContactsScanPolicy.stableFor(active.stableSignature, active.stableSignatureSinceMillis, view.signature, now, ContactsStableMillis)) {
+                    scheduleContactsTick(active)
+                    return
+                }
+                try {
+                    active.assembly.addStablePage(view.names)
+                    view.footerCount?.let(active.assembly::observeFooter)
+                    ProbeRuntime.contactsScanCount = active.assembly.count()
+                } catch (_: IllegalArgumentException) {
+                    failContactsScan(active, "CONTACTS_LIMIT_EXCEEDED")
+                    return
+                }
+                if (view.footerCount != null) {
+                    val complete = runCatching(active.assembly::complete).getOrNull()
+                    if (complete == null) {
+                        failContactsScan(active, "CONTACTS_COUNT_MISMATCH")
+                    } else encryptContactsSnapshot(active, complete)
+                    return
+                }
+                active.scrolls += 1
+                if (active.scrolls > MaxContactsScrolls) {
+                    failContactsScan(active, "CONTACTS_SCROLL_BOUND_EXCEEDED")
+                    return
+                }
+                if (!recycler.isScrollable || !recycler.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
+                    failContactsScan(active, "CONTACTS_BOTTOM_PROOF_MISSING")
+                    return
+                }
+                active.stableSignature = null
+                active.stableSignatureSinceMillis = 0L
+                scheduleContactsTick(active)
+            }
+            ContactsPhase.Encrypting -> Unit
+        }
+    }
+
+    private fun contactsView(nodes: List<AccessibilityNodeInfo>): ContactsView? {
+        val names = nodes.filter { node ->
+            node.isVisibleToUser && node.viewIdResourceName == ContactsNameViewId &&
+                ancestorViewIds(node).contains(ContactsTableViewId) && !node.text.isNullOrBlank()
+        }.map { requireNotNull(it.text) }
+        val footerNodes = nodes.filter { it.isVisibleToUser && it.viewIdResourceName == ContactsFooterViewId }
+        val footerCount = when (footerNodes.size) {
+            0 -> null
+            1 -> ContactsFooter.matchEntire(footerNodes.single().text?.toString()?.trim().orEmpty())?.groupValues?.get(1)?.toIntOrNull()
+                ?: return null
+            else -> return null
+        }
+        val signature = 31 * names.map { it.toString() }.hashCode() + (footerCount ?: -1)
+        return ContactsView(names, footerCount, signature)
+    }
+
+    private fun isContactsTop(nodes: List<AccessibilityNodeInfo>): Boolean = nodes.any {
+        it.isVisibleToUser && it.viewIdResourceName == ContactsNewFriendViewId && it.text?.toString()?.trim() == ContactsNewFriendTitle
+    }
+
+    private fun encryptContactsSnapshot(active: ContactScan, names: List<String>) {
+        active.phase = ContactsPhase.Encrypting
+        ProbeRuntime.contactsScanStatus = "正在加密${active.assembly.count()}位联系人"
+        ContactsExecutor.execute {
+            try {
+                val store = SyncStore.get(this)
+                if (active.cancelled || contactScan !== active || !store.isCurrentDevice(active.deviceId)) return@execute
+                val key = store.messageEncryptionContext(active.deviceId).a2iKey
+                val capturedAt = System.currentTimeMillis()
+                val id = SyncProtocol.uuidV7(capturedAt)
+                val envelope = try { SyncProtocol.encryptContacts(key, id, active.deviceId, capturedAt, active.profile.wechatUserId, names) }
+                finally { key.fill(0) }
+                synchronized(this@LockscreenAccessibilityReplyService) {
+                    if (active.cancelled || contactScan !== active || !store.isCurrentDevice(active.deviceId)) return@execute
+                    ContactsPendingStore.get(this).save(ContactsPending(id, active.deviceId, active.profile.wechatUserId, capturedAt, envelope))
+                    ProbeRuntime.contactsPendingId = id
+                }
+                handler.post {
+                    if (contactScan === active && !active.cancelled && store.isCurrentDevice(active.deviceId) && ProbeRuntime.contactsPendingId == id) {
+                        ContactsSyncNetwork.enqueue(this)
+                        finishContactsScan(active, "已加密入队, 正在同步", capturedAt)
+                    }
+                }
+            } catch (_: Exception) {
+                handler.post { failContactsScan(active, "CONTACTS_ENCRYPT_OR_SAVE_FAILED") }
+            }
+        }
+    }
+
+    private fun scheduleContactsTick(active: ContactScan) {
+        if (contactScan === active && !active.cancelled) {
+            handler.removeCallbacks(contactsTick)
+            handler.postDelayed(contactsTick, ContactsPollMillis)
+        }
+    }
+
+    private fun preemptContactsScan() {
+        contactScan?.let { cancelContactsScan(it, "PREEMPTED_BY_INCOMING") }
+    }
+
+    private fun cancelContactsScan(active: ContactScan, stage: String) {
+        synchronized(this) {
+            if (contactScan !== active) return
+            active.cancelled = true
+            contactScan = null
+            handler.removeCallbacks(contactsTick)
+            ProbeRuntime.contactsScanStatus = "扫描已取消: $stage"
+        }
+    }
+
+    private fun failContactsScan(active: ContactScan, stage: String) {
+        synchronized(this) {
+            if (contactScan !== active) return
+            active.cancelled = true
+            contactScan = null
+            handler.removeCallbacks(contactsTick)
+            ProbeRuntime.contactsScanStatus = "扫描失败: $stage"
+        }
+        if (foregroundPackage() == NotificationSnapshot.WechatPackage) {
+            startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+        }
+    }
+
+    private fun finishContactsScan(active: ContactScan, status: String, capturedAt: Long) {
+        synchronized(this) {
+            if (contactScan !== active) return
+            contactScan = null
+            handler.removeCallbacks(contactsTick)
+            ProbeRuntime.contactsScanStatus = status
+            ProbeRuntime.contactsScanCapturedAt = capturedAt
+        }
+        // Return only while this manual scan still owns WeChat's foreground window.
+        if (foregroundPackage() == NotificationSnapshot.WechatPackage) {
+            startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+        }
     }
 
     private fun processWechatWindow(active: Session) {
@@ -1815,6 +2100,22 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         private const val OriginalViewTimeoutMillis = 5_000L
         private const val OriginalViewSettleMillis = 1_000L
         private const val VoiceSourceSettleMillis = 450L
+        private const val ContactsPollMillis = 260L
+        private const val ContactsWorkflowTimeoutMillis = 15 * 60_000L
+        private const val ContactsLaunchTimeoutMillis = 8_000L
+        private const val MaxContactsScrolls = 2_000
+        private const val MaxContactsTopResetAttempts = 64
+        private const val ContactsStableMillis = 300L
+        private const val ContactsTabViewId = "com.tencent.mm:id/icon_tv"
+        private const val AndroidTitleViewId = "android:id/text1"
+        private const val ContactsRecyclerViewId = "com.tencent.mm:id/mg"
+        private const val ContactsNameViewId = "com.tencent.mm:id/kbq"
+        private const val ContactsTableViewId = "com.tencent.mm:id/kbo"
+        private const val ContactsFooterViewId = "com.tencent.mm:id/caj"
+        private const val ContactsNewFriendViewId = "com.tencent.mm:id/obc"
+        private const val ContactsTitle = "通讯录"
+        private const val ContactsNewFriendTitle = "新的朋友"
+        private val ContactsFooter = Regex("(\\d+)个朋友")
         private const val VoiceSourceReturnTimeoutMillis = 3_000L
         private const val VoiceTranscriptSettleMillis = 450L
         private const val WechatChatTopPx = 284
@@ -1826,11 +2127,19 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         private val SendLabels = setOf("发送", "Send")
         private val SearchLabels = setOf("搜索", "Search")
         private val ImageExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "relay-image-capture") }
+        private val ContactsExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "relay-contacts-sync") }
 
         @Volatile private var liveService: LockscreenAccessibilityReplyService? = null
         @Volatile private var successfulLockedRunAwaitingAck = false
 
         fun isLive(): Boolean = liveService != null
+
+        fun startContactsScan(profile: ContactsProfile): String =
+            liveService?.startContactsScan(profile) ?: "Accessibility 服务未连接"
+
+        fun cancelContactsScan() {
+            liveService?.contactScan?.let { active -> liveService?.cancelContactsScan(active, "USER_CANCELLED") }
+        }
 
         fun execute(contentIntent: PendingIntent, expectedTitleHash: String, replyText: String): AccessibilityReplyResult =
             liveService?.executeBlocking(contentIntent, expectedTitleHash, null, 0, -1L, replyText)

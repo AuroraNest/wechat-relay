@@ -109,6 +109,7 @@ interface SyncQueueDao {
 interface ReplyTargetDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE) fun insert(target: ReplyTarget)
     @Query("SELECT * FROM reply_targets WHERE messageId = :messageId") fun find(messageId: String): ReplyTarget?
+    @Query("SELECT wechatUserSerial FROM reply_targets WHERE wechatUserId = :wechatUserId ORDER BY createdAt DESC LIMIT 1") fun latestWechatUserSerial(wechatUserId: Int): Long?
     @Query("DELETE FROM reply_targets") fun clear()
 }
 
@@ -416,6 +417,11 @@ class SyncStore private constructor(context: Context) {
     @Synchronized
     fun replyTarget(messageId: String): ReplyTarget? = replyTargets.find(messageId)
     @Synchronized
+    fun knownWechatUserSerial(wechatUserId: Int): Long? {
+        require(NotificationSnapshot.isAllowedWechatUserId(wechatUserId))
+        return replyTargets.latestWechatUserSerial(wechatUserId)
+    }
+    @Synchronized
     fun pendingReplyAck(expectedDeviceId: String): PendingReplyAck? {
         check(isCurrentDevice(expectedDeviceId))
         val deviceId = preferences.getString(PendingReplyDeviceId, null) ?: return null
@@ -494,6 +500,8 @@ class SyncStore private constructor(context: Context) {
                 .commit(),
         )
         if (replacedDeviceId != null) runCatching {
+            ContactsPendingStore.get(appContext).clearAll()
+            ProbeRuntime.contactsPendingId = null
             database.runInTransaction {
                 queue.clear(replacedDeviceId)
                 historyForwardTasks.clear(replacedDeviceId)

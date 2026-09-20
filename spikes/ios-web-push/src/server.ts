@@ -73,6 +73,8 @@ const subscriptionFile = join(dataDir, "subscription.json");
 const eventsFile = join(dataDir, "events.jsonl");
 const messagesDir = join(dataDir, "messages");
 const maxBodyBytes = 16_384;
+const maxContactsBodyBytes = 1_572_864;
+const maxContactsCiphertextBytes = 1_048_576 + 16;
 // Two bounded 8 MiB assets need room for base64 and envelope metadata.
 const maxAndroidBodyBytes = 24 * 1024 * 1024;
 const outboxInFlight = new Set<string>();
@@ -158,6 +160,21 @@ interface ClaimedReply {
   replyEnvelope: ReplyEnvelope;
   wechatUserId: 0 | 999;
   pairId?: string;
+}
+interface ContactsEnvelope {
+  alg: "A256GCM";
+  kid: "phase1-contacts";
+  iv: string;
+  aad: string;
+  ct: string;
+}
+interface ContactsSnapshot {
+  v: 1;
+  id: string;
+  deviceId: string;
+  wechatUserId: 0 | 999;
+  capturedAt: number;
+  contactsEnvelope: ContactsEnvelope;
 }
 
 type DbExecutor = Pool | PoolConnection;
@@ -332,6 +349,10 @@ async function route(
     return updateBrowserRelayPolicy(request, response);
   if (request.method === "POST" && url.pathname === "/api/v1/android/messages")
     return uploadAndroidMessage(request, response);
+  if (request.method === "POST" && url.pathname === "/api/v1/android/contacts")
+    return uploadAndroidContacts(request, response);
+  if (request.method === "GET" && url.pathname === "/api/v1/ios/contacts")
+    return getIosContacts(request, response);
   if (request.method === "POST" && url.pathname === "/api/v1/replies")
     return submitBrowserReply(request, response);
   if (request.method === "GET" && url.pathname.startsWith("/api/v1/replies/"))
@@ -895,6 +916,106 @@ async function uploadAndroidMessage(
   json(response, 202, { id: message.id, idempotent: false });
 }
 
+async function uploadAndroidContacts(
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const { bytes, json: value } = await bodyJson(request, maxContactsBodyBytes);
+  const snapshot = validateContactsSnapshot(value);
+  const signed = await authenticateAndroidRequest(
+    request,
+    bytes,
+    "POST",
+    "/api/v1/android/contacts",
+  );
+  if (signed.deviceId !== snapshot.deviceId) throw new Error("DEVICE_MISMATCH");
+  const now = Date.now();
+  const bodyHash = createHash("sha256").update(bytes).digest();
+  const envelopeJson = JSON.stringify(snapshot.contactsEnvelope);
+  const idempotent = await transaction(async (connection) => {
+    const device = await dbOne<{ device_id: string }>(
+      connection,
+      "SELECT device_id FROM devices WHERE device_id = ? FOR UPDATE",
+      [snapshot.deviceId],
+    );
+    if (!device) throw new Error("DEVICE_UNKNOWN");
+    await consumeAndroidNonce(connection, snapshot.deviceId, signed.nonce, now);
+    const existingId = await dbOne<{
+      device_id: string;
+      wechat_user_id: string | number;
+      captured_at: string | number;
+      body_hash: Buffer;
+    }>(
+      connection,
+      "SELECT device_id, wechat_user_id, captured_at, body_hash FROM contacts_snapshots WHERE id = ? FOR UPDATE",
+      [snapshot.id],
+    );
+    if (existingId) {
+      if (
+        existingId.device_id === snapshot.deviceId &&
+        dbInteger(existingId.wechat_user_id) === snapshot.wechatUserId &&
+        dbInteger(existingId.captured_at) === snapshot.capturedAt &&
+        timingSafeBufferEqual(existingId.body_hash, bodyHash)
+      ) return true;
+      throw new Error("CONTACTS_ID_CONFLICT");
+    }
+    const current = await dbOne<{ captured_at: string | number }>(
+      connection,
+      "SELECT captured_at FROM contacts_snapshots WHERE device_id = ? AND wechat_user_id = ? FOR UPDATE",
+      [snapshot.deviceId, snapshot.wechatUserId],
+    );
+    if (current && snapshot.capturedAt <= dbInteger(current.captured_at))
+      throw new Error("CONTACTS_SNAPSHOT_STALE");
+    if (current) {
+      await dbRun(
+        connection,
+        "UPDATE contacts_snapshots SET id = ?, captured_at = ?, body_hash = ?, envelope_json = ?, received_at = ? WHERE device_id = ? AND wechat_user_id = ?",
+        [snapshot.id, snapshot.capturedAt, bodyHash, envelopeJson, now, snapshot.deviceId, snapshot.wechatUserId],
+      );
+    } else {
+      await dbRun(
+        connection,
+        "INSERT INTO contacts_snapshots(id, device_id, wechat_user_id, captured_at, body_hash, envelope_json, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [snapshot.id, snapshot.deviceId, snapshot.wechatUserId, snapshot.capturedAt, bodyHash, envelopeJson, now],
+      );
+    }
+    return false;
+  });
+  json(response, idempotent ? 200 : 201, { id: snapshot.id, idempotent });
+}
+
+async function getIosContacts(
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const session = await authorizeBrowserPair(request, false);
+  const current = await loadBrowserSessionById(session.sessionId);
+  if (!current || !isNativeDestination(current.subscription))
+    throw new Error("INVALID_IOS_SESSION");
+  const rows = await dbRows<{
+    id: string;
+    device_id: string;
+    wechat_user_id: string | number;
+    captured_at: string | number;
+    envelope_json: string;
+  }>(
+    pool,
+    "SELECT contacts_snapshots.id, contacts_snapshots.device_id, contacts_snapshots.wechat_user_id, contacts_snapshots.captured_at, contacts_snapshots.envelope_json FROM contacts_snapshots JOIN devices ON devices.device_id = contacts_snapshots.device_id WHERE devices.pair_id = ? ORDER BY contacts_snapshots.wechat_user_id ASC LIMIT 2",
+    [session.pairId],
+  );
+  response.setHeader("Cache-Control", "no-store");
+  json(response, 200, {
+    snapshots: rows.map((row) => ({
+      v: 1,
+      id: row.id,
+      deviceId: row.device_id,
+      wechatUserId: dbInteger(row.wechat_user_id),
+      capturedAt: dbInteger(row.captured_at),
+      contactsEnvelope: JSON.parse(row.envelope_json),
+    })),
+  });
+}
+
 async function getBrowserRelayPolicy(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const { pairId } = await authorizeBrowserPair(request, false);
   response.setHeader("Cache-Control", "no-store");
@@ -1059,6 +1180,54 @@ function validateAndroidMessage(value: unknown): AndroidMessage {
     ids.add(candidate.id);
   }
   return { ...message, wechatUserId, replyCapable, conversationSendCapable } as AndroidMessage;
+}
+function validateContactsSnapshot(value: unknown): ContactsSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("INVALID_CONTACTS_SNAPSHOT");
+  const snapshot = value as Partial<ContactsSnapshot>;
+  const capturedAt = snapshot.capturedAt;
+  const keys = Object.keys(snapshot).sort();
+  if (
+    keys.length !== 6 ||
+    keys[0] !== "capturedAt" ||
+    keys[1] !== "contactsEnvelope" ||
+    keys[2] !== "deviceId" ||
+    keys[3] !== "id" ||
+    keys[4] !== "v" ||
+    keys[5] !== "wechatUserId" ||
+    snapshot.v !== 1 ||
+    !isUuidV7(snapshot.id) ||
+    !isDeviceId(snapshot.deviceId) ||
+    (snapshot.wechatUserId !== 0 && snapshot.wechatUserId !== 999) ||
+    typeof capturedAt !== "number" ||
+    !Number.isSafeInteger(capturedAt) ||
+    capturedAt <= 0 ||
+    capturedAt > Date.now() + 300_000
+  )
+    throw new Error("INVALID_CONTACTS_SNAPSHOT");
+  const envelope = snapshot.contactsEnvelope;
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope))
+    throw new Error("INVALID_CONTACTS_ENVELOPE");
+  const envelopeKeys = Object.keys(envelope).sort();
+  if (
+    envelopeKeys.length !== 5 ||
+    envelopeKeys[0] !== "aad" ||
+    envelopeKeys[1] !== "alg" ||
+    envelopeKeys[2] !== "ct" ||
+    envelopeKeys[3] !== "iv" ||
+    envelopeKeys[4] !== "kid" ||
+    envelope.alg !== "A256GCM" ||
+    envelope.kid !== "phase1-contacts" ||
+    typeof envelope.aad !== "string" ||
+    envelope.aad !== `AWR1|A2I_CONTACTS|1|${snapshot.id}|${snapshot.deviceId}|${capturedAt}|${snapshot.wechatUserId}` ||
+    typeof envelope.iv !== "string" ||
+    typeof envelope.ct !== "string"
+  )
+    throw new Error("INVALID_CONTACTS_ENVELOPE");
+  decodeBase64url(envelope.iv, 24, "INVALID_CONTACTS_ENVELOPE", 12);
+  if (decodeBase64url(envelope.ct, maxContactsCiphertextBytes, "INVALID_CONTACTS_ENVELOPE").length < 17)
+    throw new Error("INVALID_CONTACTS_ENVELOPE");
+  return snapshot as ContactsSnapshot;
 }
 function validateBrowserReply(value: unknown, pairId: string): BrowserReply {
   if (!value || typeof value !== "object") throw new Error("INVALID_REPLY");
@@ -2027,6 +2196,9 @@ function isUuid(value: unknown): value is string {
       value,
     )
   );
+}
+function isUuidV7(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 }
 function isDeviceId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(value);

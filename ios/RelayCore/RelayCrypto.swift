@@ -18,6 +18,25 @@ public enum RelayCrypto {
         return try decrypt(asset.envelope, key: messageKey, expectedKid: "phase1-asset", maximumCiphertextBytes: 8 * 1_024 * 1_024 + 16)
     }
 
+    public static func decryptContacts(_ snapshot: RelayContactSnapshot, messageKey: Data) throws -> RelayContactsPayload {
+        try validateContactsEnvelope(snapshot)
+        let plaintext = try decrypt(snapshot.contactsEnvelope, key: messageKey, expectedKid: "phase1-contacts", maximumCiphertextBytes: 1_024 * 1_024 + 16)
+        guard plaintext.count <= 1_024 * 1_024 else { throw RelayError.invalidResponse }
+        do {
+            let payload = try JSONDecoder().decode(RelayContactsPayload.self, from: plaintext)
+            guard payload.v == 1, payload.contacts.count <= 10_000,
+                  Set(payload.contacts.map(\.name)).count == payload.contacts.count,
+                  (payload.contacts.allSatisfy { RelayValidation.isContactName($0.name) }) else {
+                throw RelayError.invalidResponse
+            }
+            return payload
+        } catch let error as RelayError {
+            throw error
+        } catch {
+            throw RelayError.invalidResponse
+        }
+    }
+
     public static func makeReply(session: RelaySession, target: RelayMessage, body: String, now: Date = Date()) throws -> RelayReplyRequest {
         guard target.replyCapable else { throw RelayError.invalidValue("reply target") }
         let characters = Array(body)
@@ -93,6 +112,17 @@ public enum RelayCrypto {
         let expected = "\(base)|\(message.wechatUserId)"
         let legacyAllowed = message.wechatUserId == 0 && asset.envelope.aad == base
         guard legacyAllowed || asset.envelope.aad == expected else { throw RelayError.invalidEnvelope }
+    }
+
+    static func validateContactsEnvelope(_ snapshot: RelayContactSnapshot) throws {
+        guard snapshot.v == 1, RelayValidation.isUUIDv7(snapshot.id), RelayValidation.isDeviceId(snapshot.deviceId),
+              RelayValidation.isWechatUserId(snapshot.wechatUserId), snapshot.capturedAt > 0,
+              snapshot.contactsEnvelope.alg == "A256GCM", snapshot.contactsEnvelope.kid == "phase1-contacts",
+              let ciphertext = decodeBase64url(snapshot.contactsEnvelope.ct), ciphertext.count >= 17, ciphertext.count <= 1_024 * 1_024 + 16 else {
+            throw RelayError.invalidEnvelope
+        }
+        let expected = "AWR1|A2I_CONTACTS|1|\(snapshot.id.uuidString.lowercased())|\(snapshot.deviceId)|\(snapshot.capturedAt)|\(snapshot.wechatUserId)"
+        guard snapshot.contactsEnvelope.aad == expected else { throw RelayError.invalidEnvelope }
     }
 
     static func decrypt(_ envelope: RelayEncryptedEnvelope, key: Data, expectedKid: String, maximumCiphertextBytes: Int) throws -> Data {
