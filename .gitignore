@@ -8,6 +8,8 @@ relay.*.properties
 *.pem
 *.key
 *.p12
+*.p8
+*.mobileprovision
 *.pfx
 *.log
 *.jsonl
@@ -23,5 +25,10 @@ local.properties
 *.aab
 *.jks
 *.keystore
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+ios/Configuration/Signing.local.xcconfig
 spikes/ios-web-push/data/*
 !spikes/ios-web-push/data/.gitkeep

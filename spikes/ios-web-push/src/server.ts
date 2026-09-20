@@ -46,6 +46,14 @@ import {
   validateTestPushRequest,
   type PreviewEnvelope,
 } from "./protocol.js";
+import {
+  ApnsSender,
+  loadApnsConfig,
+  normalizeDeviceToken,
+  validateApnsEnvironment,
+  type ApnsTransport,
+  type NativePushDestination,
+} from "./apns.js";
 
 const port = Number(process.env.PORT ?? 8080);
 const publicOrigin = required("PUBLIC_ORIGIN").replace(/\/$/, "");
@@ -72,6 +80,10 @@ const replyEvents = new EventEmitter();
 replyEvents.setMaxListeners(0);
 const messageEvents = new EventEmitter();
 messageEvents.setMaxListeners(0);
+const apnsConfig = await loadApnsConfig();
+const apnsSender = apnsConfig
+  ? new ApnsSender(apnsConfig, testApnsTransport() ?? undefined)
+  : undefined;
 
 interface StoredSubscription {
   subscription: PushSubscription;
@@ -81,7 +93,7 @@ interface StoredSubscription {
 }
 interface BrowserSession {
   sessionId: string;
-  subscription: PushSubscription;
+  subscription: PushSubscription | NativePushDestination;
   pairId: string | null;
 }
 interface MessageRecord {
@@ -265,6 +277,26 @@ async function route(
     event("SUBSCRIPTION_SAVED", { sessionId, savedAt: now });
     return json(response, 201, { ackToken });
   }
+  if (request.method === "POST" && url.pathname === "/api/v1/ios/sessions") {
+    authorizeBrowser(request);
+    const body = validateIosSessionRequest((await bodyJson(request)).json);
+    const ackToken = randomBytes(32).toString("base64url");
+    const sessionId = randomUUID();
+    const now = Date.now();
+    const destination: NativePushDestination = {
+      kind: "apns",
+      deviceToken: null,
+      environment: body.environment,
+      previewEnabled: body.previewEnabled,
+    };
+    await dbRun(
+      pool,
+      "INSERT INTO browser_sessions(session_id, ack_token_hash, subscription_envelope, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+      [sessionId, tokenHash(ackToken), encryptSubscription(destination), now, now],
+    );
+    event("IOS_SESSION_CREATED", { sessionId });
+    return json(response, 201, { ackToken });
+  }
   if (request.method === "POST" && url.pathname === "/api/v1/pairings") {
     authorizeBrowser(request);
     await bodyJson(request);
@@ -290,6 +322,10 @@ async function route(
   }
   if (request.method === "POST" && url.pathname === "/api/v1/android/pair")
     return pairAndroid(request, response);
+  if (request.method === "PUT" && url.pathname === "/api/v1/ios/push")
+    return updateIosPush(request, response);
+  if (request.method === "GET" && url.pathname === "/api/v1/ios/status")
+    return getIosStatus(request, response);
   if (request.method === "GET" && url.pathname === "/api/v1/relay-policy")
     return getBrowserRelayPolicy(request, response);
   if (request.method === "PUT" && url.pathname === "/api/v1/relay-policy")
@@ -425,6 +461,107 @@ async function route(
   if (request.method === "GET" || request.method === "HEAD")
     return staticFile(url.pathname, response, request.method === "HEAD");
   json(response, 404, { error: "NOT_FOUND" });
+}
+
+function validateIosSessionRequest(value: unknown): {
+  environment: "sandbox" | "production";
+  previewEnabled: boolean;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("INVALID_IOS_SESSION");
+  const body = value as Record<string, unknown>;
+  if (Object.keys(body).some((key) => key !== "environment" && key !== "previewEnabled"))
+    throw new Error("INVALID_IOS_SESSION");
+  if (body.previewEnabled !== undefined && typeof body.previewEnabled !== "boolean")
+    throw new Error("INVALID_IOS_SESSION");
+  return {
+    environment: body.environment === undefined
+      ? "sandbox"
+      : validateApnsEnvironment(body.environment),
+    previewEnabled: body.previewEnabled ?? false,
+  };
+}
+
+function validateIosPushRequest(value: unknown): NativePushDestination {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("INVALID_IOS_PUSH");
+  const body = value as Record<string, unknown>;
+  const keys = Object.keys(body).sort();
+  if (
+    keys.length !== 3 ||
+    keys[0] !== "deviceToken" ||
+    keys[1] !== "environment" ||
+    keys[2] !== "previewEnabled" ||
+    typeof body.previewEnabled !== "boolean"
+  )
+    throw new Error("INVALID_IOS_PUSH");
+  return {
+    kind: "apns",
+    deviceToken: normalizeDeviceToken(body.deviceToken),
+    environment: validateApnsEnvironment(body.environment),
+    previewEnabled: body.previewEnabled,
+  };
+}
+
+async function updateIosPush(
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const session = await authorizeBrowserPair(request, true);
+  const existing = await loadBrowserSessionById(session.sessionId);
+  if (!existing || !isNativeDestination(existing.subscription))
+    throw new Error("INVALID_IOS_SESSION");
+  const destination = validateIosPushRequest((await bodyJson(request)).json);
+  const result = await dbRun(
+    pool,
+    "UPDATE browser_sessions SET subscription_envelope = ?, updated_at = ? WHERE session_id = ? AND pair_id = ? AND invalidated_at IS NULL",
+    [
+      encryptSubscription(destination),
+      Date.now(),
+      session.sessionId,
+      session.pairId,
+    ],
+  );
+  if (result.affectedRows !== 1) throw new Error("UNAUTHORIZED");
+  if (destination.deviceToken) void sendPendingOutboxForPair(session.pairId);
+  event("IOS_PUSH_UPDATED", {
+    sessionId: session.sessionId,
+    registered: destination.deviceToken !== null,
+  });
+  json(response, 200, {
+    pushConfigured: apnsSender !== undefined,
+    pushRegistered: destination.deviceToken !== null,
+  });
+}
+
+async function getIosStatus(
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const session = await authorizeBrowserPair(request, true);
+  const current = await loadBrowserSessionById(session.sessionId);
+  if (!current || !isNativeDestination(current.subscription))
+    throw new Error("INVALID_IOS_SESSION");
+  const device = await dbOne<{
+    device_id: string;
+    last_seen_at: string | number | null;
+  }>(
+    pool,
+    "SELECT devices.device_id, MAX(request_nonces.seen_at) AS last_seen_at FROM devices LEFT JOIN request_nonces ON request_nonces.device_id = devices.device_id WHERE devices.pair_id = ? GROUP BY devices.device_id",
+    [session.pairId],
+  );
+  response.setHeader("Cache-Control", "no-store");
+  json(response, 200, {
+    paired: device !== undefined,
+    deviceId: device?.device_id ?? null,
+    lastSeenAt:
+      device?.last_seen_at === null || device?.last_seen_at === undefined
+        ? null
+        : dbInteger(device.last_seen_at),
+    serverTime: Date.now(),
+    pushConfigured: apnsSender !== undefined,
+    pushRegistered: current.subscription.deviceToken !== null,
+  });
 }
 
 async function pairAndroid(
@@ -1267,27 +1404,59 @@ async function sendOutbox(messageId: string): Promise<void> {
       session_id: string;
       subscription_envelope: string;
       pair_id: string;
+      device_id: string;
+      seq: string | number;
+      created_at: string | number;
+      envelope_json: string;
+      wechat_user_id: string | number;
+      reply_capable: string | number;
+      conversation_send_capable: string | number;
     }>(
       pool,
-      "SELECT push_outbox.payload, browser_sessions.session_id, browser_sessions.subscription_envelope, devices.pair_id FROM push_outbox JOIN messages ON messages.id = push_outbox.message_id JOIN devices ON devices.device_id = messages.device_id JOIN browser_sessions ON browser_sessions.pair_id = devices.pair_id AND browser_sessions.invalidated_at IS NULL WHERE push_outbox.message_id = ? AND push_outbox.sent_at IS NULL",
+      "SELECT push_outbox.payload, browser_sessions.session_id, browser_sessions.subscription_envelope, devices.pair_id, messages.device_id, messages.seq, messages.created_at, messages.envelope_json, messages.wechat_user_id, messages.reply_capable, messages.conversation_send_capable FROM push_outbox JOIN messages ON messages.id = push_outbox.message_id JOIN devices ON devices.device_id = messages.device_id JOIN browser_sessions ON browser_sessions.pair_id = devices.pair_id AND browser_sessions.invalidated_at IS NULL WHERE push_outbox.message_id = ? AND push_outbox.sent_at IS NULL",
       [messageId],
     );
     if (!row) return;
+    const destination = decryptSubscription(row.subscription_envelope);
+    if (isNativeDestination(destination) && (!apnsSender || !destination.deviceToken))
+      return;
     await dbRun(
       pool,
       "UPDATE push_outbox SET attempts = attempts + 1 WHERE message_id = ?",
       [messageId],
     );
     try {
-      const statusCode = await deliverPush(
-        {
-          sessionId: row.session_id,
+      let statusCode: number;
+      if (isNativeDestination(destination)) {
+        const result = await apnsSender!.send(destination, {
           pairId: row.pair_id,
-          subscription: decryptSubscription(row.subscription_envelope),
-        },
-        row.payload,
-        messageId,
-      );
+          messageId,
+          deviceId: row.device_id,
+          seq: dbInteger(row.seq),
+          createdAt: dbInteger(row.created_at),
+          wechatUserId: dbInteger(row.wechat_user_id) as 0 | 999,
+          replyCapable: dbInteger(row.reply_capable) === 1,
+          conversationSendCapable:
+            dbInteger(row.conversation_send_capable) === 1,
+          previewEnvelope: JSON.parse(row.envelope_json) as PreviewEnvelope,
+        });
+        statusCode = result.statusCode;
+        if (statusCode < 200 || statusCode >= 300)
+          throw Object.assign(new Error("APNS_REJECTED"), {
+            statusCode,
+            invalidToken: result.invalidToken,
+          });
+      } else {
+        statusCode = await deliverWebPush(
+          {
+            sessionId: row.session_id,
+            pairId: row.pair_id,
+            subscription: destination,
+          },
+          row.payload,
+          messageId,
+        );
+      }
       await dbRun(
         pool,
         "UPDATE push_outbox SET sent_at = ? WHERE message_id = ?",
@@ -1302,7 +1471,18 @@ async function sendOutbox(messageId: string): Promise<void> {
         typeof error === "object" && error && "statusCode" in error
           ? error.statusCode
           : undefined;
-      if (statusCode === 404 || statusCode === 410)
+      const invalidNativeToken =
+        isNativeDestination(destination) &&
+        typeof error === "object" &&
+        error !== null &&
+        "invalidToken" in error &&
+        error.invalidToken === true;
+      if (invalidNativeToken)
+        await clearNativeDeviceToken(
+          row.session_id,
+          destination.deviceToken!,
+        );
+      else if (!isNativeDestination(destination) && (statusCode === 404 || statusCode === 410))
         await invalidateBrowserSession(row.session_id);
       event("ANDROID_PUSH_FAILED", {
         messageId,
@@ -1320,6 +1500,44 @@ async function recoverOutbox(): Promise<void> {
   ))
     void sendOutbox(row.message_id);
 }
+async function sendPendingOutboxForPair(pairId: string): Promise<void> {
+  for (const row of await dbRows<{ message_id: string }>(
+    pool,
+    "SELECT push_outbox.message_id FROM push_outbox JOIN messages ON messages.id = push_outbox.message_id JOIN devices ON devices.device_id = messages.device_id WHERE devices.pair_id = ? AND push_outbox.sent_at IS NULL",
+    [pairId],
+  ))
+    void sendOutbox(row.message_id);
+}
+async function clearNativeDeviceToken(
+  sessionId: string,
+  rejectedToken: string,
+): Promise<void> {
+  const cleared = await transaction(async (connection) => {
+    const row = await dbOne<{ subscription_envelope: string }>(
+      connection,
+      "SELECT subscription_envelope FROM browser_sessions WHERE session_id = ? AND invalidated_at IS NULL FOR UPDATE",
+      [sessionId],
+    );
+    if (!row) return false;
+    const destination = decryptSubscription(row.subscription_envelope);
+    if (
+      !isNativeDestination(destination) ||
+      destination.deviceToken !== rejectedToken
+    )
+      return false;
+    await dbRun(
+      connection,
+      "UPDATE browser_sessions SET subscription_envelope = ?, updated_at = ? WHERE session_id = ? AND invalidated_at IS NULL",
+      [
+        encryptSubscription({ ...destination, deviceToken: null }),
+        Date.now(),
+        sessionId,
+      ],
+    );
+    return true;
+  });
+  if (cleared) event("IOS_PUSH_TOKEN_CLEARED", { sessionId });
+}
 async function sendPush(messageId: string): Promise<void> {
   const record = await loadMessage(messageId);
   const session = await loadBrowserSessionById(record.sessionId);
@@ -1331,7 +1549,7 @@ async function sendPush(messageId: string): Promise<void> {
   record.attempts += 1;
   await saveMessage(record);
   try {
-    const statusCode = await deliverPush(session, record.payload, messageId);
+    const statusCode = await deliverWebPush(session, record.payload, messageId);
     record.pushServiceAcceptedAt = Date.now();
     record.responseCode = statusCode;
     await saveMessage(record);
@@ -1349,11 +1567,13 @@ async function sendPush(messageId: string): Promise<void> {
     event("PUSH_FAILED", { messageId, responseCode: statusCode ?? null });
   }
 }
-async function deliverPush(
+async function deliverWebPush(
   session: BrowserSession,
   payload: string,
   messageId: string,
 ): Promise<number> {
+  if (isNativeDestination(session.subscription))
+    throw new Error("WEB_PUSH_SUBSCRIPTION_REQUIRED");
   const captureFile = process.env.TEST_PUSH_CAPTURE_FILE;
   if (process.env.NODE_ENV === "test" && captureFile) {
     await appendFile(
@@ -1372,6 +1592,30 @@ async function deliverPush(
     topic: messageId.replaceAll("-", "").slice(0, 32),
   });
   return result.statusCode;
+}
+function testApnsTransport(): ApnsTransport | undefined {
+  const captureFile = process.env.TEST_APNS_CAPTURE_FILE;
+  if (process.env.NODE_ENV !== "test" || !captureFile) return undefined;
+  return {
+    async request(origin, headers, payload) {
+      const path = String(headers[":path"] ?? "");
+      await appendFile(
+        captureFile,
+        `${JSON.stringify({
+          origin,
+          topic: headers["apns-topic"],
+          pushType: headers["apns-push-type"],
+          expiration: headers["apns-expiration"],
+          payload: JSON.parse(payload),
+        })}\n`,
+        { encoding: "utf8", mode: 0o600 },
+      );
+      const invalidToken = process.env.TEST_APNS_INVALID_TOKEN;
+      if (invalidToken && path.endsWith(`/${invalidToken}`))
+        return { statusCode: 410, reason: "Unregistered" };
+      return { statusCode: 200 };
+    },
+  };
 }
 function schedulePush(messageId: string, delayMs: number): void {
   const timer = setTimeout(
@@ -1540,7 +1784,7 @@ async function loadLegacySubscription(): Promise<StoredSubscription> {
     throw new Error("SUBSCRIPTION_MISSING");
   }
 }
-function encryptSubscription(value: PushSubscription): string {
+function encryptSubscription(value: PushSubscription | NativePushDestination): string {
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", storageKey, iv);
   const ciphertext = Buffer.concat([
@@ -1553,7 +1797,7 @@ function encryptSubscription(value: PushSubscription): string {
       ct: ciphertext.toString("base64url"),
   });
 }
-function decryptSubscription(value: string): PushSubscription {
+function decryptSubscription(value: string): PushSubscription | NativePushDestination {
   try {
     const wrapped = JSON.parse(value) as { iv: string; tag: string; ct: string };
     const decipher = createDecipheriv(
@@ -1562,15 +1806,32 @@ function decryptSubscription(value: string): PushSubscription {
       Buffer.from(wrapped.iv, "base64url"),
     );
     decipher.setAuthTag(Buffer.from(wrapped.tag, "base64url"));
-    return JSON.parse(
+    const destination = JSON.parse(
       Buffer.concat([
         decipher.update(Buffer.from(wrapped.ct, "base64url")),
         decipher.final(),
       ]).toString("utf8"),
-    ) as PushSubscription;
+    ) as unknown;
+    if (isNativeDestination(destination)) return destination;
+    return validateSubscription(destination);
   } catch {
     throw new Error("SUBSCRIPTION_INVALID");
   }
+}
+
+function isNativeDestination(value: unknown): value is NativePushDestination {
+  if (!value || typeof value !== "object") return false;
+  const destination = value as Partial<NativePushDestination>;
+  return (
+    destination.kind === "apns" &&
+    (destination.deviceToken === null ||
+      (typeof destination.deviceToken === "string" &&
+        /^[0-9a-f]{32,200}$/.test(destination.deviceToken) &&
+        destination.deviceToken.length % 2 === 0)) &&
+    (destination.environment === "sandbox" ||
+      destination.environment === "production") &&
+    typeof destination.previewEnabled === "boolean"
+  );
 }
 async function importLegacySubscription(): Promise<void> {
   let legacy: StoredSubscription;

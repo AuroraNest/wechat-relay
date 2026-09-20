@@ -6,6 +6,7 @@ data
 *.pem
 *.key
 *.p12
+*.p8
 *.pfx
 *.jks
 *.keystore

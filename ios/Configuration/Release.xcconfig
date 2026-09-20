@@ -1,0 +1,3 @@
+APNS_ENVIRONMENT = production
+RELAY_APNS_ENVIRONMENT = production
+#include? "Signing.local.xcconfig"

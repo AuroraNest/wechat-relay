@@ -1,0 +1,5 @@
+APNS_ENVIRONMENT = development
+RELAY_APNS_ENVIRONMENT = sandbox
+SWIFT_OPTIMIZATION_LEVEL = -Onone
+ONLY_ACTIVE_ARCH = YES
+#include? "Signing.local.xcconfig"

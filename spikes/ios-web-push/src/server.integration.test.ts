@@ -23,11 +23,20 @@ const origin = `http://127.0.0.1:${port}`;
 const testToken = "integration-test-token";
 const secondTestToken = "integration-test-token-b";
 const storageKey = Buffer.alloc(32, 7);
+const invalidApnsToken = "f".repeat(64);
 
 test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, acks, and Push", { skip: !adminUser }, async (context) => {
   const database = `awr_test_${randomBytes(8).toString("hex")}`;
   const dataDir = await mkdtemp(join(tmpdir(), "awr-mysql-"));
   const captureFile = join(dataDir, "push-capture.jsonl");
+  const apnsCaptureFile = join(dataDir, "apns-capture.jsonl");
+  const apnsKeyPath = join(dataDir, "AuthKey_TEST.p8");
+  const apnsKeys = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  await writeFile(
+    apnsKeyPath,
+    apnsKeys.privateKey.export({ type: "pkcs8", format: "pem" }),
+    { mode: 0o600 },
+  );
   const admin = await mysql.createConnection({
     host: process.env.MYSQL_TEST_ADMIN_HOST ?? "127.0.0.1",
     port: Number(process.env.MYSQL_TEST_ADMIN_PORT ?? 3306),
@@ -62,7 +71,7 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   );
   await writeLegacySubscription(dataDir, legacyAckToken, legacyPairId);
 
-  server = startServer(database, dataDir, captureFile);
+  server = startServer(database, dataDir, captureFile, apnsCaptureFile, apnsKeyPath);
   await waitUntilReady(server);
   assert.equal((await fetch(`${origin}/healthz`)).status, 200);
   assert.equal((await fetch(`${origin}/api/status`, {
@@ -82,6 +91,75 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   const b = await pairDevice(sessionB, secondTestToken);
   assert.notEqual(a.pairId, b.pairId);
   assert.notEqual(a.deviceId, b.deviceId);
+
+  const missingIosOrigin = await fetch(`${origin}/api/v1/ios/sessions`, {
+    method: "POST",
+    headers: {
+      "X-AWR-Test-Token": testToken,
+      "Content-Type": "application/json",
+    },
+    body: "{}",
+  });
+  assert.equal(missingIosOrigin.status, 400);
+  assert.deepEqual(await missingIosOrigin.json(), { error: "INVALID_ORIGIN" });
+  const nativeSession = await createIosSession();
+  const native = await pairDevice(nativeSession);
+  const initialNativeStatus = await iosStatus(nativeSession, native.pairId);
+  assert.equal(initialNativeStatus.paired, true);
+  assert.equal(initialNativeStatus.deviceId, native.deviceId);
+  assert.equal(initialNativeStatus.lastSeenAt, null);
+  assert.equal(initialNativeStatus.pushConfigured, true);
+  assert.equal(initialNativeStatus.pushRegistered, false);
+  const nativeMessage = await uploadMessage(native, {
+    v: 5,
+    seq: 1,
+    wechatUserId: 999,
+    replyCapable: true,
+    conversationSendCapable: true,
+  });
+  const [[pendingNativeOutbox]] = await db.query<(mysql.RowDataPacket & { attempts: string | number; sent_at: string | number | null })[]>(
+    "SELECT attempts, sent_at FROM push_outbox WHERE message_id = ?",
+    [nativeMessage.id],
+  );
+  assert.equal(Number(pendingNativeOutbox?.attempts), 0);
+  assert.equal(pendingNativeOutbox?.sent_at, null);
+  await updateIosPush(nativeSession, native.pairId, "a".repeat(64), "production", false);
+  await waitFor(async () =>
+    (await apnsCaptureLines(apnsCaptureFile)).some(
+      (entry) => entry.payload.messageId === nativeMessage.id,
+    ),
+  );
+  const nativeCapture = (await apnsCaptureLines(apnsCaptureFile)).find(
+    (entry) => entry.payload.messageId === nativeMessage.id,
+  )!;
+  assert.equal(nativeCapture.origin, "https://api.push.apple.com");
+  assert.equal(nativeCapture.topic, "com.auroramaple.wechatrelay");
+  assert.equal(nativeCapture.pushType, "alert");
+  assert.equal(nativeCapture.payload.previewEnabled, false);
+  assert.equal("previewEnvelope" in nativeCapture.payload, false);
+  assert.equal((nativeCapture.payload.aps as Record<string, unknown>).category, "RELAY_MESSAGE");
+  const activeNativeStatus = await iosStatus(nativeSession, native.pairId);
+  assert.equal(activeNativeStatus.pushRegistered, true);
+  assert.equal(typeof activeNativeStatus.lastSeenAt, "number");
+
+  await updateIosPush(nativeSession, native.pairId, invalidApnsToken, "sandbox", true);
+  const rejectedNativeMessage = await uploadMessage(native, {
+    v: 4,
+    seq: 2,
+    wechatUserId: 0,
+    replyCapable: false,
+  });
+  await waitFor(async () => !(await iosStatus(nativeSession, native.pairId)).pushRegistered);
+  const nativeMessages = await fetch(`${origin}/api/v1/messages`, {
+    headers: browserHeaders(nativeSession, native.pairId, true),
+  });
+  assert.equal(nativeMessages.status, 200);
+  const [[rejectedOutbox]] = await db.query<(mysql.RowDataPacket & { attempts: string | number; sent_at: string | number | null })[]>(
+    "SELECT attempts, sent_at FROM push_outbox WHERE message_id = ?",
+    [rejectedNativeMessage.id],
+  );
+  assert.equal(Number(rejectedOutbox?.attempts), 1);
+  assert.equal(rejectedOutbox?.sent_at, null);
 
   const defaultPolicy = await browserJson<{ enabled: boolean; scheduleEnabled: boolean; weekdays: number[] }>("/api/v1/relay-policy", sessionB, b.pairId);
   assert.equal(defaultPolicy.enabled, true);
@@ -320,7 +398,7 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   })).status, 200);
 
   await stop(server);
-  server = startServer(database, dataDir, captureFile);
+  server = startServer(database, dataDir, captureFile, apnsCaptureFile, apnsKeyPath);
   await waitUntilReady(server);
   const persisted = await browserJson<{ messages: Array<{ messageId: string }> }>(
     "/api/v1/messages",
@@ -352,7 +430,13 @@ async function applyMigrations(admin: Connection, database: string): Promise<voi
     await admin.query(await readFile(new URL(`../scripts/migrations/${name}`, import.meta.url), "utf8"));
 }
 
-function startServer(database: string, dataDir: string, captureFile: string): ChildProcess {
+function startServer(
+  database: string,
+  dataDir: string,
+  captureFile: string,
+  apnsCaptureFile: string,
+  apnsKeyPath: string,
+): ChildProcess {
   const vapid = webpush.generateVAPIDKeys();
   return spawn(process.execPath, [new URL("./server.js", import.meta.url).pathname], {
     env: {
@@ -375,9 +459,64 @@ function startServer(database: string, dataDir: string, captureFile: string): Ch
       MYSQL_PASSWORD: process.env.MYSQL_TEST_ADMIN_PASSWORD ?? "",
       TEST_PUSH_CAPTURE_FILE: captureFile,
       TEST_PUSH_GONE_ENDPOINT_SUFFIX: "/gone",
+      APNS_TEAM_ID: "TEAMID1234",
+      APNS_KEY_ID: "KEYID12345",
+      APNS_PRIVATE_KEY_PATH: apnsKeyPath,
+      APNS_TOPIC: "com.auroramaple.wechatrelay",
+      TEST_APNS_CAPTURE_FILE: apnsCaptureFile,
+      TEST_APNS_INVALID_TOKEN: invalidApnsToken,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+}
+
+async function createIosSession(): Promise<string> {
+  const response = await fetch(`${origin}/api/v1/ios/sessions`, {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      "X-AWR-Test-Token": testToken,
+      "Content-Type": "application/json",
+    },
+    body: "{}",
+  });
+  await assertResponseStatus(response, 201);
+  return ((await response.json()) as { ackToken: string }).ackToken;
+}
+
+async function updateIosPush(
+  ackToken: string,
+  pairId: string,
+  deviceToken: string | null,
+  environment: "sandbox" | "production",
+  previewEnabled: boolean,
+): Promise<void> {
+  const response = await fetch(`${origin}/api/v1/ios/push`, {
+    method: "PUT",
+    headers: {
+      ...browserHeaders(ackToken, pairId, true),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ deviceToken, environment, previewEnabled }),
+  });
+  await assertResponseStatus(response, 200);
+}
+
+interface IosStatus {
+  paired: boolean;
+  deviceId: string | null;
+  lastSeenAt: number | null;
+  serverTime: number;
+  pushConfigured: boolean;
+  pushRegistered: boolean;
+}
+
+async function iosStatus(ackToken: string, pairId: string): Promise<IosStatus> {
+  const response = await fetch(`${origin}/api/v1/ios/status`, {
+    headers: browserHeaders(ackToken, pairId, true),
+  });
+  await assertResponseStatus(response, 200);
+  return await response.json() as IosStatus;
 }
 
 async function createSubscription(label: string, token = testToken): Promise<string> {
@@ -632,6 +771,16 @@ async function captureLines(path: string): Promise<Array<{
   pairId: string;
   messageId: string;
   payload: { notification: { navigate: string; data: Record<string, unknown> } };
+}>> {
+  const content = await readFile(path, "utf8").catch(() => "");
+  return content.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+async function apnsCaptureLines(path: string): Promise<Array<{
+  origin: string;
+  topic: string;
+  pushType: string;
+  payload: Record<string, unknown>;
 }>> {
   const content = await readFile(path, "utf8").catch(() => "");
   return content.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
