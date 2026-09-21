@@ -729,12 +729,14 @@ class WechatNotificationListenerService : NotificationListenerService() {
             } finally {
                 key.fill(0)
             }
-        } catch (_: Exception) {
+        } catch (failure: Exception) {
+            recordSyncDiagnostic("CONTACT_SEND_DOWNLINK_DECRYPT_FAILED", failure)
             return "INVALID_REPLY"
         }
         val current = try {
             ContactsCurrentStore.get(this).read(command.wechatUserId)
-        } catch (_: Exception) {
+        } catch (failure: Exception) {
+            recordSyncDiagnostic("CONTACT_SNAPSHOT_READ_FAILED", failure)
             return "INVALID_REPLY"
         } ?: return "CONTACT_SNAPSHOT_STALE"
         if (!ContactsSendPolicy.matches(current, snapshotId, command.deviceId, command.wechatUserId) ||
@@ -747,7 +749,8 @@ class WechatNotificationListenerService : NotificationListenerService() {
             } finally {
                 key.fill(0)
             }
-        } catch (_: Exception) {
+        } catch (failure: Exception) {
+            recordSyncDiagnostic("CONTACT_SNAPSHOT_DECRYPT_FAILED", failure)
             return "INVALID_REPLY"
         }
         if (!ContactsSendPolicy.hasExactMember(contacts, decrypted.conversationTitle ?: return "INVALID_REPLY")) {
@@ -763,8 +766,9 @@ class WechatNotificationListenerService : NotificationListenerService() {
             decrypted.body,
         )
         recordSyncDiagnostic("ACCESSIBILITY_${result.stage}")
-        if (result.status == "SENT_TO_WECHAT") recordReply(result.status, null, -1)
-        return result.status
+        val status = ContactsSendPolicy.terminalStatus(result.status, result.stage)
+        if (status == "SENT_TO_WECHAT") recordReply(status, null, -1)
+        return status
     }
 
     private fun replySessionActive(generation: Long, expectedDeviceId: String): Boolean =
@@ -802,6 +806,8 @@ class WechatNotificationListenerService : NotificationListenerService() {
         "PENDING_INTENT_CANCELED" -> "微信已取消回复入口"
         "INVALID_REPLY" -> "回复数据无效"
         "CONTACT_SNAPSHOT_STALE" -> "联系人快照已过期, 请重新同步"
+        "AUTOMATION_NOT_READY" -> "自动化尚未就绪"
+        "WECHAT_WINDOW_TIMEOUT" -> "微信窗口打开超时"
         "FAILED" -> "发送失败"
         else -> status
     }

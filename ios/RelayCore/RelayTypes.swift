@@ -247,6 +247,8 @@ public enum RelayReplyStatus: String, Codable, Sendable, Equatable {
     case remoteInputUnsupported = "REMOTE_INPUT_UNSUPPORTED"
     case pendingIntentCanceled = "PENDING_INTENT_CANCELED"
     case contactSnapshotStale = "CONTACT_SNAPSHOT_STALE"
+    case automationNotReady = "AUTOMATION_NOT_READY"
+    case wechatWindowTimeout = "WECHAT_WINDOW_TIMEOUT"
     case invalidReply = "INVALID_REPLY"
     case failed = "FAILED"
 

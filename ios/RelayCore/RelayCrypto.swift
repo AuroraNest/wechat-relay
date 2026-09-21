@@ -50,7 +50,8 @@ public enum RelayCrypto {
         if conversationSend {
             aad = "AWR1|I2A|3|CONVERSATION_SEND|\(session.pairId)|\(id.uuidString.lowercased())|\(target.deviceId)|\(target.messageId.uuidString.lowercased())|\(createdAt)|\(target.wechatUserId)"
             let preview = try decryptPreview(target, messageKey: session.messageKey)
-            plaintext = try JSONSerialization.data(withJSONObject: ["body": body, "conversationTitle": preview.sender], options: [])
+            // Android's existing parser requires body before conversationTitle.
+            plaintext = try JSONSerialization.data(withJSONObject: ["body": body, "conversationTitle": preview.sender], options: [.sortedKeys])
         } else {
             aad = "AWR1|I2A|\(id.uuidString.lowercased())|\(target.deviceId)|\(target.messageId.uuidString.lowercased())|\(createdAt)|\(target.wechatUserId)"
             plaintext = try JSONSerialization.data(withJSONObject: ["body": body], options: [])
@@ -70,7 +71,7 @@ public enum RelayCrypto {
         let replyId = try id ?? UUIDv7.make(now: Date(timeIntervalSince1970: Double(createdAt) / 1_000))
         guard RelayValidation.isUUIDv7(replyId) else { throw RelayError.invalidValue("contact send") }
         let aad = "AWR1|I2A|4|CONTACT_SEND|\(session.pairId)|\(replyId.uuidString.lowercased())|\(deviceId)|\(snapshotId.uuidString.lowercased())|\(createdAt)|\(wechatUserId)"
-        let plaintext = try JSONSerialization.data(withJSONObject: ["body": body, "conversationTitle": conversationTitle], options: [])
+        let plaintext = try JSONSerialization.data(withJSONObject: ["body": body, "conversationTitle": conversationTitle], options: [.sortedKeys])
         let envelope = try encrypt(plaintext, key: session.replyKey, kid: "phase1-reply", aad: aad)
         return RelayReplyRequest(v: 4, id: replyId, targetContactSnapshotId: snapshotId, deviceId: deviceId, wechatUserId: wechatUserId, createdAt: createdAt, replyEnvelope: envelope)
     }

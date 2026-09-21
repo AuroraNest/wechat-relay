@@ -88,6 +88,20 @@ class ProbeCoreTest {
     }
 
     @Test
+    fun contactSearchUsesTheWorkflowDeadlineWhileNotificationKeepsShortWindowDeadline() {
+        assertTrue(AccessibilityReplyPolicy.shortWechatWindowTimeoutApplies(true, false))
+        assertTrue(AccessibilityReplyPolicy.shortWechatWindowTimeoutApplies(false, false))
+        assertFalse(AccessibilityReplyPolicy.shortWechatWindowTimeoutApplies(false, true))
+    }
+
+    @Test
+    fun contactSendMapsOnlyKnownAccessibilityTerminalStages() {
+        assertEquals("AUTOMATION_NOT_READY", ContactsSendPolicy.terminalStatus("REMOTE_INPUT_UNSUPPORTED", "ACCESSIBILITY_NOT_ARMED"))
+        assertEquals("WECHAT_WINDOW_TIMEOUT", ContactsSendPolicy.terminalStatus("FAILED", "WECHAT_WINDOW_TIMEOUT"))
+        assertEquals("FAILED", ContactsSendPolicy.terminalStatus("FAILED", "WORKFLOW_TIMEOUT"))
+    }
+
+    @Test
     fun pinNodeSelectorRequiresExactSystemUiPackageViewIdAndLabel() {
         val pinAncestors = listOf("com.android.systemui:id/keyguard_pin_view")
         assertTrue(LockscreenReplySelectors.isExactSystemPinNode("com.android.systemui", "com.android.systemui:id/key7", listOf("7"), pinAncestors, '7'))

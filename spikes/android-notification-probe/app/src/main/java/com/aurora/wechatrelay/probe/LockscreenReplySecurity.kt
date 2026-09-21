@@ -50,6 +50,8 @@ object AccessibilityReplyPolicy {
         nowMillis < deadlineMillis -> InputTextObservation.Wait
         else -> InputTextObservation.Fail
     }
+    internal fun shortWechatWindowTimeoutApplies(hasContentIntent: Boolean, isConversationSearch: Boolean): Boolean =
+        hasContentIntent || !isConversationSearch
     internal fun shouldRequestHome(
         startedLocked: Boolean,
         terminalStatus: String,

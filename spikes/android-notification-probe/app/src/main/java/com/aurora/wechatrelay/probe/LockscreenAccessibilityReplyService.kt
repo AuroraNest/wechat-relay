@@ -39,6 +39,8 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
     private val pinStore by lazy { LockscreenPinStore(this) }
     private val pinTick = Runnable { session?.let(::clickNextPinDigit) }
     private val historyTick = Runnable { session?.let(::processWechatWindow) }
+    // Reopening an existing WeChat window may not produce another accessibility event.
+    private val conversationNavigationTick = Runnable { session?.let(::processConversationNavigation) }
     private val contactsTick = Runnable { contactScan?.let(::processContactsScan) }
     @Volatile private var session: Session? = null
     @Volatile private var contactScan: ContactScan? = null
@@ -411,6 +413,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
     private fun workflowTimeoutStage(active: Session): String {
         if (active.isHistoryForward) return "HISTORY_TIMEOUT_${active.phase.name.uppercase()}"
         if (active.isVoiceTranscription) return "VOICE_TIMEOUT_${active.phase.name.uppercase()}"
+        if (isConversationNavigation(active)) return "WECHAT_WINDOW_TIMEOUT"
         if (!active.isImageCapture) return "WORKFLOW_TIMEOUT"
         return when (active.phase) {
             Phase.Unlocking -> "WORKFLOW_TIMEOUT_UNLOCKING"
@@ -498,8 +501,10 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
             } == true
             if (!sent) return false
             active.phase = if (active.contentIntent == null) Phase.FindingSearch else Phase.OpeningWechat
+            if (isConversationNavigation(active)) scheduleConversationNavigationTick(active)
             if (active.isHistoryForward || active.isVoiceTranscription) handler.postDelayed(historyTick, UiSettleMillis)
             handler.postDelayed({
+                val conversationSearchActive = isConversationNavigation(active)
                 if (session === active && active.phase !in setOf(
                         Phase.OpeningImageViewer,
                         Phase.WaitingOriginalView,
@@ -509,7 +514,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                         Phase.Finishing,
                         Phase.HistoryViewer, Phase.HistoryMenu, Phase.HistorySearch, Phase.HistoryResult, Phase.HistoryConfirm, Phase.HistoryClaiming, Phase.HistoryVerify, Phase.HistoryReturnSource,
                         Phase.VoiceMenu, Phase.VoiceWaitingTranscript, Phase.VoiceLongPressing, Phase.VoiceCopyMenu, Phase.VoiceClipboardReading,
-                    )) {
+                    ) && AccessibilityReplyPolicy.shortWechatWindowTimeoutApplies(active.contentIntent != null, conversationSearchActive)) {
                     finishSession("FAILED", when {
                         active.isImageCapture -> "WECHAT_WINDOW_TIMEOUT_OPENING_CHAT"
                         active.isVoiceTranscription -> "VOICE_WINDOW_TIMEOUT_OPENING_CHAT"
@@ -1914,6 +1919,24 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         }
     }
 
+    private fun processConversationNavigation(active: Session) {
+        if (session !== active || !active.cancellation.canAct() || !isConversationNavigation(active)) return
+        processWechatWindow(active)
+        if (isConversationNavigation(active)) scheduleConversationNavigationTick(active)
+    }
+
+    private fun isConversationNavigation(active: Session): Boolean =
+        active.contentIntent == null && !active.isHistoryForward && !active.isVoiceTranscription && active.phase in setOf(
+            Phase.FindingSearch, Phase.EnteringSearch, Phase.SelectingResult, Phase.OpeningWechat,
+        )
+
+    private fun scheduleConversationNavigationTick(active: Session) {
+        if (session === active && active.cancellation.canAct()) {
+            handler.removeCallbacks(conversationNavigationTick)
+            handler.postDelayed(conversationNavigationTick, UiSettleMillis)
+        }
+    }
+
     private fun isBottomComposerInput(node: AccessibilityNodeInfo): Boolean {
         if (!node.isVisibleToUser || !node.isEnabled || !node.isEditable) return false
         val bounds = Rect().also(node::getBoundsInScreen)
@@ -2009,6 +2032,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         if (active.phase == Phase.Finishing) return
         handler.removeCallbacks(pinTick)
         handler.removeCallbacks(historyTick)
+        handler.removeCallbacks(conversationNavigationTick)
         val terminalStatus = if (active.cancellation.canAct()) status else "FAILED"
         val terminalStage = active.cancellation.stage() ?: stage
         active.phase = Phase.Finishing

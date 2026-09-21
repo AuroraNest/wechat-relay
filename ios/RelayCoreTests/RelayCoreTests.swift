@@ -117,6 +117,8 @@ struct RelayCoreTests {
         let reply = try RelayCrypto.makeReply(session: session, target: message, body: "hello", now: time)
         #expect(reply.v == 3)
         #expect(reply.replyEnvelope.aad.contains("|CONVERSATION_SEND|\(session.pairId)|"))
+        let plaintext = try RelayCrypto.decrypt(reply.replyEnvelope, key: key, expectedKid: "phase1-reply", maximumCiphertextBytes: 4_096)
+        #expect(String(decoding: plaintext, as: UTF8.self) == "{\"body\":\"hello\",\"conversationTitle\":\"Phase 0\"}")
         #expect(throws: (any Error).self) { try RelayCrypto.makeReply(session: session, target: message, body: String(repeating: "x", count: 1_001), now: time) }
     }
 
@@ -141,6 +143,14 @@ struct RelayCoreTests {
 
         let generatedID = try RelayCrypto.makeContactSend(session: session, snapshotId: snapshotID, deviceId: request.deviceId, wechatUserId: request.wechatUserId, conversationTitle: "测试好友 A", body: "Hello from contacts")
         #expect(generatedID.id.uuidString.lowercased().split(separator: "-")[2].first == "7")
+    }
+
+    @Test func decodesAutomationFailuresAsTerminalStatuses() throws {
+        for value in ["AUTOMATION_NOT_READY", "WECHAT_WINDOW_TIMEOUT"] {
+            let status = try JSONDecoder().decode(RelayReplyStatus.self, from: Data("\"\(value)\"".utf8))
+            #expect(status.isTerminal)
+            #expect(status.rawValue == value)
+        }
     }
 
     @Test func serializesReplyLowercaseAndAcceptsResponsePath() async throws {

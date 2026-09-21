@@ -554,6 +554,8 @@ class MainActivity : Activity() {
         "PENDING_INTENT_CANCELED" -> "微信已取消回复入口"
         "INVALID_REPLY" -> "回复数据无效"
         "CONTACT_SNAPSHOT_STALE" -> "联系人快照已过期, 请重新同步"
+        "AUTOMATION_NOT_READY" -> "自动化尚未就绪"
+        "WECHAT_WINDOW_TIMEOUT" -> "微信窗口打开超时"
         "FAILED" -> "发送失败"
         else -> status
     }

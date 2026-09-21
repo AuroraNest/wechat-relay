@@ -42,6 +42,12 @@ internal object ContactsSendPolicy {
         current.id == snapshotId && current.deviceId == deviceId && current.wechatUserId == wechatUserId
 
     fun hasExactMember(contacts: List<String>, title: String): Boolean = contacts.any { it == title }
+
+    fun terminalStatus(status: String, stage: String): String = when (stage) {
+        "ACCESSIBILITY_NOT_ARMED" -> "AUTOMATION_NOT_READY"
+        "WECHAT_WINDOW_TIMEOUT" -> "WECHAT_WINDOW_TIMEOUT"
+        else -> status
+    }
 }
 
 internal object ContactsScanPolicy {

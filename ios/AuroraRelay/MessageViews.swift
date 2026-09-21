@@ -232,7 +232,7 @@ struct ConversationView: View {
                                 VStack(alignment: .trailing, spacing: 7) {
                                     Text(reply.body).textSelection(.enabled).padding(14).background(Color.relayGreen.opacity(0.13), in: RoundedRectangle(cornerRadius: 18))
                                     Button { Task { await model.retry(reply) } } label: {
-                                        Text(reply.status.label).font(.caption2).foregroundStyle(reply.status == .sentToWechat ? Color.secondary : Color.relayGreen)
+                                        Text(reply.request.v == 4 && reply.status == .remoteInputUnsupported ? "小米自动化不可用, 请检查 Relay 授权与保护状态" : reply.status.label).font(.caption2).foregroundStyle(reply.status == .sentToWechat ? Color.secondary : Color.relayGreen)
                                     }.disabled(reply.status != .submitting)
                                 }
                             }.id(entry.id)

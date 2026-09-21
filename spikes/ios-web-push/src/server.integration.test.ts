@@ -252,6 +252,13 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   assert.equal("targetMessageId" in contactReplyStatus, false);
   await contactReplyEvents.close();
 
+  for (const status of ["AUTOMATION_NOT_READY", "WECHAT_WINDOW_TIMEOUT"]) {
+    const failedReply = await submitContactReply(nativeSessionB, nativeB.pairId, nativeB, contactSnapshot.id, 0) as { replyId: string };
+    await acknowledgeReply(nativeB, failedReply.replyId, status);
+    const result = await browserJson<Record<string, unknown>>(`/api/v1/replies/${failedReply.replyId}`, nativeSessionB, nativeB.pairId);
+    assert.equal(result.status, status);
+  }
+
   const replacementContactSnapshot = contactsSnapshot(nativeB, 0, Date.now() + 1, 2);
   const replacementContactBody = JSON.stringify(replacementContactSnapshot);
   await assertResponseStatus(

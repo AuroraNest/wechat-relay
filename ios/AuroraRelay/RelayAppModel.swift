@@ -713,6 +713,8 @@ extension RelayReplyStatus {
         case .pendingIntentCanceled: return "微信回复入口已失效"
         case .invalidReply: return "回复内容未通过校验"
         case .contactSnapshotStale: return "好友名单已失效, 请在小米重新同步好友后重发"
+        case .automationNotReady: return "小米锁屏自动化未就绪, 请打开小米 Relay 检查保护状态"
+        case .wechatWindowTimeout: return "等待微信会话超时, 请在小米检查微信界面"
         case .failed: return "Android 发送失败"
         }
     }
