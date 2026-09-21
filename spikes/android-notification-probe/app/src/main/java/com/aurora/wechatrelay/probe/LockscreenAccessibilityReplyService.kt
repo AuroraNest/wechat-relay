@@ -116,6 +116,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         var keypadWaitingLogged: Boolean = false,
         var pinTimeoutSnapshotLogged: Boolean = false,
         var pinEntryStarted: Boolean = false,
+        var returnedFromOtherChat: Boolean = false,
         var inputObservationDeadlineMillis: Long = 0L,
         var setTextAcceptedLogged: Boolean = false,
         var inputTextObservedLogged: Boolean = false,
@@ -1869,12 +1870,42 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                     processWechatWindow(active)
                     return
                 }
+                if (isConversationNavigation(active)) {
+                    val searchInputs = nodes.filter {
+                        it.isVisibleToUser && it.isEnabled && it.isEditable &&
+                            it.viewIdResourceName == "com.tencent.mm:id/d98"
+                    }
+                    if (searchInputs.size == 1 && editableInputs == 0) {
+                        active.phase = Phase.EnteringSearch
+                        return
+                    }
+                }
                 val candidates = nodes.filter { node ->
                     node.isVisibleToUser && node.isEnabled && node.isClickable &&
                         nodeLabels(node).any { LockscreenReplySelectors.normalizeTitle(it) in SearchLabels }
                 }
                 if (candidates.size > 1) return finishSession("WECHAT_ACTION_CHANGED", "AMBIGUOUS_SEARCH_CONTROL")
-                val search = candidates.singleOrNull() ?: return
+                val search = candidates.singleOrNull()
+                if (search == null) {
+                    val backControls = nodes.filter {
+                        it.isVisibleToUser && it.isEnabled && it.isClickable &&
+                            it.viewIdResourceName == "com.tencent.mm:id/actionbar_up_indicator"
+                    }
+                    if (isConversationNavigation(active) && LockscreenReplySelectors.canReturnFromOtherChat(
+                            editableInputs, backControls.size, active.returnedFromOtherChat,
+                        )) {
+                        // ponytail: Return once from an observed chat; unknown screens must time out safely.
+                        active.returnedFromOtherChat = true
+                        if (active.cancellation.runIfActive {
+                                backControls.single().performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                            } != true) {
+                            finishSession("FAILED", "SEARCH_BACK_CLICK_FAILED")
+                        } else {
+                            recordAccessibilityStage("SEARCH_RETURNED_FROM_OTHER_CHAT")
+                        }
+                    }
+                    return
+                }
                 if (active.cancellation.runIfActive { search.performAction(AccessibilityNodeInfo.ACTION_CLICK) } != true) {
                     finishSession("FAILED", "SEARCH_CLICK_FAILED")
                     return

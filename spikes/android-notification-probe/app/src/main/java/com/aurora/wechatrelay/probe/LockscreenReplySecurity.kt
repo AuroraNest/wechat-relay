@@ -106,6 +106,9 @@ object LockscreenReplySelectors {
     internal fun isUnambiguousChatSurface(titleMatches: Boolean, editableInputs: Int): Boolean =
         titleMatches && editableInputs == 1
 
+    internal fun canReturnFromOtherChat(editableInputs: Int, backControls: Int, alreadyReturned: Boolean): Boolean =
+        editableInputs == 1 && backControls == 1 && !alreadyReturned
+
     internal fun hasUniqueReadySendControl(sendControls: Int): Boolean = sendControls == 1
 
     internal fun isBottomComposerBounds(left: Int, top: Int, right: Int, bottom: Int, screenHeight: Int): Boolean =

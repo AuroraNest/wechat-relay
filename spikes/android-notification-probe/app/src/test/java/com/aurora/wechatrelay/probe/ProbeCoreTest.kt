@@ -113,6 +113,16 @@ class ProbeCoreTest {
     }
 
     @Test
+    fun conversationSearchReturnsOnlyOnceFromAnUnambiguousChat() {
+        assertTrue(LockscreenReplySelectors.canReturnFromOtherChat(1, 1, false))
+        assertFalse(LockscreenReplySelectors.canReturnFromOtherChat(1, 1, true))
+        assertFalse(LockscreenReplySelectors.canReturnFromOtherChat(0, 1, false))
+        assertFalse(LockscreenReplySelectors.canReturnFromOtherChat(2, 1, false))
+        assertFalse(LockscreenReplySelectors.canReturnFromOtherChat(1, 0, false))
+        assertFalse(LockscreenReplySelectors.canReturnFromOtherChat(1, 2, false))
+    }
+
+    @Test
     fun targetAndVisibleTitleSelectionAreExactAndUnambiguous() {
         assertEquals("Alice Team", LockscreenReplySelectors.normalizeTitle("  Alice\n Team  "))
         assertTrue(LockscreenReplySelectors.titleMatches("expected", listOf("other", "expected")))
