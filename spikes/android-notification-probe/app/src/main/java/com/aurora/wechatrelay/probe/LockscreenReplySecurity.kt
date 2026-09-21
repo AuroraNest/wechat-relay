@@ -109,6 +109,9 @@ object LockscreenReplySelectors {
     internal fun canReturnFromOtherChat(editableInputs: Int, backControls: Int, alreadyReturned: Boolean): Boolean =
         editableInputs == 1 && backControls == 1 && !alreadyReturned
 
+    internal fun isExactSingleRecipient(expectedHash: String, memberHashes: List<String>): Boolean =
+        expectedHash.isNotBlank() && memberHashes.singleOrNull() == expectedHash
+
     internal fun hasUniqueReadySendControl(sendControls: Int): Boolean = sendControls == 1
 
     internal fun isBottomComposerBounds(left: Int, top: Int, right: Int, bottom: Int, screenHeight: Int): Boolean =

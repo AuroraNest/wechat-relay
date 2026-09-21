@@ -32,14 +32,14 @@ android {
         applicationId = "com.aurora.wechatrelay.probe"
         minSdk = 28
         targetSdk = 36
-        versionCode = 48
-        versionName = "0.6.31"
+        versionCode = 49
+        versionName = "0.6.32"
 
         buildConfigField("String", "RELAY_ORIGIN", "\"$relayOrigin\"")
 
         buildConfigField("boolean", "LOCKSCREEN_ACCESSIBILITY_REPLY", "false")
 
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunner = "com.aurora.wechatrelay.probe.RecipientNavigationCheck"
     }
 
     buildTypes {

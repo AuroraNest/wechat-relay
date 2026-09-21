@@ -46,7 +46,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
     @Volatile private var contactScan: ContactScan? = null
 
     private enum class Phase {
-        Unlocking, FindingSearch, EnteringSearch, SelectingResult, OpeningWechat,
+        Unlocking, FindingSearch, EnteringSearch, SelectingResult, OpeningWechat, CheckingRecipient, ReturningToChat,
         OpeningImageViewer, WaitingOriginalView,
         HistoryViewer, HistoryMenu, HistorySearch, HistoryResult, HistoryConfirm, HistoryClaiming, HistoryVerify, HistoryReturnSource,
         VoiceMenu, VoiceWaitingTranscript, VoiceLongPressing, VoiceCopyMenu, VoiceClipboardReading,
@@ -117,6 +117,17 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         var pinTimeoutSnapshotLogged: Boolean = false,
         var pinEntryStarted: Boolean = false,
         var returnedFromOtherChat: Boolean = false,
+        var recipientComposer: AccessibilityNodeInfo? = null,
+        var recipientVerified: Boolean = false,
+        var recipientInfoOpenedAt: Long = 0L,
+        var recipientBackAt: Long = 0L,
+        var recipientInfoWindowSeen: Boolean = false,
+        var recipientChatWindowSeen: Boolean = false,
+        var recipientInfoWindowId: Int = -1,
+        var recipientChatWindowId: Int = -1,
+        var recipientInfoClickSeen: Boolean = false,
+        var recipientBackClickSeen: Boolean = false,
+        var recipientWindowSettledAt: Long = 0L,
         var inputObservationDeadlineMillis: Long = 0L,
         var setTextAcceptedLogged: Boolean = false,
         var inputTextObservedLogged: Boolean = false,
@@ -198,6 +209,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
             }
         }
         val active = session ?: return
+        if (event != null && !acceptRecipientNavigationEvent(active, event)) return
         if (active.isVoiceTranscription && active.phase == Phase.VoiceWaitingTranscript &&
             event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             VoiceTranscriptionPolicy.isFailureDialog(event.packageName?.toString(), event.className?.toString(), event.text.map(CharSequence::toString)) &&
@@ -214,6 +226,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                     Phase.EnteringSearch,
                     Phase.SelectingResult,
                     Phase.OpeningWechat,
+                    Phase.CheckingRecipient, Phase.ReturningToChat,
                     Phase.OpeningImageViewer,
                     Phase.WaitingOriginalView,
                     Phase.Verifying,
@@ -414,7 +427,10 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
     private fun workflowTimeoutStage(active: Session): String {
         if (active.isHistoryForward) return "HISTORY_TIMEOUT_${active.phase.name.uppercase()}"
         if (active.isVoiceTranscription) return "VOICE_TIMEOUT_${active.phase.name.uppercase()}"
-        if (isConversationNavigation(active)) return "WECHAT_WINDOW_TIMEOUT"
+        if (isConversationNavigation(active)) {
+            recordAccessibilityStage("NAVIGATION_TIMEOUT_${active.phase.name.uppercase()}")
+            return "WECHAT_WINDOW_TIMEOUT"
+        }
         if (!active.isImageCapture) return "WORKFLOW_TIMEOUT"
         return when (active.phase) {
             Phase.Unlocking -> "WORKFLOW_TIMEOUT_UNLOCKING"
@@ -853,6 +869,10 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
 
     private fun processWechatWindow(active: Session) {
         if (session !== active || !active.cancellation.canAct()) return
+        if (active.recipientVerified && foregroundPackage() != NotificationSnapshot.WechatPackage) {
+            finishSession("WECHAT_ACTION_CHANGED", "RECIPIENT_WINDOW_LOST")
+            return
+        }
         if (active.isHistoryForward) {
             if (active.phase in setOf(Phase.FindingSearch, Phase.EnteringSearch, Phase.SelectingResult)) {
                 processConversationSearch(active, rootsForPackage(NotificationSnapshot.WechatPackage))
@@ -868,6 +888,10 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         val roots = rootsForPackage(NotificationSnapshot.WechatPackage)
         if (active.phase in setOf(Phase.FindingSearch, Phase.EnteringSearch, Phase.SelectingResult)) {
             processConversationSearch(active, roots)
+            return
+        }
+        if (active.phase in setOf(Phase.CheckingRecipient, Phase.ReturningToChat)) {
+            processRecipientCheck(active, roots)
             return
         }
         if (roots.isEmpty()) {
@@ -894,9 +918,12 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
             return
         }
         if (active.contentIntent == null && active.phase in setOf(Phase.OpeningWechat, Phase.ReadyToClick) &&
-            !visibleTitleMatches(roots, active.expectedTitleHash)
+            !visibleTitleMatches(roots, active.expectedTitleHash) && !active.recipientVerified
         ) {
-            if (active.phase == Phase.OpeningWechat) return
+            if (active.phase == Phase.OpeningWechat) {
+                beginRecipientCheck(active, roots)
+                return
+            }
             finishSession("WECHAT_ACTION_CHANGED", "TITLE_RECHECK_FAILED")
             return
         }
@@ -907,6 +934,10 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         if (input == null) {
             if (active.phase == Phase.OpeningWechat) return
             finishSession("WECHAT_ACTION_CHANGED", "AMBIGUOUS_REPLY_CONTROLS")
+            return
+        }
+        if (active.recipientVerified && (roots.size != 1 || input.windowId != active.recipientChatWindowId || input != active.recipientComposer)) {
+            finishSession("WECHAT_ACTION_CHANGED", "RECIPIENT_CHAT_CHANGED")
             return
         }
 
@@ -1959,7 +1990,111 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
     private fun isConversationNavigation(active: Session): Boolean =
         active.contentIntent == null && !active.isHistoryForward && !active.isVoiceTranscription && active.phase in setOf(
             Phase.FindingSearch, Phase.EnteringSearch, Phase.SelectingResult, Phase.OpeningWechat,
+            Phase.CheckingRecipient, Phase.ReturningToChat,
         )
+
+    private fun beginRecipientCheck(active: Session, roots: List<AccessibilityNodeInfo>) {
+        if (!isConversationNavigation(active)) return
+        if (roots.size != 1) return
+        val nodes = roots.flatMap(::walk)
+        val input = nodes.filter(::isBottomComposerInput).singleOrNull() ?: return
+        val more = nodes.filter {
+            it.isVisibleToUser && it.isEnabled && it.isClickable &&
+                it.viewIdResourceName == "com.tencent.mm:id/fq" &&
+                nodeLabels(it).any { label -> label.toString() == "更多信息" }
+        }.singleOrNull() ?: return
+        active.recipientComposer = input
+        active.recipientInfoOpenedAt = SystemClock.uptimeMillis()
+        active.phase = Phase.CheckingRecipient
+        if (active.cancellation.runIfActive { more.performAction(AccessibilityNodeInfo.ACTION_CLICK) } != true) {
+            finishSession("FAILED", "RECIPIENT_INFO_OPEN_FAILED")
+        } else recordAccessibilityStage("RECIPIENT_INFO_OPENED")
+    }
+
+    private fun processRecipientCheck(active: Session, roots: List<AccessibilityNodeInfo>) {
+        if (roots.size != 1) return
+        if (SystemClock.uptimeMillis() < active.recipientWindowSettledAt) return
+        val nodes = roots.flatMap(::walk)
+        if (active.phase == Phase.ReturningToChat) {
+            if (!active.recipientChatWindowSeen) return
+            if (roots.single().windowId != active.recipientChatWindowId) return
+            val input = nodes.filter(::isBottomComposerInput).singleOrNull() ?: return
+            if (input != active.recipientComposer) {
+                finishSession("WECHAT_ACTION_CHANGED", "RECIPIENT_CHAT_CHANGED")
+                return
+            }
+            active.recipientVerified = true
+            active.phase = Phase.OpeningWechat
+            recordAccessibilityStage("RECIPIENT_CHAT_VERIFIED")
+            processWechatWindow(active)
+            return
+        }
+        val infoTitle = nodes.any {
+            it.isVisibleToUser && it.viewIdResourceName == "android:id/text1" && it.text?.toString() == "聊天信息"
+        }
+        if (!infoTitle || !active.recipientInfoWindowSeen || roots.single().windowId != active.recipientInfoWindowId) return
+        val members = nodes.filter { it.isVisibleToUser && it.viewIdResourceName == "com.tencent.mm:id/m7b" }
+        if (members.isEmpty()) return
+        val hashes = members.map { Privacy.saltedHash(LockscreenReplySelectors.normalizeTitle(it.text), Privacy.salt(this)) }
+        if (!LockscreenReplySelectors.isExactSingleRecipient(active.expectedTitleHash, hashes)) {
+            finishSession("WECHAT_ACTION_CHANGED", "RECIPIENT_INFO_MISMATCH")
+            return
+        }
+        val back = nodes.filter {
+            it.isVisibleToUser && it.isEnabled && it.isClickable &&
+                it.viewIdResourceName == "com.tencent.mm:id/actionbar_up_indicator"
+        }.singleOrNull() ?: return
+        active.phase = Phase.ReturningToChat
+        active.recipientBackAt = SystemClock.uptimeMillis()
+        if (active.cancellation.runIfActive { back.performAction(AccessibilityNodeInfo.ACTION_CLICK) } != true) {
+            finishSession("FAILED", "RECIPIENT_INFO_RETURN_FAILED")
+        }
+    }
+
+    private fun acceptRecipientNavigationEvent(active: Session, event: AccessibilityEvent): Boolean {
+        if (active.recipientInfoOpenedAt == 0L || event.eventTime < active.recipientInfoOpenedAt ||
+            active.phase !in setOf(Phase.CheckingRecipient, Phase.ReturningToChat, Phase.OpeningWechat, Phase.ReadyToClick)
+        ) return true
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED &&
+            foregroundPackage() != NotificationSnapshot.WechatPackage
+        ) {
+            finishSession("WECHAT_ACTION_CHANGED", "RECIPIENT_WINDOW_LOST")
+            return false
+        }
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val expected = when (active.phase) {
+                Phase.CheckingRecipient -> "com.tencent.mm.ui.SingleChatInfoUI"
+                Phase.ReturningToChat -> {
+                    if (event.eventTime < active.recipientBackAt) return true
+                    "com.tencent.mm.ui.chatting.ChattingUI"
+                }
+                else -> null
+            }
+            if (event.packageName?.toString() != NotificationSnapshot.WechatPackage || event.className?.toString() != expected) {
+                finishSession("WECHAT_ACTION_CHANGED", "RECIPIENT_NAVIGATION_CHANGED")
+                return false
+            }
+            if (active.phase == Phase.CheckingRecipient) {
+                active.recipientInfoWindowSeen = true
+                active.recipientInfoWindowId = event.windowId
+            } else {
+                active.recipientChatWindowSeen = true
+                active.recipientChatWindowId = event.windowId
+            }
+            active.recipientWindowSettledAt = SystemClock.uptimeMillis() + UiSettleMillis
+        } else if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
+            val sourceId = event.source?.viewIdResourceName
+            val infoClick = active.recipientBackAt == 0L || event.eventTime < active.recipientBackAt
+            val expectedId = if (infoClick) "com.tencent.mm:id/fq" else "com.tencent.mm:id/actionbar_up_indicator"
+            val alreadySeen = if (infoClick) active.recipientInfoClickSeen else active.recipientBackClickSeen
+            if (event.packageName?.toString() != NotificationSnapshot.WechatPackage || sourceId != expectedId || alreadySeen) {
+                finishSession("WECHAT_ACTION_CHANGED", "RECIPIENT_NAVIGATION_CHANGED")
+                return false
+            }
+            if (infoClick) active.recipientInfoClickSeen = true else active.recipientBackClickSeen = true
+        }
+        return true
+    }
 
     private fun scheduleConversationNavigationTick(active: Session) {
         if (session === active && active.cancellation.canAct()) {

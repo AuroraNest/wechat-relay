@@ -113,6 +113,16 @@ class ProbeCoreTest {
     }
 
     @Test
+    fun recipientInfoRequiresExactlyOneMatchingMember() {
+        assertTrue(LockscreenReplySelectors.isExactSingleRecipient("target", listOf("target")))
+        assertFalse(LockscreenReplySelectors.isExactSingleRecipient("target", emptyList()))
+        assertFalse(LockscreenReplySelectors.isExactSingleRecipient("target", listOf("other")))
+        assertFalse(LockscreenReplySelectors.isExactSingleRecipient("target", listOf("target", "other")))
+        assertFalse(LockscreenReplySelectors.isExactSingleRecipient("target", listOf("target", "target")))
+        assertFalse(LockscreenReplySelectors.isExactSingleRecipient("", listOf("")))
+    }
+
+    @Test
     fun conversationSearchReturnsOnlyOnceFromAnUnambiguousChat() {
         assertTrue(LockscreenReplySelectors.canReturnFromOtherChat(1, 1, false))
         assertFalse(LockscreenReplySelectors.canReturnFromOtherChat(1, 1, true))
