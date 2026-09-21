@@ -62,6 +62,7 @@ APNs 是可选能力. 不配置时服务仍可为原生 App 创建 session, 完�
 - `POST /api/v1/pairings`: 继续使用既有 `X-AWR-Test-Token` 和 `X-AWR-Ack-Token` 流程.
 - `PUT /api/v1/ios/push`: 使用 `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id`, 提交 `{deviceToken,environment,previewEnabled}`. `deviceToken` 可以是 `null`.
 - `GET /api/v1/ios/status`: 使用 `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id`, 返回配对, Android 最近签名请求时间及 Push 状态.
+- `GET /api/v1/ios/events?afterSeq=N`: 仅 native session 使用 `Origin`, `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id` 建立前台 SSE. 服务端先发送 `ready` 和当前最新 sequence, 后续只发送 `message` sequence 或 `reply` UUID 提示. 客户端收到提示后仍通过既有受认证 HTTP API 同步密文和回复状态. 服务端约每 22 秒发送 heartbeat 并重新校验 session.
 - `POST /api/v1/android/contacts`: 使用既有 Android 签名请求头, 提交 v1 contacts envelope. 服务端验证 `AWR1|A2I_CONTACTS|1|{id}|{deviceId}|{capturedAt}|{wechatUserId}` AAD, 但不读取联系人明文.
 - `GET /api/v1/ios/contacts`: 仅 native session 使用 `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id` 读取当前 pair 的至多两个 profile snapshot. 重配对后旧 device 的快照不可读取.
 

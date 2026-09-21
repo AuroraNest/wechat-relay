@@ -82,6 +82,11 @@ const replyEvents = new EventEmitter();
 replyEvents.setMaxListeners(0);
 const messageEvents = new EventEmitter();
 messageEvents.setMaxListeners(0);
+const iosEvents = new EventEmitter();
+iosEvents.setMaxListeners(0);
+const iosSseHeartbeatMs = 22_000;
+const iosSseDrainTimeoutMs = 30_000;
+const maxPendingIosReplyHints = 32;
 const apnsConfig = await loadApnsConfig();
 const apnsSender = apnsConfig
   ? new ApnsSender(apnsConfig, testApnsTransport() ?? undefined)
@@ -343,6 +348,8 @@ async function route(
     return updateIosPush(request, response);
   if (request.method === "GET" && url.pathname === "/api/v1/ios/status")
     return getIosStatus(request, response);
+  if (request.method === "GET" && url.pathname === "/api/v1/ios/events")
+    return streamIosEvents(request, response, url);
   if (request.method === "GET" && url.pathname === "/api/v1/relay-policy")
     return getBrowserRelayPolicy(request, response);
   if (request.method === "PUT" && url.pathname === "/api/v1/relay-policy")
@@ -713,6 +720,7 @@ async function submitBrowserReply(
   }
   event("REPLY_QUEUED", { replyId: reply.id, targetMessageId: reply.targetMessageId });
   replyEvents.emit("queued", reply.deviceId);
+  iosEvents.emit("reply", pairId, reply.id);
   json(response, 201, { replyId: reply.id, status: "QUEUED" });
 }
 
@@ -760,6 +768,7 @@ async function getAndroidReply(
     const relayPolicy = relayPolicyJson(await loadRelayPolicy(signed.pairId));
     if (!reply) return json(response, 200, { reply: null, relayPolicy });
     event("REPLY_DELIVERED_TO_ANDROID", { replyId: reply.id });
+    iosEvents.emit("reply", signed.pairId, reply.id);
     json(response, 200, { reply, relayPolicy });
   } finally {
     wake.cancel();
@@ -783,16 +792,24 @@ async function acknowledgeAndroidReply(
     url.pathname,
   );
   const now = Date.now();
-  await transaction(async (connection) => {
+  const pairId = await transaction(async (connection) => {
     await consumeAndroidNonce(connection, signed.deviceId, signed.nonce, now);
+    const reply = await dbOne<{ pair_id: string }>(
+      connection,
+      "SELECT pair_id FROM replies WHERE id = ? AND device_id = ? FOR UPDATE",
+      [replyId, signed.deviceId],
+    );
+    if (!reply) throw new Error("REPLY_NOT_FOUND");
     const result = await dbRun(
       connection,
       "UPDATE replies SET status = ?, status_at = ? WHERE id = ? AND device_id = ?",
       [status, now, replyId, signed.deviceId],
     );
     if (result.affectedRows !== 1) throw new Error("REPLY_NOT_FOUND");
+    return reply.pair_id;
   });
   event("REPLY_ACKNOWLEDGED", { replyId, status });
+  iosEvents.emit("reply", pairId, replyId);
   json(response, 202, { replyId, status });
 }
 
@@ -1122,6 +1139,146 @@ async function streamBrowserMessages(
   } finally {
     wake?.cancel();
   }
+}
+
+async function streamIosEvents(
+  request: IncomingMessage,
+  response: ServerResponse,
+  url: URL,
+): Promise<void> {
+  const { pairId } = await authorizeNativeBrowserPair(request);
+  const rawAfterSeq = url.searchParams.get("afterSeq");
+  if (!rawAfterSeq || !/^(?:0|[1-9][0-9]*)$/.test(rawAfterSeq))
+    throw new Error("INVALID_CURSOR");
+  const afterSeq = Number(rawAfterSeq);
+  if (!Number.isSafeInteger(afterSeq)) throw new Error("INVALID_CURSOR");
+
+  response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  response.setHeader("Cache-Control", "no-store");
+  response.setHeader("X-Accel-Buffering", "no");
+  response.flushHeaders();
+
+  let closed = false;
+  let opened = false;
+  let changeVersion = 0;
+  let pendingMessage = false;
+  const pendingReplies = new Set<string>();
+  let notifyWaiter: (() => void) | undefined;
+  const notify = (): void => {
+    changeVersion++;
+    const resolve = notifyWaiter;
+    notifyWaiter = undefined;
+    resolve?.();
+  };
+  const onMessage = (storedPairId: string): void => {
+    if (storedPairId !== pairId) return;
+    pendingMessage = true;
+    notify();
+  };
+  const onReply = (storedPairId: string, replyId: string): void => {
+    if (storedPairId !== pairId) return;
+    if (pendingReplies.size >= maxPendingIosReplyHints) {
+      closed = true;
+      response.end();
+      notify();
+      return;
+    }
+    pendingReplies.add(replyId);
+    notify();
+  };
+  const close = (): void => {
+    closed = true;
+    notify();
+  };
+  messageEvents.on("stored", onMessage);
+  iosEvents.on("reply", onReply);
+  response.once("close", close);
+
+  const waitForChange = (observedVersion: number, timeoutMs: number): Promise<boolean> => {
+    if (closed || changeVersion !== observedVersion) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(done, timeoutMs);
+      timer.unref();
+      notifyWaiter = () => done(true);
+      function done(changed = false): void {
+        clearTimeout(timer);
+        if (notifyWaiter) notifyWaiter = undefined;
+        resolve(changed);
+      }
+    });
+  };
+
+  try {
+    // Subscribe before reading the cursor so a store during the read is observed.
+    const readySeq = await latestMessageSeq(pairId);
+    if (!await writeSse(response, "ready", String(readySeq))) return;
+    opened = true;
+    event("IOS_STREAM_OPENED", {});
+    let nextAuthorizationAt = Date.now() + iosSseHeartbeatMs;
+    while (!closed) {
+      if (Date.now() >= nextAuthorizationAt) {
+        try {
+          await authorizeNativeBrowserPair(request);
+        } catch {
+          event("IOS_SSE_AUTH_REVOKED", {});
+          response.end();
+          return;
+        }
+        if (!await writeSse(response, undefined, "keepalive")) return;
+        nextAuthorizationAt = Date.now() + iosSseHeartbeatMs;
+        continue;
+      }
+      if (pendingMessage) {
+        pendingMessage = false;
+        const latestSeq = await latestMessageSeq(pairId);
+        if (!await writeSse(response, "message", String(latestSeq))) return;
+        continue;
+      }
+      const replyId = pendingReplies.values().next().value as string | undefined;
+      if (replyId) {
+        pendingReplies.delete(replyId);
+        if (!await writeSse(response, "reply", replyId)) return;
+        continue;
+      }
+      const observedVersion = changeVersion;
+      await waitForChange(observedVersion, nextAuthorizationAt - Date.now());
+    }
+  } finally {
+    messageEvents.off("stored", onMessage);
+    iosEvents.off("reply", onReply);
+    response.off("close", close);
+    if (!response.destroyed && !response.writableEnded) response.end();
+    if (opened) event("IOS_STREAM_CLOSED", {});
+  }
+}
+
+async function writeSse(
+  response: ServerResponse,
+  eventName: "ready" | "message" | "reply" | undefined,
+  data: string,
+): Promise<boolean> {
+  if (response.destroyed || response.writableEnded) return false;
+  const payload = eventName
+    ? `event: ${eventName}\ndata: ${data}\n\n`
+    : `: ${data}\n\n`;
+  if (response.write(payload)) return true;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      response.destroy();
+      done(false);
+    }, iosSseDrainTimeoutMs);
+    timer.unref();
+    response.once("drain", drained);
+    response.once("close", closed);
+    function done(result: boolean): void {
+      clearTimeout(timer);
+      response.off("drain", drained);
+      response.off("close", closed);
+      resolve(result && !response.destroyed && !response.writableEnded);
+    }
+    function drained(): void { done(true); }
+    function closed(): void { done(false); }
+  });
 }
 
 function validateAndroidMessage(value: unknown): AndroidMessage {
@@ -1831,6 +1988,15 @@ async function authorizeBrowserPair(
   )
     throw new Error("PAIRING_MISMATCH");
   return { pairId: requestedPairId, sessionId: session.sessionId };
+}
+async function authorizeNativeBrowserPair(
+  request: IncomingMessage,
+): Promise<{ pairId: string; sessionId: string }> {
+  const session = await authorizeBrowserPair(request, true);
+  const current = await loadBrowserSessionById(session.sessionId);
+  if (!current || !isNativeDestination(current.subscription))
+    throw new Error("INVALID_IOS_SESSION");
+  return session;
 }
 async function authorizeBrowserSession(request: IncomingMessage): Promise<BrowserSession> {
   const candidate = request.headers["x-awr-ack-token"];

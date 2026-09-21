@@ -110,6 +110,16 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   assert.equal(initialNativeStatus.lastSeenAt, null);
   assert.equal(initialNativeStatus.pushConfigured, true);
   assert.equal(initialNativeStatus.pushRegistered, false);
+  const missingIosEventsOrigin = await fetch(`${origin}/api/v1/ios/events?afterSeq=0`, {
+    headers: browserHeaders(nativeSession, native.pairId),
+  });
+  assert.equal(missingIosEventsOrigin.status, 400);
+  assert.deepEqual(await missingIosEventsOrigin.json(), { error: "INVALID_ORIGIN" });
+  const pwaIosEvents = await fetch(`${origin}/api/v1/ios/events?afterSeq=0`, {
+    headers: browserHeaders(sessionA, a.pairId, true),
+  });
+  assert.equal(pwaIosEvents.status, 400);
+  assert.deepEqual(await pwaIosEvents.json(), { error: "INVALID_IOS_SESSION" });
   const nativeMessage = await uploadMessage(native, {
     v: 5,
     seq: 1,
@@ -117,6 +127,33 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
     replyCapable: true,
     conversationSendCapable: true,
   });
+  const initialEvents = await openIosEvents(nativeSession, native.pairId, 0);
+  assert.deepEqual(await initialEvents.next(), { event: "ready", data: "1" });
+  await initialEvents.close();
+
+  const nativeSessionB = await createIosSession(secondTestToken);
+  const nativeB = await pairDevice(nativeSessionB, secondTestToken);
+  const nativeReplyEvents = await openIosEvents(nativeSession, native.pairId, 1);
+  const nativeBReplyEvents = await openIosEvents(nativeSessionB, nativeB.pairId, 0);
+  assert.deepEqual(await nativeReplyEvents.next(), { event: "ready", data: "1" });
+  assert.deepEqual(await nativeBReplyEvents.next(), { event: "ready", data: "0" });
+  const nativeReplyId = randomUUID();
+  const nativeReply = await submitReply(nativeSession, native, nativeMessage.id, 2, 999, nativeReplyId);
+  assert.deepEqual(nativeReply, { replyId: nativeReplyId, status: "QUEUED" });
+  assert.deepEqual(await nativeReplyEvents.next(), { event: "reply", data: nativeReplyId });
+  assert.equal(await Promise.race([
+    nativeBReplyEvents.next().then(() => "data"),
+    delay(150).then(() => "timeout"),
+  ]), "timeout");
+  const nativeClaim = await fetch(`${origin}/api/v1/android/replies`, {
+    headers: signedHeaders(native, "", "GET", "/api/v1/android/replies"),
+  });
+  await assertResponseStatus(nativeClaim, 200);
+  assert.deepEqual(await nativeReplyEvents.next(), { event: "reply", data: nativeReplyId });
+  await acknowledgeReply(native, nativeReplyId, "SENT_TO_WECHAT");
+  assert.deepEqual(await nativeReplyEvents.next(), { event: "reply", data: nativeReplyId });
+  await nativeReplyEvents.close();
+  await nativeBReplyEvents.close();
   const [[pendingNativeOutbox]] = await db.query<(mysql.RowDataPacket & { attempts: string | number; sent_at: string | number | null })[]>(
     "SELECT attempts, sent_at FROM push_outbox WHERE message_id = ?",
     [nativeMessage.id],
@@ -233,12 +270,19 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   assert.deepEqual(await crossPairContacts.json(), { error: "PAIRING_MISMATCH" });
 
   await updateIosPush(nativeSession, native.pairId, invalidApnsToken, "sandbox", true);
+  const nativeMessageEvents = await openIosEvents(nativeSession, native.pairId, 1);
+  assert.deepEqual(await nativeMessageEvents.next(), { event: "ready", data: "1" });
   const rejectedNativeMessage = await uploadMessage(native, {
     v: 4,
     seq: 2,
     wechatUserId: 0,
     replyCapable: false,
   });
+  assert.deepEqual(await nativeMessageEvents.next(), { event: "message", data: "2" });
+  await nativeMessageEvents.close();
+  const reconnectEvents = await openIosEvents(nativeSession, native.pairId, 1);
+  assert.deepEqual(await reconnectEvents.next(), { event: "ready", data: "2" });
+  await reconnectEvents.close();
   await waitFor(async () => !(await iosStatus(nativeSession, native.pairId)).pushRegistered);
   const nativeMessages = await fetch(`${origin}/api/v1/messages`, {
     headers: browserHeaders(nativeSession, native.pairId, true),
@@ -471,6 +515,17 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   assert.equal(fragmentA.get("pairId"), a.pairId);
   assert.equal(fragmentA.get("wechatUserId"), "999");
 
+  const revokedEvents = await openIosEvents(nativeSessionB, nativeB.pairId, 0);
+  assert.deepEqual(await revokedEvents.next(), { event: "ready", data: "0" });
+  await db.execute(
+    "UPDATE browser_sessions SET invalidated_at = ?, updated_at = ? WHERE ack_token_hash = ?",
+    [Date.now(), Date.now(), createHash("sha256").update(nativeSessionB).digest()],
+  );
+  assert.equal(await Promise.race([
+    revokedEvents.next(),
+    delay(25_000).then(() => assert.fail("IOS_SSE_REVOCATION_TIMEOUT")),
+  ]), undefined);
+
   const goneSubscription = await fetch(`${origin}/api/subscription`, {
     method: "POST",
     headers: {
@@ -574,12 +629,12 @@ function startServer(
   });
 }
 
-async function createIosSession(): Promise<string> {
+async function createIosSession(token = testToken): Promise<string> {
   const response = await fetch(`${origin}/api/v1/ios/sessions`, {
     method: "POST",
     headers: {
       Origin: origin,
-      "X-AWR-Test-Token": testToken,
+      "X-AWR-Test-Token": token,
       "Content-Type": "application/json",
     },
     body: "{}",
@@ -621,6 +676,38 @@ async function iosStatus(ackToken: string, pairId: string): Promise<IosStatus> {
   });
   await assertResponseStatus(response, 200);
   return await response.json() as IosStatus;
+}
+
+async function openIosEvents(ackToken: string, pairId: string, afterSeq: number): Promise<{
+  next: () => Promise<{ event: string; data: string } | undefined>;
+  close: () => Promise<void>;
+}> {
+  const response = await fetch(`${origin}/api/v1/ios/events?afterSeq=${afterSeq}`, {
+    headers: browserHeaders(ackToken, pairId, true),
+  });
+  await assertResponseStatus(response, 200);
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  return {
+    next: async () => {
+      while (true) {
+        const boundary = buffer.indexOf("\n\n");
+        if (boundary >= 0) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const event = /^event: ([^\n]+)$/m.exec(frame)?.[1];
+          const data = /^data: ([^\n]+)$/m.exec(frame)?.[1];
+          if (event && data !== undefined) return { event, data };
+          continue;
+        }
+        const chunk = await reader.read();
+        if (chunk.done) return undefined;
+        buffer += decoder.decode(chunk.value, { stream: true });
+      }
+    },
+    close: async () => { await reader.cancel(); },
+  };
 }
 
 async function createSubscription(label: string, token = testToken): Promise<string> {

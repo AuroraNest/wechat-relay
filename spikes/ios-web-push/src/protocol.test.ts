@@ -80,7 +80,7 @@ test("Nginx separates control, data, and long-lived protocol traffic", async () 
     assert.match(config, /location @control_rate_limited \{[\s\S]*?add_header Retry-After 6 always/);
     assert.match(config, /location @data_rate_limited \{[\s\S]*?add_header Retry-After 1 always/);
     assert.match(config, /location = \/api\/v1\/android\/messages \{[\s\S]*?client_max_body_size 24m;[\s\S]*?limit_req zone=awr_data burst=20 nodelay;/);
-    for (const path of ["/api/v1/messages/stream", "/api/v1/android/replies"]) {
+    for (const path of ["/api/v1/messages/stream", "/api/v1/ios/events", "/api/v1/android/replies"]) {
       const location = config.match(new RegExp(`location = ${path.replaceAll("/", "\\/")} \\{([\\s\\S]*?)\\n    \\}`))?.[1] ?? "";
       assert.match(location, /limit_req zone=awr_data burst=20 nodelay/);
       assert.match(location, /limit_conn awr_long_lived 8/);

@@ -100,6 +100,10 @@ final class RelayAppModel: ObservableObject {
 
     private var snapshot = InboxSnapshot()
     private var loop: Task<Void, Never>?
+    private var stream: Task<Void, Never>?
+    private var foregroundRun: UUID?
+    private var streamConnected = false
+    private var refreshRequested = false
     private var apnsToken: String?
     private var pushDirty = true
     private var nextCursor: Int?
@@ -151,18 +155,61 @@ final class RelayAppModel: ObservableObject {
 
     func start() {
         guard !isDemo, loop == nil else { return }
+        let run = UUID()
+        foregroundRun = run
         loop = Task { [weak self] in
             await self?.refreshNotificationPermission()
             while !Task.isCancelled {
-                guard let self else { return }
-                await self.refresh()
-                // ponytail: foreground polling keeps reply status and device state together; use SSE if this single-client load becomes material.
+                guard let self, self.foregroundRun == run else { return }
+                // Keep a low-frequency reconciliation while connected, and poll during stream outages.
+                if !self.streamConnected || self.problem != nil || Date().timeIntervalSince(self.lastSync ?? .distantPast) >= 30 {
+                    await self.refresh()
+                }
+                guard !Task.isCancelled, self.foregroundRun == run else { return }
+                self.startEventStream(run: run)
                 try? await Task.sleep(for: .seconds(self.problem == nil ? 4 : 15))
             }
         }
     }
 
-    func stop() { loop?.cancel(); loop = nil }
+    func stop() {
+        foregroundRun = nil
+        loop?.cancel(); loop = nil
+        stream?.cancel(); stream = nil
+        streamConnected = false
+        refreshRequested = false
+    }
+
+    private func startEventStream(run: UUID) {
+        guard stream == nil, let session, device?.paired == true, cacheReadable else { return }
+        stream = Task { [weak self] in
+            var delay = 1
+            while !Task.isCancelled {
+                guard let self, self.foregroundRun == run, self.session?.pairId == session.pairId else { return }
+                do {
+                    let api = try RelayAPI(origin: session.origin)
+                    let cursor = max(self.snapshot.clearedThrough, self.snapshot.messages.map(\.seq).max() ?? 0)
+                    try await api.streamEvents(session: session, afterSeq: cursor) { [weak self] event in
+                        await self?.receiveStreamEvent(event, pairID: session.pairId, run: run)
+                    }
+                } catch {
+                    guard !Task.isCancelled, self.foregroundRun == run else { return }
+                    if self.streamConnected { delay = 1 }
+                    self.streamConnected = false
+                    // A stream failure does not imply message sync failed; HTTP polling remains available.
+                }
+                try? await Task.sleep(for: .seconds(delay))
+                delay = min(delay * 2, 30)
+            }
+        }
+    }
+
+    private func receiveStreamEvent(_ event: RelayStreamEvent, pairID: String, run: UUID) async {
+        guard !Task.isCancelled, foregroundRun == run, session?.pairId == pairID else { return }
+        if case .ready = event { streamConnected = true }
+        // The ready event follows subscription, so this also recovers reply changes during disconnection.
+        await refresh()
+    }
 
     #if DEBUG
     func enterDemo() {
@@ -195,9 +242,16 @@ final class RelayAppModel: ObservableObject {
     }
 
     func refresh() async {
-        guard !isDemo, let session, !isRefreshing, cacheReadable else { return }
+        guard !isDemo, let session, cacheReadable, !Task.isCancelled else { return }
+        guard !isRefreshing else { refreshRequested = true; return }
         isRefreshing = true
-        defer { isRefreshing = false }
+        defer {
+            isRefreshing = false
+            if refreshRequested {
+                refreshRequested = false
+                Task { [weak self] in await self?.refresh() }
+            }
+        }
         do {
             let api = try RelayAPI(origin: session.origin)
             if device == nil || Date().timeIntervalSince(lastStatusCheck) > 25 {
@@ -214,19 +268,25 @@ final class RelayAppModel: ObservableObject {
             try await syncMessages(api: api, session: session)
             guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             try await refreshReplies(api: api, session: session)
+            guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             if policy.updatedAt == 0 || Date().timeIntervalSince(lastStatusCheck) < 2 {
-                policy = try await api.policy(session: session)
+                let currentPolicy = try await api.policy(session: session)
+                guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
+                policy = currentPolicy
             }
             if pushDirty {
                 try await api.updatePush(session: session, token: apnsToken, environment: pushEnvironment, previewEnabled: previewEnabled)
+                guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
                 pushDirty = false
-                device = try await api.deviceStatus(session: session)
+                let currentDevice = try await api.deviceStatus(session: session)
+                guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
+                device = currentDevice
             }
             lastSync = Date()
             problem = nil
         } catch is CancellationError {
         } catch {
-            if !Task.isCancelled { problem = Self.describe(error) }
+            if self.session?.pairId == session.pairId, !Task.isCancelled { problem = Self.describe(error) }
         }
     }
 
@@ -236,6 +296,7 @@ final class RelayAppModel: ObservableObject {
         var collected: [RelayMessage] = []
         repeat {
             let page = try await api.messages(session: session, beforeSeq: cursor)
+            guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             collected += page.messages.filter { $0.seq > known }
             let next = page.nextCursor.flatMap(Int.init)
             if snapshot.messages.isEmpty && cursor == nil { nextCursor = next; hasMore = page.hasMore && snapshot.clearedThrough == 0 }
@@ -252,11 +313,14 @@ final class RelayAppModel: ObservableObject {
         guard !isDemo, let session, hasMore, let nextCursor else { return }
         do {
             let page = try await RelayAPI(origin: session.origin).messages(session: session, beforeSeq: nextCursor)
+            guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             try merge(page.messages.filter { $0.seq > snapshot.clearedThrough })
             self.nextCursor = page.nextCursor.flatMap(Int.init)
             hasMore = page.hasMore && self.nextCursor != nil
             try saveCache()
-        } catch { problem = Self.describe(error) }
+        } catch {
+            if self.session?.pairId == session.pairId, !Task.isCancelled { problem = Self.describe(error) }
+        }
     }
 
     func refreshContacts() async {
@@ -383,10 +447,15 @@ final class RelayAppModel: ObservableObject {
         defer { submitting.remove(reply.id) }
         do {
             let result = try await RelayAPI(origin: session.origin).submitReply(session: session, request: reply.request)
+            guard self.session?.pairId == session.pairId else { return }
             guard result.replyId == reply.id else { throw RelayError.invalidResponse }
             updateReply(reply.id, status: result.status)
             try saveCache()
+            // A fast ACK event can arrive while this ID is excluded from refreshReplies.
+            submitting.remove(reply.id)
+            await refresh()
         } catch {
+            guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             problem = "回复尚未确认提交. 可以点重试, 同一条回复不会重复创建. \(Self.describe(error))"
         }
     }
@@ -395,6 +464,7 @@ final class RelayAppModel: ObservableObject {
         for reply in outgoing where !reply.status.isTerminal && !submitting.contains(reply.id) {
             do {
                 let result = try await api.replyStatus(session: session, id: reply.id)
+                guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
                 guard result.replyId == reply.id else { throw RelayError.invalidResponse }
                 updateReply(reply.id, status: result.status)
             } catch RelayError.httpStatus(404) where reply.status == .submitting {

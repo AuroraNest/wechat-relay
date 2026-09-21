@@ -57,6 +57,42 @@ public final class RelayAPI: NSObject, @unchecked Sendable {
         return try await request(path: "/api/v1/messages/wait", query: [URLQueryItem(name: "afterSeq", value: String(afterSeq))], session: relaySession, timeout: 60)
     }
 
+    public func streamEvents(session relaySession: RelaySession, afterSeq: Int, onEvent: @Sendable (RelayStreamEvent) async throws -> Void) async throws {
+        guard relaySession.origin == origin else { throw RelayError.invalidOrigin }
+        guard afterSeq >= 0 else { throw RelayError.invalidValue("after sequence") }
+        var components = URLComponents(url: origin, resolvingAgainstBaseURL: false)!
+        components.path = "/api/v1/ios/events"
+        components.queryItems = [URLQueryItem(name: "afterSeq", value: String(afterSeq))]
+        guard let url = components.url else { throw RelayError.invalidOrigin }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 60
+        request.setValue(originString, forHTTPHeaderField: "Origin")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue(relaySession.ackToken, forHTTPHeaderField: "X-AWR-Ack-Token")
+        request.setValue(relaySession.pairId, forHTTPHeaderField: "X-AWR-Pair-Id")
+        let configuration = sessionConfiguration.copy() as! URLSessionConfiguration
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 3_600
+        let connection = URLSession(configuration: configuration, delegate: RelayStreamRedirectDelegate(), delegateQueue: nil)
+        defer { connection.invalidateAndCancel() }
+        try await withTaskCancellationHandler {
+            let (bytes, response) = try await connection.bytes(for: request)
+            guard let http = response as? HTTPURLResponse, let responseURL = http.url,
+                  RelayOrigin.isSameOrigin(responseURL, as: origin) else { throw RelayError.redirectRejected }
+            guard http.statusCode == 200 else { throw RelayError.httpStatus(http.statusCode) }
+            guard http.mimeType?.lowercased() == "text/event-stream" else { throw RelayError.invalidResponse }
+            var parser = RelayStreamParser()
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                if let event = try parser.append(byte) { try await onEvent(event) }
+            }
+            // EOF is a disconnect, even when the HTTP response ended successfully.
+            throw RelayError.invalidResponse
+        } onCancel: {
+            connection.invalidateAndCancel()
+        }
+    }
+
     public func asset(session relaySession: RelaySession, id: UUID) async throws -> RelayAsset {
         try await request(path: "/api/v1/assets/\(id.uuidString.lowercased())", session: relaySession)
     }

@@ -34,6 +34,8 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -project ios
 
 ## Push 接入边界
 
+前台通过 `/api/v1/ios/events` 接收 SSE 新消息和回复状态提示, 再从原有鉴权 API 拉取规范数据. 连接就绪和重连后补拉, 进入后台取消连接, 锁屏通知继续使用 APNs. SSE 正常时约每 30 秒核对一次消息、回复和设备状态; 断线时回退原有轮询并退避重连, 不自动重发回复. 流内不携带消息正文或密钥, 旧 PWA 事件接口不变.
+
 原生端首次配对生成自己的新密钥, 因为旧 PWA 的密钥不可导出. Android 切换后使用新配对; 原 PWA 历史保留在原处, 不迁入本机. 配对流程不要求先授予通知权限.
 
 服务端需部署本次接口并配置 APNs signing key、Team ID、Key ID 与 App topic, 参见 [服务端说明](../spikes/ios-web-push/README.md). App 自动注册 device token. 使用普通 alert push + Notification Service Extension, 不依赖常驻后台或 silent push.

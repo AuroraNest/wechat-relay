@@ -143,6 +143,78 @@ struct RelayCoreTests {
         #expect(json["previewEnabled"] as? Bool == false)
     }
 
+    @Test func parsesBoundedStreamHintsAcrossLineEndings() throws {
+        var parser = RelayStreamParser()
+        var events: [RelayStreamEvent] = []
+        let source = ": keepalive\r\n\r\nevent: ready\r\ndata: 0\r\n\r\ndata: 7\n\nevent: reply\rdata: \(messageID.uuidString.lowercased())\r\revent: future\ndata: ignored\n\n"
+        for byte in source.utf8 {
+            if let event = try parser.append(byte) { events.append(event) }
+        }
+        #expect(events == [.ready(0), .message(7), .reply(messageID)])
+        for invalid in ["data: -1\n\n", "data: 9007199254740992\n\n", "event: reply\ndata: invalid\n\n"] {
+            #expect(throws: RelayError.invalidResponse) {
+                var parser = RelayStreamParser()
+                for byte in invalid.utf8 { _ = try parser.append(byte) }
+            }
+        }
+        #expect(throws: RelayError.responseTooLarge) {
+            var parser = RelayStreamParser()
+            for byte in String(repeating: "x", count: 1_025).utf8 { _ = try parser.append(byte) }
+        }
+        #expect(throws: RelayError.responseTooLarge) {
+            var parser = RelayStreamParser()
+            for byte in String(repeating: "data: 1\n: comment\n", count: 400).utf8 { _ = try parser.append(byte) }
+        }
+    }
+
+    @Test func streamsAuthenticatedHintsAndTreatsEOFAsDisconnect() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ReplyURLProtocol.self]
+        ReplyURLProtocol.reset()
+        ReplyURLProtocol.configure(body: Data("event: ready\ndata: 5\n\nevent: reply\ndata: \(messageID.uuidString)\n\n".utf8), headers: ["Content-Type": "text/event-stream"], status: 200)
+        let api = try RelayAPI(origin: URL(string: "https://relay.example.com")!, configuration: configuration)
+        let session = try RelaySession(origin: URL(string: "https://relay.example.com")!, ackToken: "ack", pairId: messageID.uuidString.lowercased(), messageKey: key, replyKey: key)
+        let recorder = StreamRecorder()
+        await #expect(throws: RelayError.invalidResponse) {
+            try await api.streamEvents(session: session, afterSeq: 4) { await recorder.append($0) }
+        }
+        #expect(await recorder.events == [.ready(5), .reply(messageID)])
+        let request = try #require(ReplyURLProtocol.capturedRequest())
+        #expect(request.url?.path == "/api/v1/ios/events")
+        #expect(request.url?.query == "afterSeq=4")
+        #expect(request.value(forHTTPHeaderField: "X-AWR-Ack-Token") == "ack")
+        #expect(request.value(forHTTPHeaderField: "X-AWR-Pair-Id") == session.pairId)
+        #expect(request.value(forHTTPHeaderField: "Origin") == "https://relay.example.com")
+        ReplyURLProtocol.configure(body: Data(), headers: [:], status: 401)
+        await #expect(throws: RelayError.httpStatus(401)) {
+            try await api.streamEvents(session: session, afterSeq: 4) { _ in }
+        }
+        ReplyURLProtocol.configure(body: Data(), headers: ["Content-Type": "text/html"], status: 200)
+        await #expect(throws: RelayError.invalidResponse) {
+            try await api.streamEvents(session: session, afterSeq: 4) { _ in }
+        }
+    }
+
+    @Test func cancelsOpenStreamWhenForegroundTaskStops() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ReplyURLProtocol.self]
+        ReplyURLProtocol.reset()
+        ReplyURLProtocol.configure(body: Data("event: ready\ndata: 0\n\n".utf8), headers: ["Content-Type": "text/event-stream"], status: 200, holdOpen: true)
+        let api = try RelayAPI(origin: URL(string: "https://relay.example.com")!, configuration: configuration)
+        let session = try RelaySession(origin: URL(string: "https://relay.example.com")!, ackToken: "ack", pairId: messageID.uuidString.lowercased(), messageKey: key, replyKey: key)
+        let recorder = StreamRecorder()
+        let task = Task {
+            try await api.streamEvents(session: session, afterSeq: 0) { await recorder.append($0) }
+        }
+        for _ in 0..<100 {
+            if await !recorder.events.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        task.cancel()
+        await #expect(throws: (any Error).self) { try await task.value }
+        #expect(await recorder.events == [.ready(0)])
+    }
+
     private func contactsVector() throws -> ContactsVector {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let data = try Data(contentsOf: root.appendingPathComponent("packages/crypto-test-vectors/contacts-v1.json"))
@@ -151,6 +223,11 @@ struct RelayCoreTests {
 }
 
 private struct ContactsResponse: Encodable { let snapshots: [RelayContactSnapshot] }
+
+private actor StreamRecorder {
+    var events: [RelayStreamEvent] = []
+    func append(_ event: RelayStreamEvent) { events.append(event) }
+}
 
 private struct ContactsVector: Decodable {
     let version: Int
@@ -179,6 +256,8 @@ private final class ReplyURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) private static var body: Data?
     nonisolated(unsafe) private static var responseBody = Data("{\"replyId\":\"019d2f1a-7b4c-7d10-8c21-1c77be6a91b0\",\"status\":\"QUEUED\"}".utf8)
     nonisolated(unsafe) private static var responseHeaders = ["Content-Type": "application/json"]
+    nonisolated(unsafe) private static var responseStatus = 201
+    nonisolated(unsafe) private static var holdOpen = false
 
     static func reset() {
         lock.lock()
@@ -186,13 +265,17 @@ private final class ReplyURLProtocol: URLProtocol, @unchecked Sendable {
         body = nil
         responseBody = Data("{\"replyId\":\"019d2f1a-7b4c-7d10-8c21-1c77be6a91b0\",\"status\":\"QUEUED\"}".utf8)
         responseHeaders = ["Content-Type": "application/json"]
+        responseStatus = 201
+        holdOpen = false
         lock.unlock()
     }
 
-    static func configure(body: Data, headers: [String: String]) {
+    static func configure(body: Data, headers: [String: String], status: Int = 201, holdOpen: Bool = false) {
         lock.lock()
         responseBody = body
         responseHeaders = headers
+        responseStatus = status
+        Self.holdOpen = holdOpen
         lock.unlock()
     }
 
@@ -231,11 +314,13 @@ private final class ReplyURLProtocol: URLProtocol, @unchecked Sendable {
         }
         let responseBody = Self.responseBody
         let responseHeaders = Self.responseHeaders
+        let responseStatus = Self.responseStatus
+        let holdOpen = Self.holdOpen
         Self.lock.unlock()
-        let response = HTTPURLResponse(url: request.url!, statusCode: 201, httpVersion: "HTTP/1.1", headerFields: responseHeaders)!
+        let response = HTTPURLResponse(url: request.url!, statusCode: responseStatus, httpVersion: "HTTP/1.1", headerFields: responseHeaders)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: responseBody)
-        client?.urlProtocolDidFinishLoading(self)
+        if !holdOpen { client?.urlProtocolDidFinishLoading(self) }
     }
 
     override func stopLoading() {}
