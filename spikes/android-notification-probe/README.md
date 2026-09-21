@@ -29,7 +29,7 @@ cp relay.production.properties.example relay.production.properties
 Android 16 / API 36+ 的 Xiaomi debug 构建包含显式开启的 Accessibility 实验回退. 它只用于研究, release 构建不会开启.
 
 - `RemoteInput` 可用时优先使用. 回退只在它不可用时尝试.
-- 当前微信版本无法提供可校验的会话标题, 收件人标题校验暂时禁用. 因此存在向错误会话发送消息的风险.
+- 通过联系人快照发起会话时, 搜索结果、进入会话后的标题、输入框和发送按钮都必须唯一且匹配. 任一校验失败会停止操作.
 - 锁屏时只尝试一次本地加密 PIN. 任何失败, 超时, 歧义或取消都会停止 UI 操作并重新锁屏.
 - 不使用 Root, Hook, Xposed, Frida, 微信数据库或坐标手势.
 

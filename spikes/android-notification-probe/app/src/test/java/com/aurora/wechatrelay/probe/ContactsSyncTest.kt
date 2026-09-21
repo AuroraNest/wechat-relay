@@ -66,4 +66,20 @@ class ContactsSyncTest {
         assertEquals("AWR1|A2I_CONTACTS|1|019d2f1a-7b4c-7d10-8c21-1c77be6a91b0|device-id-0000001|1788148800000|999", envelope.aad)
         assertEquals("qRjQUlapNix5Eyy6oHuAivJzt-el7gKDCdRWMK8_1eHaGwChM8C6UTS8TO90cj2mg0eJrKAeaBmvDw9xKZJI_6V7sPJGZLLukD9mRDX-i9uukg8", envelope.ct)
     }
+
+    @Test
+    fun freshContactsSnapshotsUseV2AadWithoutChangingPlaintextSchema() {
+        val id = "019d2f1a-7b4c-7d10-8c21-1c77be6a91b0"
+        val envelope = SyncProtocol.encryptContactsV2(
+            key = ByteArray(32) { 1 },
+            id = id,
+            deviceId = "device-id-0000001",
+            capturedAt = 1788148800000,
+            wechatUserId = 999,
+            contacts = listOf("测试好友 A"),
+            iv = ByteArray(12) { it.toByte() },
+        )
+
+        assertEquals("AWR1|A2I_CONTACTS|2|$id|device-id-0000001|1788148800000|999", envelope.aad)
+    }
 }

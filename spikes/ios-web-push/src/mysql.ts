@@ -24,7 +24,7 @@ export const pool: Pool = mysql.createPool({
   bigNumberStrings: true,
 });
 
-const requiredSchemaVersion = 6;
+const requiredSchemaVersion = 7;
 const requiredColumns: Record<string, readonly string[]> = {
   schema_migrations: ["version", "name", "applied_at"],
   pairings: ["pair_id", "secret_hash", "expires_at", "consumed_at"],
@@ -32,7 +32,7 @@ const requiredColumns: Record<string, readonly string[]> = {
   request_nonces: ["device_id", "nonce", "seen_at"],
   messages: ["id", "device_id", "wechat_user_id", "reply_capable", "conversation_send_capable", "seq", "created_at", "body_hash", "envelope_json", "assets_json", "received_at"],
   push_outbox: ["message_id", "payload", "queued_at", "attempts", "sent_at"],
-  replies: ["id", "pair_id", "target_message_id", "device_id", "wechat_user_id", "created_at", "envelope_json", "status", "status_at", "queued_at"],
+  replies: ["id", "pair_id", "target_message_id", "contact_snapshot_id", "device_id", "wechat_user_id", "created_at", "envelope_json", "status", "status_at", "queued_at"],
   browser_sessions: ["session_id", "ack_token_hash", "subscription_envelope", "pair_id", "created_at", "updated_at", "invalidated_at"],
   relay_policies: ["pair_id", "enabled", "schedule_enabled", "weekdays_mask", "start_minutes", "end_minutes", "updated_at"],
   contacts_snapshots: ["id", "device_id", "wechat_user_id", "captured_at", "body_hash", "envelope_json", "received_at"],
@@ -70,6 +70,11 @@ export async function verifySchema(): Promise<void> {
     const conversationSendCapable = rows.find((row) => row.table_name === "messages" && row.column_name === "conversation_send_capable");
     if (!conversationSendCapable || conversationSendCapable.is_nullable !== "NO" || Number(conversationSendCapable.column_default) !== 0)
       throw new Error("SCHEMA_CONVERSATION_SEND_CAPABILITY_INVALID");
+    for (const column of ["target_message_id", "contact_snapshot_id"]) {
+      const target = rows.find((row) => row.table_name === "replies" && row.column_name === column);
+      if (!target || target.is_nullable !== "YES")
+        throw new Error("SCHEMA_REPLY_TARGET_INVALID");
+    }
   } finally {
     connection.release();
   }

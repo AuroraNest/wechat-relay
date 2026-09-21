@@ -7,7 +7,7 @@ struct InboxView: View {
     @EnvironmentObject private var model: RelayAppModel
     @State private var search = ""
     private var conversations: [Conversation] {
-        model.conversations.filter { search.isEmpty || $0.latest.preview.sender.localizedCaseInsensitiveContains(search) || $0.latest.preview.body.localizedCaseInsensitiveContains(search) }
+        model.conversations.filter { search.isEmpty || $0.friend.name.localizedCaseInsensitiveContains(search) || $0.body.localizedCaseInsensitiveContains(search) }
     }
     var body: some View {
         List {
@@ -24,15 +24,15 @@ struct InboxView: View {
                 ForEach(conversations) { conversation in
                     NavigationLink(value: conversation.id) {
                         HStack(spacing: 14) {
-                            AvatarView(item: conversation.latest)
+                            FriendAvatarView(friend: conversation.friend)
                             VStack(alignment: .leading, spacing: 7) {
                                 HStack(alignment: .firstTextBaseline) {
-                                    Text(conversation.latest.preview.sender).font(.system(size: 17, weight: .semibold)).lineLimit(1)
+                                    Text(conversation.friend.name).font(.system(size: 17, weight: .semibold)).lineLimit(1)
                                     Spacer(minLength: 10)
-                                    Text(Date(timeIntervalSince1970: Double(conversation.latest.message.createdAt) / 1_000), style: .time).font(.caption2).foregroundStyle(.tertiary)
+                                    Text(Date(timeIntervalSince1970: Double(conversation.createdAt) / 1_000), style: .time).font(.caption2).foregroundStyle(.tertiary)
                                 }
                                 HStack {
-                                    Text(conversation.latest.preview.body).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                                    Text(conversation.body).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                                     Spacer(minLength: 5)
                                     if conversation.unread > 0 { Text(conversation.unread > 99 ? "99+" : "\(conversation.unread)").font(.caption2.weight(.semibold)).foregroundStyle(.white).padding(.horizontal, 5).padding(.vertical, 2).background(Color.relayGreen, in: Capsule()) }
                                 }
@@ -121,7 +121,7 @@ struct FriendsView: View {
             ForEach(sections, id: \.initial) { section in
                 Section(section.initial) {
                     ForEach(section.friends) { friend in
-                        NavigationLink { FriendDetailView(friend: friend) } label: {
+                        NavigationLink { ConversationView(conversationID: friend.id) } label: {
                             HStack(spacing: 13) {
                                 FriendAvatarView(friend: friend)
                                 VStack(alignment: .leading, spacing: 3) {
@@ -192,40 +192,6 @@ struct FriendAvatarView: View {
     }
 }
 
-struct FriendDetailView: View {
-    @EnvironmentObject private var model: RelayAppModel
-    let friend: RelayFriend
-
-    var body: some View {
-        if let conversationID = model.conversationID(for: friend) {
-            ConversationView(conversationID: conversationID)
-        } else {
-            detail
-        }
-    }
-
-    private var detail: some View {
-        List {
-            Section {
-                HStack(spacing: 16) {
-                    FriendAvatarView(friend: friend)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(friend.name).font(.title3.weight(.semibold))
-                        Text(friend.profileLabel).font(.subheadline).foregroundStyle(.secondary)
-                    }
-                }.padding(.vertical, 8)
-            }
-            Section {
-                Label("尚无已接收的聊天记录", systemImage: "clock")
-            } footer: {
-                Text("Relay 不能从这里发起新的微信会话. 收到该好友的新消息后, 可在消息页查看和回复.")
-            }
-        }
-        .navigationTitle("好友资料")
-        .navigationBarTitleDisplayMode(.inline)
-    }
-}
-
 struct ConversationView: View {
     @EnvironmentObject private var model: RelayAppModel
     let conversationID: String
@@ -235,6 +201,8 @@ struct ConversationView: View {
     @FocusState private var inputFocused: Bool
     private var messages: [InboxItem] { model.items.filter { $0.conversationID == conversationID } }
     private var target: InboxItem? { messages.last(where: { $0.message.replyCapable }) }
+    private var friend: RelayFriend? { model.friends.first { $0.id == conversationID } }
+    private var canSend: Bool { target != nil || friend.map { model.canSend(to: $0) } == true }
     private var replies: [OutgoingMessage] { model.outgoing.filter { $0.conversationID == conversationID } }
 
     var body: some View {
@@ -282,28 +250,35 @@ struct ConversationView: View {
             }
             .onChange(of: inputFocused) { _, focused in if focused { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } } }
         }
-        .navigationTitle(messages.last?.preview.sender ?? "会话").navigationBarTitleDisplayMode(.inline)
+        .navigationTitle(messages.last?.preview.sender ?? friend?.name ?? model.conversations.first(where: { $0.id == conversationID })?.friend.name ?? "会话").navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 8) {
                 if let error { Text(error).font(.caption).foregroundStyle(.red) }
                 if let problem = model.problem { Text(problem).font(.caption).foregroundStyle(.orange).lineLimit(3) }
                 HStack(alignment: .bottom, spacing: 10) {
-                    TextField(target == nil ? "当前消息无法回复" : "输入回复", text: $draft, axis: .vertical)
+                    TextField(canSend ? "输入回复" : "暂时无法发送", text: $draft, axis: .vertical)
                         .lineLimit(1...5).focused($inputFocused).padding(.horizontal, 15).padding(.vertical, 11)
                         .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 22))
-                        .disabled(target == nil)
+                        .disabled(!canSend)
                     Button {
-                        guard let target else { return }
+                        guard canSend else { return }
                         sending = true; error = nil
                         Task {
-                            do { try await model.send(draft, to: target); draft = "" }
+                            do {
+                                if let target { try await model.send(draft, to: target) }
+                                else if let friend { try await model.send(draft, to: friend) }
+                                draft = ""
+                            }
                             catch { self.error = RelayAppModel.describe(error) }
                             sending = false
                         }
                     } label: { Image(systemName: "arrow.up").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44).foregroundStyle(.white).background(Color.relayGreen, in: Circle()) }
-                        .disabled(target == nil || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.count > 1_000 || sending)
-                        .opacity(target == nil || draft.isEmpty ? 0.4 : 1).accessibilityLabel("发送回复")
+                        .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.count > 1_000 || sending)
+                        .opacity(!canSend || draft.isEmpty ? 0.4 : 1).accessibilityLabel("发送回复")
+                }
+                if !canSend && friend != nil {
+                    Text("请更新小米 Relay 并重新同步一次好友, 即可主动发送消息.").font(.caption).foregroundStyle(.secondary)
                 }
                 if draft.count > 1_000 { Text("回复最多 1000 字").font(.caption).foregroundStyle(.red) }
                 Text("已发往微信表示 Android 已执行发送, 不代表对方已读.").font(.caption2).foregroundStyle(.secondary)

@@ -24,7 +24,7 @@ npm run dev
 
 `.env.development` 是 `npm run dev` 唯一读取的环境文件. 启动前会校验 `NODE_ENV=development`, `MYSQL_HOST=127.0.0.1`, `MYSQL_PORT=23306`, `MYSQL_DATABASE=wechat_relay_dev`, `DATA_DIR=data/development`, 并要求 `REDIS_URL` 为空. `npm run dev:db` 使用 `compose.development.yml` 创建独立 MySQL 8.4 volume. 初始迁移只会在新 volume 创建时导入. 已有 volume 应按版本应用增量迁移, 不要为重新初始化迁移删除数据.
 
-联系人快照要求 schema v6. 对已有数据库先应用 `scripts/migrations/006-contacts-snapshots.sql`; 表只保存每个 Android device 和 profile 的最新 AES-GCM 密文信封及校验元数据.
+联系人快照和联系人发信要求 schema v7. 对已有数据库先顺序应用 `scripts/migrations/006-contacts-snapshots.sql` 与 `scripts/migrations/007-contact-send-replies.sql`; 表只保存每个 Android device 和 profile 的最新 AES-GCM 密文信封及校验元数据.
 
 开发 Origin 只能用于本机检查. 若要在 iPhone 上安装 PWA 或接收 Web Push, 请配置自己的 HTTPS Origin, 并将它写入 development 配置的 `PUBLIC_ORIGIN`.
 
@@ -52,6 +52,41 @@ npm run start:production
 
 `deploy/phase0a` 提供通用 Docker 和 Nginx 示例, 不会直接替换任何已有环境. 忽略规则不能代替对 `.env.production`, Push Subscription, 配对码和密钥的访问控制.
 
+### schema v7 升级与回退
+
+升级前先备份数据库, 再在停止接收新 v4 reply 的窗口执行 migration 007 并确认 `schema_migrations` 的最大版本为 7. 例如可由部署环境的受控 MySQL 凭据执行:
+
+```bash
+mysql --defaults-extra-file=/path/to/mysql.cnf "$MYSQL_DATABASE" < scripts/migrations/007-contact-send-replies.sql
+```
+
+新镜像严格要求 schema v7; 旧镜像严格要求 schema v6, 因而不能在 schema v7 上直接作为回滚镜像启动.
+
+如需回退到旧镜像, 先确认没有任何 v4 reply. 以下 SQL 每一步都以 `@awr_v4_rows = 0` 为前提; 非零时只执行 `DO 0`, 不会删除 v4 数据或改变 schema. 它只适用于 v4 未产生任何行的回退窗口, 不应在有 v4 数据时执行.
+
+```sql
+SELECT COUNT(*) INTO @awr_v4_rows FROM replies WHERE contact_snapshot_id IS NOT NULL;
+SELECT @awr_v4_rows AS v4_reply_rows;
+
+SET @awr_rollback_drop_check = IF(@awr_v4_rows = 0, 'ALTER TABLE replies DROP CHECK replies_exactly_one_target', 'DO 0');
+PREPARE awr_rollback_stmt FROM @awr_rollback_drop_check;
+EXECUTE awr_rollback_stmt;
+DEALLOCATE PREPARE awr_rollback_stmt;
+
+SET @awr_rollback_drop_contact = IF(@awr_v4_rows = 0, 'ALTER TABLE replies DROP COLUMN contact_snapshot_id', 'DO 0');
+PREPARE awr_rollback_stmt FROM @awr_rollback_drop_contact;
+EXECUTE awr_rollback_stmt;
+DEALLOCATE PREPARE awr_rollback_stmt;
+
+SET @awr_rollback_target = IF(@awr_v4_rows = 0, 'ALTER TABLE replies MODIFY target_message_id VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL', 'DO 0');
+PREPARE awr_rollback_stmt FROM @awr_rollback_target;
+EXECUTE awr_rollback_stmt;
+DEALLOCATE PREPARE awr_rollback_stmt;
+
+DELETE FROM schema_migrations WHERE version = 7 AND @awr_v4_rows = 0;
+SELECT MAX(version) AS schema_version FROM schema_migrations;
+```
+
 ## 原生 iPhone 与 APNs
 
 APNs 是可选能力. 不配置时服务仍可为原生 App 创建 session, 完成配对并提供消息和回复 API. 未注册 device token 或 APNs 未配置时, Push outbox 保持待发送, 不会伪造成功或发起外部重试. 配置 APNs 时, `APNS_TEAM_ID`, `APNS_KEY_ID` 和 `APNS_PRIVATE_KEY_PATH` 必须同时存在. 私钥路径指向 Git 外的 Apple `.p8` 文件. `APNS_TOPIC` 默认是 `com.auroramaple.wechatrelay`, 只由服务端配置, 客户端不能提交 topic, host 或私钥.
@@ -63,8 +98,10 @@ APNs 是可选能力. 不配置时服务仍可为原生 App 创建 session, 完�
 - `PUT /api/v1/ios/push`: 使用 `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id`, 提交 `{deviceToken,environment,previewEnabled}`. `deviceToken` 可以是 `null`.
 - `GET /api/v1/ios/status`: 使用 `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id`, 返回配对, Android 最近签名请求时间及 Push 状态.
 - `GET /api/v1/ios/events?afterSeq=N`: 仅 native session 使用 `Origin`, `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id` 建立前台 SSE. 服务端先发送 `ready` 和当前最新 sequence, 后续只发送 `message` sequence 或 `reply` UUID 提示. 客户端收到提示后仍通过既有受认证 HTTP API 同步密文和回复状态. 服务端约每 22 秒发送 heartbeat 并重新校验 session.
-- `POST /api/v1/android/contacts`: 使用既有 Android 签名请求头, 提交 v1 contacts envelope. 服务端验证 `AWR1|A2I_CONTACTS|1|{id}|{deviceId}|{capturedAt}|{wechatUserId}` AAD, 但不读取联系人明文.
+- `POST /api/v1/android/contacts`: 使用既有 Android 签名请求头, 提交 v1 或 v2 contacts envelope. 服务端验证 `AWR1|A2I_CONTACTS|{v}|{id}|{deviceId}|{capturedAt}|{wechatUserId}` AAD, 但不读取联系人明文. v1 继续可读取; v2 表示 Android 已保留可用于联系人发信的本地验证快照.
 - `GET /api/v1/ios/contacts`: 仅 native session 使用 `X-AWR-Ack-Token` 和 `X-AWR-Pair-Id` 读取当前 pair 的至多两个 profile snapshot. 重配对后旧 device 的快照不可读取.
+- `POST /api/v1/replies`: 原有 v1-v3 保持按 message target 工作. v4 必须带 `targetContactSnapshotId`, 不得带 `targetMessageId`, AAD 为 `AWR1|I2A|4|CONTACT_SEND|{pairId}|{replyId}|{deviceId}|{snapshotId}|{createdAt}|{wechatUserId}`. 服务端仅接受当前 pair、device、profile 的 v2 snapshot, 不读取 reply plaintext; plaintext 保持在 reply envelope 内的 `{body,conversationTitle}` schema.
+- `GET /api/v1/android/replies`: legacy poll 明确不返回 v4, 避免旧 Android 降级消费联系人发信. `GET /api/v1/android/replies/v4` 使用同样的 Android 签名请求格式并以该精确 pathname 参与签名, 可领取所有 reply 版本. `POST /api/v1/android/replies/{id}/ack` 接受 terminal `CONTACT_SNAPSHOT_STALE`.
 
 当 `previewEnabled=false` 时, APNs payload 不含 `previewEnvelope`. 通知扩展应从受认证的消息 API 获取完整密文记录. APNs 返回无效 token 时, 服务端只清除该原生 destination 的 token, 不撤销 session 或配对.
 

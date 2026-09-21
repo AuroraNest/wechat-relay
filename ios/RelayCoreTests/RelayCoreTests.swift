@@ -65,6 +65,31 @@ struct RelayCoreTests {
         #expect(throws: RelayError.invalidResponse) { try RelayCrypto.decryptContacts(duplicateSnapshot, messageKey: key) }
     }
 
+    @Test func decryptsV2ContactsEnvelopeWithVersionBoundAAD() throws {
+        let snapshotID = UUID(uuidString: "019d2f1a-7b4c-7d10-8c21-1c77be6a91b1")!
+        let payload = try RelayContactsPayload(v: 1, contacts: [RelayContact(name: "测试好友 A")])
+        let plaintext = try JSONEncoder().encode(payload)
+        let aad = "AWR1|A2I_CONTACTS|2|\(snapshotID.uuidString.lowercased())|\(deviceID)|1788148800001|999"
+        let envelope = try RelayCrypto.encrypt(plaintext, key: key, kid: "phase1-contacts", aad: aad)
+        let snapshot = try RelayContactSnapshot(v: 2, id: snapshotID, deviceId: deviceID, wechatUserId: 999, capturedAt: 1_788_148_800_001, contactsEnvelope: envelope)
+        #expect(try RelayCrypto.decryptContacts(snapshot, messageKey: key) == payload)
+    }
+
+    @Test func acceptsContactsOuterV2() async throws {
+        let snapshotID = UUID(uuidString: "019d2f1a-7b4c-7d10-8c21-1c77be6a91b1")!
+        let plaintext = Data("{\"v\":1,\"contacts\":[]}".utf8)
+        let aad = "AWR1|A2I_CONTACTS|2|\(snapshotID.uuidString.lowercased())|\(deviceID)|1788148800001|999"
+        let envelope = try RelayCrypto.encrypt(plaintext, key: key, kid: "phase1-contacts", aad: aad)
+        let snapshot = try RelayContactSnapshot(v: 2, id: snapshotID, deviceId: deviceID, wechatUserId: 999, capturedAt: 1_788_148_800_001, contactsEnvelope: envelope)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ReplyURLProtocol.self]
+        ReplyURLProtocol.reset()
+        ReplyURLProtocol.configure(body: try JSONEncoder().encode(ContactsResponse(snapshots: [snapshot])), headers: ["Content-Type": "application/json"])
+        let api = try RelayAPI(origin: URL(string: "https://relay.example.com")!, configuration: configuration)
+        let session = try RelaySession(origin: URL(string: "https://relay.example.com")!, ackToken: "ack", pairId: messageID.uuidString.lowercased(), messageKey: key, replyKey: key)
+        #expect(try await api.contacts(session: session) == [snapshot])
+    }
+
     @Test func requestsContactsWithAckSessionHeaders() async throws {
         let vector = try contactsVector()
         let configuration = URLSessionConfiguration.ephemeral
@@ -95,6 +120,29 @@ struct RelayCoreTests {
         #expect(throws: (any Error).self) { try RelayCrypto.makeReply(session: session, target: message, body: String(repeating: "x", count: 1_001), now: time) }
     }
 
+    @Test func makesAndDecryptsContactSendV4Fixture() throws {
+        let vector = try contactSendVector()
+        #expect(vector.version == 4)
+        let request = vector.request
+        #expect(request.v == 4)
+        #expect(request.targetMessageId == nil)
+        let snapshotID = try #require(request.targetContactSnapshotId)
+        let fixturePlaintext = try RelayCrypto.decrypt(request.replyEnvelope, key: vector.key, expectedKid: "phase1-reply", maximumCiphertextBytes: 4_096)
+        #expect(String(decoding: fixturePlaintext, as: UTF8.self) == vector.plaintext)
+
+        let session = try RelaySession(origin: URL(string: "https://relay.example.com")!, ackToken: "ack", pairId: vector.pairId, messageKey: vector.key, replyKey: vector.key)
+        let generated = try RelayCrypto.makeContactSend(session: session, snapshotId: snapshotID, deviceId: request.deviceId, wechatUserId: request.wechatUserId, conversationTitle: "测试好友 A", body: "Hello from contacts", id: request.id, createdAt: request.createdAt)
+        #expect(generated.v == 4)
+        #expect(generated.targetMessageId == nil)
+        #expect(generated.targetContactSnapshotId == snapshotID)
+        #expect(generated.replyEnvelope.aad == request.replyEnvelope.aad)
+        let plaintext = try RelayCrypto.decrypt(generated.replyEnvelope, key: vector.key, expectedKid: "phase1-reply", maximumCiphertextBytes: 4_096)
+        #expect(String(decoding: plaintext, as: UTF8.self) == vector.plaintext)
+
+        let generatedID = try RelayCrypto.makeContactSend(session: session, snapshotId: snapshotID, deviceId: request.deviceId, wechatUserId: request.wechatUserId, conversationTitle: "测试好友 A", body: "Hello from contacts")
+        #expect(generatedID.id.uuidString.lowercased().split(separator: "-")[2].first == "7")
+    }
+
     @Test func serializesReplyLowercaseAndAcceptsResponsePath() async throws {
         let id = UUID(uuidString: "019d2f1a-7b4c-7d10-8c21-1c77be6a91b0")!
         let target = UUID(uuidString: "019d2f1a-7b4c-7d10-8c21-1c77be6a91b1")!
@@ -113,6 +161,27 @@ struct RelayCoreTests {
         let json = try JSONSerialization.jsonObject(with: body) as! [String: Any]
         #expect(json["id"] as? String == id.uuidString.lowercased())
         #expect(json["targetMessageId"] as? String == target.uuidString.lowercased())
+    }
+
+    @Test func serializesAndValidatesContactSendTarget() async throws {
+        let vector = try contactSendVector()
+        let request = vector.request
+        let snapshotID = try #require(request.targetContactSnapshotId)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ReplyURLProtocol.self]
+        ReplyURLProtocol.reset()
+        let api = try RelayAPI(origin: URL(string: "https://relay.example.com")!, configuration: configuration)
+        let session = try RelaySession(origin: URL(string: "https://relay.example.com")!, ackToken: "ack", pairId: vector.pairId, messageKey: vector.key, replyKey: vector.key)
+        _ = try await api.submitReply(session: session, request: request)
+        let body = try #require(ReplyURLProtocol.capturedBody())
+        let json = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        #expect(json["targetMessageId"] == nil)
+        #expect(json["targetContactSnapshotId"] as? String == snapshotID.uuidString.lowercased())
+
+        let invalid = RelayReplyRequest(v: 4, id: request.id, targetMessageId: messageID, targetContactSnapshotId: snapshotID, deviceId: request.deviceId, wechatUserId: request.wechatUserId, createdAt: request.createdAt, replyEnvelope: request.replyEnvelope)
+        await #expect(throws: RelayError.invalidValue("reply target")) {
+            _ = try await api.submitReply(session: session, request: invalid)
+        }
     }
 
     @Test func rejectsOversizedResponseBeforeBodyCollection() async throws {
@@ -220,6 +289,12 @@ struct RelayCoreTests {
         let data = try Data(contentsOf: root.appendingPathComponent("packages/crypto-test-vectors/contacts-v1.json"))
         return try JSONDecoder().decode(ContactsVector.self, from: data)
     }
+
+    private func contactSendVector() throws -> ContactSendVector {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let data = try Data(contentsOf: root.appendingPathComponent("packages/crypto-test-vectors/contact-send-v4.json"))
+        return try JSONDecoder().decode(ContactSendVector.self, from: data)
+    }
 }
 
 private struct ContactsResponse: Encodable { let snapshots: [RelayContactSnapshot] }
@@ -247,6 +322,29 @@ private struct ContactsVector: Decodable {
         self.key = key
         plaintext = try values.decode(String.self, forKey: .plaintext)
         snapshot = try values.decode(RelayContactSnapshot.self, forKey: .snapshot)
+    }
+}
+
+private struct ContactSendVector: Decodable {
+    let version: Int
+    let key: Data
+    let pairId: String
+    let plaintext: String
+    let request: RelayReplyRequest
+
+    enum CodingKeys: String, CodingKey { case version, key, pairId, plaintext, request }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decode(Int.self, forKey: .version)
+        let encodedKey = try values.decode(String.self, forKey: .key)
+        var paddedKey = encodedKey.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        paddedKey.append(String(repeating: "=", count: (4 - paddedKey.count % 4) % 4))
+        guard let key = Data(base64Encoded: paddedKey) else { throw RelayError.invalidResponse }
+        self.key = key
+        pairId = try values.decode(String.self, forKey: .pairId)
+        plaintext = try values.decode(String.self, forKey: .plaintext)
+        request = try values.decode(RelayReplyRequest.self, forKey: .request)
     }
 }
 

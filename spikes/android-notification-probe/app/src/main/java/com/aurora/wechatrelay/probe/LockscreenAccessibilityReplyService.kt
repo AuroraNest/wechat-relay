@@ -776,11 +776,11 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                 val key = store.messageEncryptionContext(active.deviceId).a2iKey
                 val capturedAt = System.currentTimeMillis()
                 val id = SyncProtocol.uuidV7(capturedAt)
-                val envelope = try { SyncProtocol.encryptContacts(key, id, active.deviceId, capturedAt, active.profile.wechatUserId, names) }
+                val envelope = try { SyncProtocol.encryptContactsV2(key, id, active.deviceId, capturedAt, active.profile.wechatUserId, names) }
                 finally { key.fill(0) }
                 synchronized(this@LockscreenAccessibilityReplyService) {
                     if (active.cancelled || contactScan !== active || !store.isCurrentDevice(active.deviceId)) return@execute
-                    ContactsPendingStore.get(this).save(ContactsPending(id, active.deviceId, active.profile.wechatUserId, capturedAt, envelope))
+                    ContactsPendingStore.get(this).save(ContactsPending(id, active.deviceId, active.profile.wechatUserId, active.profile.userSerial, capturedAt, envelope, 2))
                     ProbeRuntime.contactsPendingId = id
                 }
                 handler.post {
@@ -864,7 +864,6 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
             processConversationSearch(active, roots)
             return
         }
-        // ponytail: User-authorized experiment skips title verification; restore it when accessible identity is available.
         if (roots.isEmpty()) {
             if (active.phase == Phase.OpeningWechat) return
             if (active.isImageCapture && active.phase == Phase.OpeningImageViewer) {
@@ -886,6 +885,13 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         }
         if (active.isImageCapture) {
             processImageCapture(active)
+            return
+        }
+        if (active.contentIntent == null && active.phase in setOf(Phase.OpeningWechat, Phase.ReadyToClick) &&
+            !visibleTitleMatches(roots, active.expectedTitleHash)
+        ) {
+            if (active.phase == Phase.OpeningWechat) return
+            finishSession("WECHAT_ACTION_CHANGED", "TITLE_RECHECK_FAILED")
             return
         }
         val replyText = requireNotNull(active.replyText)

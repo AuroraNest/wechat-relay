@@ -24,7 +24,8 @@ data class PairingCode(val pairId: String, val pairSecret: String, val expiresAt
 data class ReplyCommand(
     val v: Int,
     val id: String,
-    val targetMessageId: String,
+    val targetMessageId: String?,
+    val targetContactSnapshotId: String?,
     val deviceId: String,
     val createdAt: Long,
     val wechatUserId: Int,
@@ -156,7 +157,7 @@ object SyncNetwork {
     fun pollReply(context: Context, expectedDeviceId: String): ReplyPollResult {
         val store = SyncStore.get(context)
         check(store.paired())
-        val connection = signedConnection(store.requestSigningContext(expectedDeviceId), "GET", RepliesPath, ByteArray(0), ReplyPollReadTimeoutMillis)
+        val connection = signedConnection(store.requestSigningContext(expectedDeviceId), "GET", RepliesV4Path, ByteArray(0), ReplyPollReadTimeoutMillis)
         try {
             val responseCode = connection.responseCode
             if (responseCode !in 200..299) throw IllegalStateException("HTTP_$responseCode")
@@ -165,12 +166,21 @@ object SyncNetwork {
             if (root.isNull("reply")) return ReplyPollResult(relayPolicy, null)
             val reply = root.getJSONObject("reply")
             val version = reply.getInt("v")
-            require(version == 1 || version == 2 || version == 3)
+            require(version in 1..4)
             val envelope = reply.getJSONObject("replyEnvelope")
+            val targetMessageId = if (version == 4) null else reply.getString("targetMessageId")
+            val targetContactSnapshotId = if (version == 4) {
+                require(!reply.has("targetMessageId"))
+                reply.getString("targetContactSnapshotId")
+            } else {
+                require(!reply.has("targetContactSnapshotId"))
+                null
+            }
             return ReplyPollResult(relayPolicy, ReplyCommand(
                 v = version,
                 id = reply.getString("id"),
-                targetMessageId = reply.getString("targetMessageId"),
+                targetMessageId = targetMessageId,
+                targetContactSnapshotId = targetContactSnapshotId,
                 deviceId = reply.getString("deviceId"),
                 createdAt = reply.getLong("createdAt"),
                 wechatUserId = reply.getInt("wechatUserId"),
@@ -183,7 +193,12 @@ object SyncNetwork {
                     ct = envelope.getString("ct"),
                 ),
             ).also {
-                require(it.id.isNotBlank() && it.targetMessageId.isNotBlank() && it.deviceId.isNotBlank() && it.createdAt > 0L && NotificationSnapshot.isAllowedWechatUserId(it.wechatUserId))
+                require(it.id.isNotBlank() && it.deviceId.isNotBlank() && it.createdAt > 0L && NotificationSnapshot.isAllowedWechatUserId(it.wechatUserId))
+                if (it.v == 4) {
+                    require(!it.pairId.isNullOrBlank() && !it.targetContactSnapshotId.isNullOrBlank())
+                } else {
+                    require(!it.targetMessageId.isNullOrBlank())
+                }
             })
         } finally {
             connection.disconnect()
@@ -252,11 +267,12 @@ object SyncNetwork {
     }
 
     private const val RepliesPath = "/api/v1/android/replies"
+    private const val RepliesV4Path = "/api/v1/android/replies/v4"
     private const val ReplyPollReadTimeoutMillis = 30_000
     private val pairingGate = PairingGate()
     private val ReplyStatuses = setOf(
         "SENT_TO_WECHAT", "NOTIFICATION_NOT_ACTIVE", "WECHAT_ACTION_CHANGED", "REMOTE_INPUT_UNSUPPORTED",
-        "PENDING_INTENT_CANCELED", "INVALID_REPLY", "FAILED",
+        "PENDING_INTENT_CANCELED", "INVALID_REPLY", "CONTACT_SNAPSHOT_STALE", "FAILED",
     )
 }
 

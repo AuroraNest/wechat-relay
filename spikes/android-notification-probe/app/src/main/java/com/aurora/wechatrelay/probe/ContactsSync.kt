@@ -19,9 +19,30 @@ data class ContactsPending(
     val id: String,
     val deviceId: String,
     val wechatUserId: Int,
+    val userSerial: Long?,
+    val capturedAt: Long,
+    val envelope: Envelope,
+    val v: Int,
+)
+
+data class ContactsCurrent(
+    val id: String,
+    val deviceId: String,
+    val wechatUserId: Int,
+    val userSerial: Long,
     val capturedAt: Long,
     val envelope: Envelope,
 )
+
+private object ContactsStorageLock
+private val ContactsUuidV7 = Regex("[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+
+internal object ContactsSendPolicy {
+    fun matches(current: ContactsCurrent, snapshotId: String, deviceId: String, wechatUserId: Int): Boolean =
+        current.id == snapshotId && current.deviceId == deviceId && current.wechatUserId == wechatUserId
+
+    fun hasExactMember(contacts: List<String>, title: String): Boolean = contacts.any { it == title }
+}
 
 internal object ContactsScanPolicy {
     fun hasCompleteProof(startedAtTop: Boolean, expectedCount: Int?, uniqueNameCount: Int): Boolean =
@@ -145,15 +166,18 @@ object ContactsProfileResolver {
 class ContactsPendingStore private constructor(context: Context) {
     private val appContext = context.applicationContext
 
-    fun save(value: ContactsPending) = synchronized(FileLock) {
-        require(value.id == value.id.lowercase() && UuidV7.matches(value.id))
+    fun save(value: ContactsPending) = synchronized(ContactsStorageLock) {
+        require(value.id == value.id.lowercase() && ContactsUuidV7.matches(value.id))
         require(NotificationSnapshot.isAllowedWechatUserId(value.wechatUserId))
+        require(value.v in 1..2 && (value.v == 1 || value.userSerial != null))
+        require(value.userSerial == null || value.wechatUserId != 0 || value.userSerial == 0L)
         val target = AtomicFile(fileFor(value.wechatUserId))
         val bytes = JSONObject()
-            .put("v", 1)
+            .put("v", value.v)
             .put("id", value.id)
             .put("deviceId", value.deviceId)
             .put("wechatUserId", value.wechatUserId)
+            .putOpt("userSerial", value.userSerial)
             .put("capturedAt", value.capturedAt)
             .put("contactsEnvelope", JSONObject(SyncProtocol.envelopeJson(value.envelope)))
             .toString().toByteArray(StandardCharsets.UTF_8)
@@ -167,7 +191,7 @@ class ContactsPendingStore private constructor(context: Context) {
         }
     }
 
-    fun read(wechatUserId: Int): ContactsPending? = synchronized(FileLock) {
+    fun read(wechatUserId: Int): ContactsPending? = synchronized(ContactsStorageLock) {
         val file = fileFor(wechatUserId)
         if (!file.exists()) return null
         val root = JSONObject(AtomicFile(file).openRead().bufferedReader(StandardCharsets.UTF_8).use { it.readText() })
@@ -176,32 +200,36 @@ class ContactsPendingStore private constructor(context: Context) {
             id = root.getString("id"),
             deviceId = root.getString("deviceId"),
             wechatUserId = root.getInt("wechatUserId"),
+            userSerial = if (root.has("userSerial")) root.getLong("userSerial") else null,
             capturedAt = root.getLong("capturedAt"),
             envelope = Envelope(envelope.getString("alg"), envelope.getString("kid"), envelope.getString("iv"), envelope.getString("aad"), envelope.getString("ct")),
+            v = root.optInt("v", 1),
         ).also { validate(it, wechatUserId) }
     }
 
-    fun clear(wechatUserId: Int) = synchronized(FileLock) { AtomicFile(fileFor(wechatUserId)).delete() }
-    fun clearAll() = synchronized(FileLock) { AtomicFile(fileFor(0)).delete(); AtomicFile(fileFor(999)).delete() }
+    fun clear(wechatUserId: Int) = synchronized(ContactsStorageLock) { AtomicFile(fileFor(wechatUserId)).delete() }
+    fun clearAll() = synchronized(ContactsStorageLock) { AtomicFile(fileFor(0)).delete(); AtomicFile(fileFor(999)).delete() }
 
     /** The upload that observed an older file must never erase a newer completed scan. */
-    fun clearIfMatches(wechatUserId: Int, id: String, deviceId: String): Boolean = synchronized(FileLock) {
+    fun clearIfMatches(wechatUserId: Int, id: String, deviceId: String): Boolean = synchronized(ContactsStorageLock) {
         val current = read(wechatUserId) ?: return@synchronized false
         if (current.id != id || current.deviceId != deviceId) return@synchronized false
         AtomicFile(fileFor(wechatUserId)).delete()
         true
     }
 
-    fun isCurrent(wechatUserId: Int, id: String, deviceId: String): Boolean = synchronized(FileLock) {
+    fun isCurrent(wechatUserId: Int, id: String, deviceId: String): Boolean = synchronized(ContactsStorageLock) {
         val current = read(wechatUserId)
         current?.id == id && current.deviceId == deviceId
     }
 
     private fun validate(value: ContactsPending, requestedUserId: Int) {
         require(value.wechatUserId == requestedUserId && NotificationSnapshot.isAllowedWechatUserId(value.wechatUserId))
-        require(value.id == value.id.lowercase() && UuidV7.matches(value.id) && value.capturedAt > 0L)
+        require(value.v in 1..2 && value.id == value.id.lowercase() && ContactsUuidV7.matches(value.id) && value.capturedAt > 0L)
+        require(value.v == 1 || value.userSerial != null)
+        require(value.userSerial == null || value.wechatUserId != 0 || value.userSerial == 0L)
         require(value.envelope.alg == "A256GCM" && value.envelope.kid == "phase1-contacts")
-        require(value.envelope.aad == SyncProtocol.a2iContactsAad(value.id, value.deviceId, value.capturedAt, value.wechatUserId))
+        require(value.envelope.aad == if (value.v == 1) SyncProtocol.a2iContactsAad(value.id, value.deviceId, value.capturedAt, value.wechatUserId) else SyncProtocol.a2iContactsV2Aad(value.id, value.deviceId, value.capturedAt, value.wechatUserId))
         require(SyncProtocol.decode(value.envelope.iv).size == 12)
         require(SyncProtocol.decode(value.envelope.ct).size <= MaxCiphertextBytes)
     }
@@ -209,10 +237,75 @@ class ContactsPendingStore private constructor(context: Context) {
     private fun fileFor(wechatUserId: Int): File = File(appContext.filesDir, "contacts-pending-$wechatUserId.json")
 
     companion object {
-        private val UuidV7 = Regex("[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
-        private val FileLock = Any()
         const val MaxCiphertextBytes = ContactsPageAssembly.MaxPlaintextBytes + 16
         fun get(context: Context): ContactsPendingStore = ContactsPendingStore(context)
+    }
+}
+
+/** Keeps the latest server-accepted v2 encrypted scan. No contact plaintext is persisted here. */
+class ContactsCurrentStore private constructor(context: Context) {
+    private val appContext = context.applicationContext
+
+    fun save(value: ContactsCurrent) = synchronized(ContactsStorageLock) {
+        validate(value, value.wechatUserId)
+        val target = AtomicFile(fileFor(value.wechatUserId))
+        val bytes = JSONObject()
+            .put("v", 2)
+            .put("id", value.id)
+            .put("deviceId", value.deviceId)
+            .put("wechatUserId", value.wechatUserId)
+            .put("userSerial", value.userSerial)
+            .put("capturedAt", value.capturedAt)
+            .put("contactsEnvelope", JSONObject(SyncProtocol.envelopeJson(value.envelope)))
+            .toString().toByteArray(StandardCharsets.UTF_8)
+        val stream = target.startWrite()
+        try {
+            stream.write(bytes)
+            target.finishWrite(stream)
+        } catch (failure: Exception) {
+            target.failWrite(stream)
+            throw failure
+        }
+    }
+
+    fun read(wechatUserId: Int): ContactsCurrent? = synchronized(ContactsStorageLock) {
+        val file = fileFor(wechatUserId)
+        if (!file.exists()) return null
+        val root = JSONObject(AtomicFile(file).openRead().bufferedReader(StandardCharsets.UTF_8).use { it.readText() })
+        require(root.getInt("v") == 2)
+        val envelope = root.getJSONObject("contactsEnvelope")
+        return ContactsCurrent(
+            id = root.getString("id"),
+            deviceId = root.getString("deviceId"),
+            wechatUserId = root.getInt("wechatUserId"),
+            userSerial = root.getLong("userSerial"),
+            capturedAt = root.getLong("capturedAt"),
+            envelope = Envelope(envelope.getString("alg"), envelope.getString("kid"), envelope.getString("iv"), envelope.getString("aad"), envelope.getString("ct")),
+        ).also { validate(it, wechatUserId) }
+    }
+
+    fun promoteIfPendingCurrent(pendingStore: ContactsPendingStore, pending: ContactsPending): Boolean = synchronized(ContactsStorageLock) {
+        if (pending.v != 2 || pending.userSerial == null || !pendingStore.isCurrent(pending.wechatUserId, pending.id, pending.deviceId)) return false
+        save(ContactsCurrent(pending.id, pending.deviceId, pending.wechatUserId, pending.userSerial, pending.capturedAt, pending.envelope))
+        true
+    }
+
+    fun clearAll() = synchronized(ContactsStorageLock) { AtomicFile(fileFor(0)).delete(); AtomicFile(fileFor(999)).delete() }
+
+    private fun validate(value: ContactsCurrent, requestedUserId: Int) {
+        require(value.wechatUserId == requestedUserId && NotificationSnapshot.isAllowedWechatUserId(value.wechatUserId))
+        require(value.id == value.id.lowercase() && ContactsUuidV7.matches(value.id) && value.capturedAt > 0L && value.userSerial >= 0L)
+        require(value.wechatUserId != 0 || value.userSerial == 0L)
+        require(value.envelope.alg == "A256GCM" && value.envelope.kid == "phase1-contacts")
+        require(value.envelope.aad == SyncProtocol.a2iContactsV2Aad(value.id, value.deviceId, value.capturedAt, value.wechatUserId))
+        require(SyncProtocol.decode(value.envelope.iv).size == 12)
+        require(SyncProtocol.decode(value.envelope.ct).size <= ContactsPendingStore.MaxCiphertextBytes)
+    }
+
+    private fun fileFor(wechatUserId: Int): File = File(appContext.filesDir, "contacts-current-$wechatUserId.json")
+
+    companion object {
+        fun get(context: Context): ContactsCurrentStore = ContactsCurrentStore(context)
     }
 }
 
@@ -231,6 +324,7 @@ object ContactsSyncNetwork {
         if (!store.paired()) return Result.Complete
         val signing = store.requestSigningContext()
         val pendingStore = ContactsPendingStore.get(context)
+        val currentStore = ContactsCurrentStore.get(context)
         for (userId in listOf(0, 999)) {
             val pending = try { pendingStore.read(userId) } catch (_: Exception) { return Result.Retry } ?: continue
             if (pending.deviceId != signing.deviceId) {
@@ -238,7 +332,7 @@ object ContactsSyncNetwork {
                 continue
             }
             val body = JSONObject()
-                .put("v", 1).put("id", pending.id).put("deviceId", pending.deviceId)
+                .put("v", pending.v).put("id", pending.id).put("deviceId", pending.deviceId)
                 .put("wechatUserId", pending.wechatUserId).put("capturedAt", pending.capturedAt)
                 .put("contactsEnvelope", JSONObject(SyncProtocol.envelopeJson(pending.envelope)))
                 .toString().toByteArray(StandardCharsets.UTF_8)
@@ -249,6 +343,7 @@ object ContactsSyncNetwork {
                     when {
                         connection.responseCode in 200..299 -> {
                             if (!store.isCurrentDevice(pending.deviceId)) return Result.Complete
+                            currentStore.promoteIfPendingCurrent(pendingStore, pending)
                             if (pendingStore.clearIfMatches(userId, pending.id, pending.deviceId) && ProbeRuntime.contactsPendingId == pending.id) {
                                 ProbeRuntime.contactsPendingId = null
                                 ProbeRuntime.contactsScanStatus = "好友已同步"

@@ -80,7 +80,7 @@ test("Nginx separates control, data, and long-lived protocol traffic", async () 
     assert.match(config, /location @control_rate_limited \{[\s\S]*?add_header Retry-After 6 always/);
     assert.match(config, /location @data_rate_limited \{[\s\S]*?add_header Retry-After 1 always/);
     assert.match(config, /location = \/api\/v1\/android\/messages \{[\s\S]*?client_max_body_size 24m;[\s\S]*?limit_req zone=awr_data burst=20 nodelay;/);
-    for (const path of ["/api/v1/messages/stream", "/api/v1/ios/events", "/api/v1/android/replies"]) {
+    for (const path of ["/api/v1/messages/stream", "/api/v1/ios/events", "/api/v1/android/replies", "/api/v1/android/replies/v4"]) {
       const location = config.match(new RegExp(`location = ${path.replaceAll("/", "\\/")} \\{([\\s\\S]*?)\\n    \\}`))?.[1] ?? "";
       assert.match(location, /limit_req zone=awr_data burst=20 nodelay/);
       assert.match(location, /limit_conn awr_long_lived 8/);
@@ -144,6 +144,42 @@ test("conversation send v3 binds mode, pair, device, target, timestamp, and prof
   assert.match(server, /reply\.v === 3 && dbInteger\(target\.conversation_send_capable\) !== 1/);
   assert.match(server, /messages\.id = \? AND messages\.device_id = \? AND devices\.pair_id = \?/);
   assert.match(migration, /conversation_send_capable TINYINT\(1\) NOT NULL DEFAULT 0/);
+});
+
+test("contact send v4 keeps the contact target and plaintext inside the reply envelope", async () => {
+  const vectorUrl = new URL("../../../packages/crypto-test-vectors/contact-send-v4.json", import.meta.url);
+  const vector = JSON.parse(await readFile(vectorUrl, "utf8")) as {
+    version: number;
+    key: string;
+    plaintext: string;
+    request: { targetContactSnapshotId: string; targetMessageId?: unknown; replyEnvelope: { aad: string; iv: string; ct: string } };
+  };
+  const key = await crypto.subtle.importKey("raw", Buffer.from(vector.key, "base64url"), "AES-GCM", false, ["decrypt"]);
+  const plaintext = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: Buffer.from(vector.request.replyEnvelope.iv, "base64url"),
+      additionalData: Buffer.from(vector.request.replyEnvelope.aad, "utf8"),
+    },
+    key,
+    Buffer.from(vector.request.replyEnvelope.ct, "base64url"),
+  );
+  const server = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
+  const migration = await readFile(new URL("../scripts/migrations/007-contact-send-replies.sql", import.meta.url), "utf8");
+
+  assert.equal(vector.version, 4);
+  assert.equal(vector.request.targetMessageId, undefined);
+  assert.match(vector.request.replyEnvelope.aad, /^AWR1\|I2A\|4\|CONTACT_SEND\|/);
+  assert.deepEqual(JSON.parse(Buffer.from(plaintext).toString("utf8")), JSON.parse(vector.plaintext));
+  assert.match(vector.plaintext, /"body"/);
+  assert.match(vector.plaintext, /"conversationTitle"/);
+  assert.doesNotMatch(vector.plaintext, /contactName/);
+  assert.match(server, /targetContactSnapshotId/);
+  assert.match(server, /contact_snapshot_id IS NULL/);
+  assert.match(server, /\/api\/v1\/android\/replies\/v4/);
+  assert.match(migration, /MODIFY target_message_id .* NULL/);
+  assert.match(migration, /ADD COLUMN contact_snapshot_id/);
+  assert.match(migration, /replies_exactly_one_target/);
 });
 
 test("Accessibility gate schedules one guarded PIN selector chain", async () => {

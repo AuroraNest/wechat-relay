@@ -14,7 +14,9 @@ struct InboxItem: Identifiable {
 
 struct Conversation: Identifiable {
     let id: String
-    let latest: InboxItem
+    let friend: RelayFriend
+    let body: String
+    let createdAt: Int64
     let unread: Int
 }
 
@@ -36,6 +38,7 @@ struct OutgoingMessage: Codable, Identifiable {
 }
 
 private struct CachedContacts: Codable {
+    var version: Int? = nil
     let id: UUID
     let deviceId: String
     let wechatUserId: Int
@@ -136,10 +139,18 @@ final class RelayAppModel: ObservableObject {
     }
 
     var conversations: [Conversation] {
-        Dictionary(grouping: items, by: \.conversationID).compactMap { id, values in
-            guard let latest = values.max(by: { $0.message.seq < $1.message.seq }) else { return nil }
-            return Conversation(id: id, latest: latest, unread: values.filter { $0.message.seq > (snapshot.readThrough[id] ?? 0) }.count)
-        }.sorted { $0.latest.message.seq > $1.latest.message.seq }
+        let incoming = Dictionary(grouping: items, by: \.conversationID)
+        let sent = Dictionary(grouping: outgoing, by: \.conversationID)
+        return Set(incoming.keys).union(sent.keys).compactMap { id in
+            let values = incoming[id] ?? []
+            let latest = values.max(by: { $0.message.seq < $1.message.seq })
+            let reply = sent[id]?.max(by: { $0.request.createdAt < $1.request.createdAt })
+            guard let profile = latest?.message.wechatUserId ?? reply?.request.wechatUserId else { return nil }
+            let title = latest?.preview.sender ?? String(id.dropFirst("\(profile):".count))
+            let useReply = (reply?.request.createdAt ?? 0) >= (latest?.message.createdAt ?? 0)
+            let time = useReply ? reply!.request.createdAt : latest!.message.createdAt
+            return Conversation(id: id, friend: RelayFriend(name: title, wechatUserId: profile, capturedAt: time), body: useReply ? reply!.body : latest!.preview.body, createdAt: time, unread: values.filter { $0.message.seq > (snapshot.readThrough[id] ?? 0) }.count)
+        }.sorted { $0.createdAt > $1.createdAt }
     }
 
     var friendsCapturedAt: Date? {
@@ -384,7 +395,7 @@ final class RelayAppModel: ObservableObject {
                     continue
                 }
             }
-            cached[remote.wechatUserId] = CachedContacts(id: remote.id, deviceId: remote.deviceId, wechatUserId: remote.wechatUserId, capturedAt: remote.capturedAt, contacts: payload.contacts)
+            cached[remote.wechatUserId] = CachedContacts(version: remote.v, id: remote.id, deviceId: remote.deviceId, wechatUserId: remote.wechatUserId, capturedAt: remote.capturedAt, contacts: payload.contacts)
             changed = true
         }
         guard changed else { return }
@@ -409,8 +420,8 @@ final class RelayAppModel: ObservableObject {
         }
     }
 
-    func conversationID(for friend: RelayFriend) -> String? {
-        items.last(where: { $0.message.wechatUserId == friend.wechatUserId && $0.preview.sender == friend.name })?.conversationID
+    func canSend(to friend: RelayFriend) -> Bool {
+        snapshot.contacts.contains { $0.version == 2 && $0.deviceId == device?.deviceId && $0.wechatUserId == friend.wechatUserId && $0.contacts.contains(where: { $0.name == friend.name }) }
     }
 
     func avatarItem(for friend: RelayFriend) -> InboxItem? {
@@ -428,10 +439,24 @@ final class RelayAppModel: ObservableObject {
         let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
         let request = try RelayCrypto.makeReply(session: session, target: target.message, body: text)
         let pending = OutgoingMessage(request: request, conversationID: target.conversationID, body: text, status: .submitting)
+        try await enqueue(pending)
+    }
+
+    func send(_ body: String, to friend: RelayFriend) async throws {
+        guard let session, canSend(to: friend),
+              let contacts = snapshot.contacts.first(where: { $0.wechatUserId == friend.wechatUserId }) else {
+            throw RelayError.invalidValue("contact snapshot")
+        }
+        let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = try RelayCrypto.makeContactSend(session: session, snapshotId: contacts.id, deviceId: contacts.deviceId, wechatUserId: friend.wechatUserId, conversationTitle: friend.name, body: text)
+        try await enqueue(OutgoingMessage(request: request, conversationID: friend.id, body: text, status: .submitting))
+    }
+
+    private func enqueue(_ pending: OutgoingMessage) async throws {
         snapshot.outgoing.append(pending)
         do { try saveCache() } catch { snapshot.outgoing.removeAll { $0.id == pending.id }; throw error }
         outgoing = snapshot.outgoing
-        if isDemo { updateReply(request.id, status: .sentToWechat); return }
+        if isDemo { updateReply(pending.id, status: .sentToWechat); return }
         // Persist the immutable request before submitting; retries reuse its ID, time and ciphertext.
         await submit(pending)
     }
@@ -664,8 +689,8 @@ final class RelayAppModel: ObservableObject {
             }
             try merge([])
             snapshot.contacts = [
-                CachedContacts(id: try UUIDv7.make(now: Date()), deviceId: "demo_android_0001", wechatUserId: 0, capturedAt: Int64(Date().timeIntervalSince1970 * 1_000), contacts: [try RelayContact(name: "林一"), try RelayContact(name: "陈默"), try RelayContact(name: "文件传输助手"), try RelayContact(name: "王珊")]),
-                CachedContacts(id: try UUIDv7.make(now: Date()), deviceId: "demo_android_0001", wechatUserId: 999, capturedAt: Int64(Date().timeIntervalSince1970 * 1_000), contacts: [try RelayContact(name: "小周"), try RelayContact(name: "赵晨")])
+                CachedContacts(version: 2, id: try UUIDv7.make(now: Date()), deviceId: "demo_android_0001", wechatUserId: 0, capturedAt: Int64(Date().timeIntervalSince1970 * 1_000), contacts: [try RelayContact(name: "林一"), try RelayContact(name: "陈默"), try RelayContact(name: "文件传输助手"), try RelayContact(name: "王珊")]),
+                CachedContacts(version: 2, id: try UUIDv7.make(now: Date()), deviceId: "demo_android_0001", wechatUserId: 999, capturedAt: Int64(Date().timeIntervalSince1970 * 1_000), contacts: [try RelayContact(name: "小周"), try RelayContact(name: "赵晨")])
             ]
             refreshFriends()
             contactsAvailable = true
@@ -687,6 +712,7 @@ extension RelayReplyStatus {
         case .remoteInputUnsupported: return "此消息不支持通知回复"
         case .pendingIntentCanceled: return "微信回复入口已失效"
         case .invalidReply: return "回复内容未通过校验"
+        case .contactSnapshotStale: return "好友名单已失效, 请在小米重新同步好友后重发"
         case .failed: return "Android 发送失败"
         }
     }

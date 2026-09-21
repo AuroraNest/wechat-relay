@@ -501,6 +501,7 @@ class SyncStore private constructor(context: Context) {
         )
         if (replacedDeviceId != null) runCatching {
             ContactsPendingStore.get(appContext).clearAll()
+            ContactsCurrentStore.get(appContext).clearAll()
             ProbeRuntime.contactsPendingId = null
             database.runInTransaction {
                 queue.clear(replacedDeviceId)

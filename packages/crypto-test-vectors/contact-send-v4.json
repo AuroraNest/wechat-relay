@@ -1,0 +1,21 @@
+{
+  "version": 4,
+  "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "pairId": "11111111-2222-4333-8444-555555555555",
+  "plaintext": "{\"body\":\"Hello from contacts\",\"conversationTitle\":\"测试好友 A\"}",
+  "request": {
+    "v": 4,
+    "id": "019d2f1a-7b4c-7d10-8c21-1c77be6a91b1",
+    "targetContactSnapshotId": "019d2f1a-7b4c-7d10-8c21-1c77be6a91b0",
+    "deviceId": "device-id-0000001",
+    "wechatUserId": 999,
+    "createdAt": 1788148801000,
+    "replyEnvelope": {
+      "alg": "A256GCM",
+      "kid": "phase1-reply",
+      "iv": "MDEyMzQ1Njc4OTo7",
+      "aad": "AWR1|I2A|4|CONTACT_SEND|11111111-2222-4333-8444-555555555555|019d2f1a-7b4c-7d10-8c21-1c77be6a91b1|device-id-0000001|019d2f1a-7b4c-7d10-8c21-1c77be6a91b0|1788148801000|999",
+      "ct": "yBdTr40WaDkIe-uAfvYeDu5IInegUSpxRt0lP8qfXF0sDnoBXrP608dLfB0Tsr9IjHZ_r546LYg4pcTppcfa1BFEw-UaMYGjDH4fxwXErPq07z0"
+    }
+  }
+}

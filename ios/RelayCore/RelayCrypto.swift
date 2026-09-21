@@ -59,6 +59,22 @@ public enum RelayCrypto {
         return RelayReplyRequest(v: version, id: id, targetMessageId: target.messageId, deviceId: target.deviceId, wechatUserId: target.wechatUserId, createdAt: createdAt, replyEnvelope: envelope)
     }
 
+    public static func makeContactSend(session: RelaySession, snapshotId: UUID, deviceId: String, wechatUserId: Int, conversationTitle: String, body: String, id: UUID? = nil, createdAt: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)) throws -> RelayReplyRequest {
+        let characters = Array(body)
+        guard !characters.isEmpty, characters.count <= 1_000,
+              RelayValidation.isUUIDv7(snapshotId), RelayValidation.isDeviceId(deviceId),
+              RelayValidation.isWechatUserId(wechatUserId), RelayValidation.isContactName(conversationTitle),
+              createdAt > 0 else {
+            throw RelayError.invalidValue("contact send")
+        }
+        let replyId = try id ?? UUIDv7.make(now: Date(timeIntervalSince1970: Double(createdAt) / 1_000))
+        guard RelayValidation.isUUIDv7(replyId) else { throw RelayError.invalidValue("contact send") }
+        let aad = "AWR1|I2A|4|CONTACT_SEND|\(session.pairId)|\(replyId.uuidString.lowercased())|\(deviceId)|\(snapshotId.uuidString.lowercased())|\(createdAt)|\(wechatUserId)"
+        let plaintext = try JSONSerialization.data(withJSONObject: ["body": body, "conversationTitle": conversationTitle], options: [])
+        let envelope = try encrypt(plaintext, key: session.replyKey, kid: "phase1-reply", aad: aad)
+        return RelayReplyRequest(v: 4, id: replyId, targetContactSnapshotId: snapshotId, deviceId: deviceId, wechatUserId: wechatUserId, createdAt: createdAt, replyEnvelope: envelope)
+    }
+
     public static func makePairingCode(_ pairing: RelayPairing) throws -> String {
         guard RelayValidation.isUUID(pairing.pairId), !pairing.pairSecret.isEmpty, pairing.messageKey.count == 32, pairing.replyKey.count == 32 else {
             throw RelayError.invalidValue("pairing")
@@ -115,13 +131,13 @@ public enum RelayCrypto {
     }
 
     static func validateContactsEnvelope(_ snapshot: RelayContactSnapshot) throws {
-        guard snapshot.v == 1, RelayValidation.isUUIDv7(snapshot.id), RelayValidation.isDeviceId(snapshot.deviceId),
+        guard (snapshot.v == 1 || snapshot.v == 2), RelayValidation.isUUIDv7(snapshot.id), RelayValidation.isDeviceId(snapshot.deviceId),
               RelayValidation.isWechatUserId(snapshot.wechatUserId), snapshot.capturedAt > 0,
               snapshot.contactsEnvelope.alg == "A256GCM", snapshot.contactsEnvelope.kid == "phase1-contacts",
               let ciphertext = decodeBase64url(snapshot.contactsEnvelope.ct), ciphertext.count >= 17, ciphertext.count <= 1_024 * 1_024 + 16 else {
             throw RelayError.invalidEnvelope
         }
-        let expected = "AWR1|A2I_CONTACTS|1|\(snapshot.id.uuidString.lowercased())|\(snapshot.deviceId)|\(snapshot.capturedAt)|\(snapshot.wechatUserId)"
+        let expected = "AWR1|A2I_CONTACTS|\(snapshot.v)|\(snapshot.id.uuidString.lowercased())|\(snapshot.deviceId)|\(snapshot.capturedAt)|\(snapshot.wechatUserId)"
         guard snapshot.contactsEnvelope.aad == expected else { throw RelayError.invalidEnvelope }
     }
 

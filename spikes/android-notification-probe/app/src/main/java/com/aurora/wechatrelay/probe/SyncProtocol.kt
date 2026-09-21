@@ -83,6 +83,30 @@ object SyncProtocol {
         return Envelope("A256GCM", "phase1-contacts", encode(iv), aad, encode(ciphertext))
     }
 
+    fun encryptContactsV2(
+        key: ByteArray,
+        id: String,
+        deviceId: String,
+        capturedAt: Long,
+        wechatUserId: Int,
+        contacts: List<String>,
+        iv: ByteArray = ByteArray(12).also(random::nextBytes),
+    ): Envelope {
+        require(key.size == 32 && NotificationSnapshot.isAllowedWechatUserId(wechatUserId))
+        require(id == id.lowercase() && ContactsId.matches(id) && iv.size == 12)
+        require(contacts.distinct().size == contacts.size)
+        contacts.forEach { name -> require(name.isNotEmpty() && name == name.trim() && name.toByteArray(StandardCharsets.UTF_8).size <= ContactsPageAssembly.MaxNameBytes) }
+        val plaintext = ContactsPageAssembly.contactsJson(contacts).toByteArray(StandardCharsets.UTF_8)
+        require(plaintext.size <= ContactsPageAssembly.MaxPlaintextBytes)
+        val aad = a2iContactsV2Aad(id, deviceId, capturedAt, wechatUserId)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        cipher.updateAAD(aad.toByteArray(StandardCharsets.UTF_8))
+        val ciphertext = try { cipher.doFinal(plaintext) } finally { plaintext.fill(0) }
+        require(ciphertext.size <= ContactsPendingStore.MaxCiphertextBytes)
+        return Envelope("A256GCM", "phase1-contacts", encode(iv), aad, encode(ciphertext))
+    }
+
     fun a2iAad(id: String, deviceId: String, seq: Long, createdAt: Long, wechatUserId: Int? = null): String =
         if (wechatUserId == null) "AWR1|A2I|$id|$deviceId|$seq|$createdAt" else "AWR1|A2I|$id|$deviceId|$seq|$createdAt|$wechatUserId"
 
@@ -94,12 +118,22 @@ object SyncProtocol {
         return "AWR1|A2I_CONTACTS|1|$id|$deviceId|$capturedAt|$wechatUserId"
     }
 
+    fun a2iContactsV2Aad(id: String, deviceId: String, capturedAt: Long, wechatUserId: Int): String {
+        require(id == id.lowercase() && ContactsId.matches(id) && NotificationSnapshot.isAllowedWechatUserId(wechatUserId))
+        return "AWR1|A2I_CONTACTS|2|$id|$deviceId|$capturedAt|$wechatUserId"
+    }
+
     fun i2aAad(replyId: String, deviceId: String, targetMessageId: String, createdAt: Long, wechatUserId: Int? = null): String =
         if (wechatUserId == null) "AWR1|I2A|$replyId|$deviceId|$targetMessageId|$createdAt" else "AWR1|I2A|$replyId|$deviceId|$targetMessageId|$createdAt|$wechatUserId"
 
     fun i2aConversationSendAad(pairId: String, replyId: String, deviceId: String, targetMessageId: String, createdAt: Long, wechatUserId: Int): String {
         require(pairId.isNotBlank() && NotificationSnapshot.isAllowedWechatUserId(wechatUserId))
         return "AWR1|I2A|3|CONVERSATION_SEND|$pairId|$replyId|$deviceId|$targetMessageId|$createdAt|$wechatUserId"
+    }
+
+    fun i2aContactSendAad(pairId: String, replyId: String, deviceId: String, snapshotId: String, createdAt: Long, wechatUserId: Int): String {
+        require(pairId.isNotBlank() && snapshotId == snapshotId.lowercase() && ContactsId.matches(snapshotId) && NotificationSnapshot.isAllowedWechatUserId(wechatUserId))
+        return "AWR1|I2A|4|CONTACT_SEND|$pairId|$replyId|$deviceId|$snapshotId|$createdAt|$wechatUserId"
     }
 
     fun decryptI2aReply(key: ByteArray, replyId: String, deviceId: String, targetMessageId: String, createdAt: Long, envelope: Envelope, wechatUserId: Int? = null): String {
@@ -135,6 +169,60 @@ object SyncProtocol {
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
         cipher.updateAAD(expectedAad.toByteArray(StandardCharsets.UTF_8))
         return parseConversationSend(cipher.doFinal(decode(envelope.ct)).toString(StandardCharsets.UTF_8))
+    }
+
+    fun decryptI2aContactSend(
+        key: ByteArray,
+        pairId: String,
+        replyId: String,
+        deviceId: String,
+        snapshotId: String,
+        createdAt: Long,
+        envelope: Envelope,
+        wechatUserId: Int,
+    ): DecryptedReply {
+        require(key.size == 32 && envelope.alg == "A256GCM" && envelope.kid == "phase1-reply")
+        val expectedAad = i2aContactSendAad(pairId, replyId, deviceId, snapshotId, createdAt, wechatUserId)
+        require(envelope.aad == expectedAad)
+        val iv = decode(envelope.iv)
+        require(iv.size == 12)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        cipher.updateAAD(expectedAad.toByteArray(StandardCharsets.UTF_8))
+        return parseConversationSend(cipher.doFinal(decode(envelope.ct)).toString(StandardCharsets.UTF_8))
+    }
+
+    fun decryptContactsV2(
+        key: ByteArray,
+        id: String,
+        deviceId: String,
+        capturedAt: Long,
+        wechatUserId: Int,
+        envelope: Envelope,
+    ): List<String> {
+        require(key.size == 32 && envelope.alg == "A256GCM" && envelope.kid == "phase1-contacts")
+        val expectedAad = a2iContactsV2Aad(id, deviceId, capturedAt, wechatUserId)
+        require(envelope.aad == expectedAad)
+        val iv = decode(envelope.iv)
+        require(iv.size == 12 && decode(envelope.ct).size <= ContactsPendingStore.MaxCiphertextBytes)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        cipher.updateAAD(expectedAad.toByteArray(StandardCharsets.UTF_8))
+        val plaintext = cipher.doFinal(decode(envelope.ct)).toString(StandardCharsets.UTF_8)
+        val root = org.json.JSONObject(plaintext)
+        require(root.length() == 2 && root.has("v") && root.has("contacts") && root.getInt("v") == 1)
+        val values = root.getJSONArray("contacts")
+        require(values.length() <= ContactsPageAssembly.MaxContacts)
+        val contacts = ArrayList<String>(values.length())
+        repeat(values.length()) { index ->
+            val entry = values.getJSONObject(index)
+            require(entry.length() == 1 && entry.has("name"))
+            val name = entry.getString("name")
+            require(name.isNotEmpty() && name == name.trim() && name.toByteArray(StandardCharsets.UTF_8).size <= ContactsPageAssembly.MaxNameBytes)
+            contacts += name
+        }
+        require(contacts.distinct().size == contacts.size)
+        return contacts
     }
 
     // The downlink schema intentionally has one string field, so keep parsing local and JVM-testable.

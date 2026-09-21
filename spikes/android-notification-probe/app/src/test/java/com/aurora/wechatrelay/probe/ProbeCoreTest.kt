@@ -7,6 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.io.File
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -384,6 +385,63 @@ class ProbeCoreTest {
     }
 
     @Test
+    fun contactSendV4DecryptsSharedFixtureAndBindsPairSnapshotAndProfile() {
+        val fixture = workspaceFixture("packages/crypto-test-vectors/contact-send-v4.json")
+        val key = fixtureValue(fixture, "key")
+        val pairId = fixtureValue(fixture, "pairId")
+        val replyId = fixtureValue(fixture, "id")
+        val snapshotId = fixtureValue(fixture, "targetContactSnapshotId")
+        val deviceId = fixtureValue(fixture, "deviceId")
+        val createdAt = fixtureLong(fixture, "createdAt")
+        val aad = fixtureValue(fixture, "aad")
+        val envelope = Envelope(
+            "A256GCM",
+            "phase1-reply",
+            fixtureValue(fixture, "iv"),
+            aad,
+            fixtureValue(fixture, "ct"),
+        )
+
+        assertEquals(
+            DecryptedReply("Hello from contacts", "测试好友 A"),
+            SyncProtocol.decryptI2aContactSend(SyncProtocol.decode(key), pairId, replyId, deviceId, snapshotId, createdAt, envelope, 999),
+        )
+        try {
+            SyncProtocol.decryptI2aContactSend(SyncProtocol.decode(key), "different-pair", replyId, deviceId, snapshotId, createdAt, envelope, 999)
+            throw AssertionError("expected v4 pair binding failure")
+        } catch (_: IllegalArgumentException) {
+        }
+        try {
+            SyncProtocol.decryptI2aContactSend(SyncProtocol.decode(key), pairId, replyId, deviceId, "019d2f1a-7b4c-7d10-8c21-1c77be6a91b2", createdAt, envelope, 999)
+            throw AssertionError("expected v4 snapshot binding failure")
+        } catch (_: IllegalArgumentException) {
+        }
+        try {
+            SyncProtocol.decryptI2aContactSend(SyncProtocol.decode(key), pairId, replyId, deviceId, snapshotId, createdAt, envelope, 0)
+            throw AssertionError("expected v4 profile binding failure")
+        } catch (_: IllegalArgumentException) {
+        }
+    }
+
+    @Test
+    fun contactSendRequiresExactCurrentSnapshotAndExactMember() {
+        val current = ContactsCurrent(
+            id = "019d2f1a-7b4c-7d10-8c21-1c77be6a91b0",
+            deviceId = "device-id-0000001",
+            wechatUserId = 999,
+            userSerial = 17,
+            capturedAt = 1788148800000,
+            envelope = Envelope("A256GCM", "phase1-contacts", "iv", "aad", "ct"),
+        )
+        assertTrue(ContactsSendPolicy.matches(current, current.id, current.deviceId, 999))
+        assertFalse(ContactsSendPolicy.matches(current, "019d2f1a-7b4c-7d10-8c21-1c77be6a91b2", current.deviceId, 999))
+        assertFalse(ContactsSendPolicy.matches(current, current.id, "other-device", 999))
+        assertFalse(ContactsSendPolicy.matches(current, current.id, current.deviceId, 0))
+        assertTrue(ContactsSendPolicy.hasExactMember(listOf("Alice", "测试好友 A"), "测试好友 A"))
+        assertFalse(ContactsSendPolicy.hasExactMember(listOf("Alice"), "alice"))
+    }
+
+    @Test
     fun replyBodyRejectsBlankAndOverlongUnicodeText() {
         try {
             SyncProtocol.parseReplyBody("{\"body\":\"   \"}")
@@ -396,6 +454,22 @@ class ProbeCoreTest {
         } catch (_: IllegalArgumentException) {
         }
     }
+
+    private fun workspaceFixture(relativePath: String): String {
+        val file = generateSequence(File(requireNotNull(System.getProperty("user.dir")))) { it.parentFile }
+            .map { File(it, relativePath) }
+            .firstOrNull(File::isFile)
+            ?: throw AssertionError("shared fixture missing: $relativePath")
+        return file.readText(StandardCharsets.UTF_8)
+    }
+
+    private fun fixtureValue(json: String, key: String): String =
+        Regex("\\\"$key\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"").find(json)?.groupValues?.get(1)
+            ?: throw AssertionError("fixture value missing: $key")
+
+    private fun fixtureLong(json: String, key: String): Long =
+        Regex("\\\"$key\\\"\\s*:\\s*(\\d+)").find(json)?.groupValues?.get(1)?.toLong()
+            ?: throw AssertionError("fixture numeric value missing: $key")
 
     @Test
     fun imageCaptureSelectsOnlyObservedLatestIncomingImageForExactSender() {

@@ -103,7 +103,7 @@ public struct RelayContactSnapshot: Codable, Sendable, Equatable, Identifiable {
     public let contactsEnvelope: RelayEncryptedEnvelope
 
     public init(v: Int, id: UUID, deviceId: String, wechatUserId: Int, capturedAt: Int64, contactsEnvelope: RelayEncryptedEnvelope) throws {
-        guard v == 1, RelayValidation.isUUIDv7(id), RelayValidation.isDeviceId(deviceId), RelayValidation.isWechatUserId(wechatUserId), capturedAt > 0 else {
+        guard (v == 1 || v == 2), RelayValidation.isUUIDv7(id), RelayValidation.isDeviceId(deviceId), RelayValidation.isWechatUserId(wechatUserId), capturedAt > 0 else {
             throw RelayError.invalidValue("contact snapshot")
         }
         self.v = v
@@ -181,18 +181,20 @@ public struct RelayMessage: Codable, Identifiable, Sendable, Equatable {
 public struct RelayReplyRequest: Codable, Sendable, Equatable, Identifiable {
     public let v: Int
     public let id: UUID
-    public let targetMessageId: UUID
+    public let targetMessageId: UUID?
+    public let targetContactSnapshotId: UUID?
     public let deviceId: String
     public let wechatUserId: Int
     public let createdAt: Int64
     public let replyEnvelope: RelayEncryptedEnvelope
 
-    enum CodingKeys: String, CodingKey { case v, id, targetMessageId, deviceId, wechatUserId, createdAt, replyEnvelope }
+    enum CodingKeys: String, CodingKey { case v, id, targetMessageId, targetContactSnapshotId, deviceId, wechatUserId, createdAt, replyEnvelope }
 
-    public init(v: Int, id: UUID, targetMessageId: UUID, deviceId: String, wechatUserId: Int, createdAt: Int64, replyEnvelope: RelayEncryptedEnvelope) {
+    public init(v: Int, id: UUID, targetMessageId: UUID? = nil, targetContactSnapshotId: UUID? = nil, deviceId: String, wechatUserId: Int, createdAt: Int64, replyEnvelope: RelayEncryptedEnvelope) {
         self.v = v
         self.id = id
         self.targetMessageId = targetMessageId
+        self.targetContactSnapshotId = targetContactSnapshotId
         self.deviceId = deviceId
         self.wechatUserId = wechatUserId
         self.createdAt = createdAt
@@ -203,7 +205,8 @@ public struct RelayReplyRequest: Codable, Sendable, Equatable, Identifiable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         v = try values.decode(Int.self, forKey: .v)
         id = try values.decode(UUID.self, forKey: .id)
-        targetMessageId = try values.decode(UUID.self, forKey: .targetMessageId)
+        targetMessageId = try values.decodeIfPresent(UUID.self, forKey: .targetMessageId)
+        targetContactSnapshotId = try values.decodeIfPresent(UUID.self, forKey: .targetContactSnapshotId)
         deviceId = try values.decode(String.self, forKey: .deviceId)
         wechatUserId = try values.decode(Int.self, forKey: .wechatUserId)
         createdAt = try values.decode(Int64.self, forKey: .createdAt)
@@ -214,7 +217,8 @@ public struct RelayReplyRequest: Codable, Sendable, Equatable, Identifiable {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(v, forKey: .v)
         try values.encode(id.uuidString.lowercased(), forKey: .id)
-        try values.encode(targetMessageId.uuidString.lowercased(), forKey: .targetMessageId)
+        if let targetMessageId { try values.encode(targetMessageId.uuidString.lowercased(), forKey: .targetMessageId) }
+        if let targetContactSnapshotId { try values.encode(targetContactSnapshotId.uuidString.lowercased(), forKey: .targetContactSnapshotId) }
         try values.encode(deviceId, forKey: .deviceId)
         try values.encode(wechatUserId, forKey: .wechatUserId)
         try values.encode(createdAt, forKey: .createdAt)
@@ -226,6 +230,7 @@ public struct RelayReplyResult: Codable, Sendable, Equatable {
     public let replyId: UUID
     public let status: RelayReplyStatus
     public let targetMessageId: UUID?
+    public let targetContactSnapshotId: UUID?
     public let deviceId: String?
     public let wechatUserId: Int?
     public let createdAt: Int64?
@@ -241,6 +246,7 @@ public enum RelayReplyStatus: String, Codable, Sendable, Equatable {
     case wechatActionChanged = "WECHAT_ACTION_CHANGED"
     case remoteInputUnsupported = "REMOTE_INPUT_UNSUPPORTED"
     case pendingIntentCanceled = "PENDING_INTENT_CANCELED"
+    case contactSnapshotStale = "CONTACT_SNAPSHOT_STALE"
     case invalidReply = "INVALID_REPLY"
     case failed = "FAILED"
 

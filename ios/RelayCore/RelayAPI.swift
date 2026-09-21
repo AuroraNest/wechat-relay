@@ -126,7 +126,7 @@ public final class RelayAPI: NSObject, @unchecked Sendable {
             throw RelayError.invalidResponse
         }
         for snapshot in response.snapshots {
-            guard snapshot.v == 1, RelayValidation.isUUIDv7(snapshot.id), RelayValidation.isDeviceId(snapshot.deviceId),
+            guard (snapshot.v == 1 || snapshot.v == 2), RelayValidation.isUUIDv7(snapshot.id), RelayValidation.isDeviceId(snapshot.deviceId),
                   RelayValidation.isWechatUserId(snapshot.wechatUserId), snapshot.capturedAt > 0 else {
                 throw RelayError.invalidResponse
             }
@@ -173,14 +173,22 @@ public final class RelayAPI: NSObject, @unchecked Sendable {
     }
 
     private func validateReplyRequest(_ reply: RelayReplyRequest, pairId: String) throws {
-        guard (reply.v == 2 || reply.v == 3), RelayValidation.isDeviceId(reply.deviceId), RelayValidation.isWechatUserId(reply.wechatUserId), reply.createdAt > 0, reply.replyEnvelope.alg == "A256GCM", reply.replyEnvelope.kid == "phase1-reply" else { throw RelayError.invalidValue("reply") }
+        guard (reply.v == 2 || reply.v == 3 || reply.v == 4), RelayValidation.isDeviceId(reply.deviceId), RelayValidation.isWechatUserId(reply.wechatUserId), reply.createdAt > 0, reply.replyEnvelope.alg == "A256GCM", reply.replyEnvelope.kid == "phase1-reply" else { throw RelayError.invalidValue("reply") }
         let id = reply.id.uuidString.lowercased()
-        let target = reply.targetMessageId.uuidString.lowercased()
         let expected: String
-        if reply.v == 3 {
-            expected = "AWR1|I2A|3|CONVERSATION_SEND|\(pairId)|\(id)|\(reply.deviceId)|\(target)|\(reply.createdAt)|\(reply.wechatUserId)"
-        } else {
-            expected = "AWR1|I2A|\(id)|\(reply.deviceId)|\(target)|\(reply.createdAt)|\(reply.wechatUserId)"
+        switch reply.v {
+        case 2:
+            guard let target = reply.targetMessageId, reply.targetContactSnapshotId == nil else { throw RelayError.invalidValue("reply target") }
+            expected = "AWR1|I2A|\(id)|\(reply.deviceId)|\(target.uuidString.lowercased())|\(reply.createdAt)|\(reply.wechatUserId)"
+        case 3:
+            guard let target = reply.targetMessageId, reply.targetContactSnapshotId == nil else { throw RelayError.invalidValue("reply target") }
+            expected = "AWR1|I2A|3|CONVERSATION_SEND|\(pairId)|\(id)|\(reply.deviceId)|\(target.uuidString.lowercased())|\(reply.createdAt)|\(reply.wechatUserId)"
+        case 4:
+            guard reply.targetMessageId == nil, let snapshotId = reply.targetContactSnapshotId,
+                  RelayValidation.isUUIDv7(reply.id), RelayValidation.isUUIDv7(snapshotId) else { throw RelayError.invalidValue("reply target") }
+            expected = "AWR1|I2A|4|CONTACT_SEND|\(pairId)|\(id)|\(reply.deviceId)|\(snapshotId.uuidString.lowercased())|\(reply.createdAt)|\(reply.wechatUserId)"
+        default:
+            throw RelayError.invalidValue("reply")
         }
         guard reply.replyEnvelope.aad == expected else { throw RelayError.invalidValue("reply AAD") }
     }

@@ -553,6 +553,7 @@ class MainActivity : Activity() {
         "REMOTE_INPUT_UNSUPPORTED" -> "当前通知不支持回复"
         "PENDING_INTENT_CANCELED" -> "微信已取消回复入口"
         "INVALID_REPLY" -> "回复数据无效"
+        "CONTACT_SNAPSHOT_STALE" -> "联系人快照已过期, 请重新同步"
         "FAILED" -> "发送失败"
         else -> status
     }

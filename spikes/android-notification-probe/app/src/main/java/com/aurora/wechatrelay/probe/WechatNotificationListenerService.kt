@@ -627,15 +627,16 @@ class WechatNotificationListenerService : NotificationListenerService() {
 
     private fun executeReplyCommand(command: ReplyCommand, store: SyncStore, expectedDeviceId: String): String {
         if (!ProbeRuntime.listenerConnected) return "NOTIFICATION_NOT_ACTIVE"
+        if (command.v == 4) return executeContactSendCommand(command, store, expectedDeviceId)
         val decrypted = try {
             val key = store.i2aKey(expectedDeviceId)
             try {
                 if (command.v == 3) {
                     val pairId = command.pairId ?: return "INVALID_REPLY"
-                    SyncProtocol.decryptI2aConversationSend(key, pairId, command.id, command.deviceId, command.targetMessageId, command.createdAt, command.replyEnvelope, command.wechatUserId)
+                    SyncProtocol.decryptI2aConversationSend(key, pairId, command.id, command.deviceId, requireNotNull(command.targetMessageId), command.createdAt, command.replyEnvelope, command.wechatUserId)
                 } else {
                     DecryptedReply(
-                        SyncProtocol.decryptI2aReply(key, command.id, command.deviceId, command.targetMessageId, command.createdAt, command.replyEnvelope, if (command.v == 2) command.wechatUserId else null),
+                        SyncProtocol.decryptI2aReply(key, command.id, command.deviceId, requireNotNull(command.targetMessageId), command.createdAt, command.replyEnvelope, if (command.v == 2) command.wechatUserId else null),
                         null,
                     )
                 }
@@ -645,7 +646,7 @@ class WechatNotificationListenerService : NotificationListenerService() {
         } catch (_: Exception) {
             return "INVALID_REPLY"
         }
-        val target = store.replyTarget(command.targetMessageId) ?: return "NOTIFICATION_NOT_ACTIVE"
+        val target = store.replyTarget(requireNotNull(command.targetMessageId)) ?: return "NOTIFICATION_NOT_ACTIVE"
         if (target.wechatUserId != command.wechatUserId) return "INVALID_REPLY"
         val conversationTitle = decrypted.conversationTitle
         if (command.v == 3 && (conversationTitle == null || !LockscreenReplySelectors.plaintextTitleMatches(
@@ -718,6 +719,54 @@ class WechatNotificationListenerService : NotificationListenerService() {
         }
     }
 
+    private fun executeContactSendCommand(command: ReplyCommand, store: SyncStore, expectedDeviceId: String): String {
+        val pairId = command.pairId ?: return "INVALID_REPLY"
+        val snapshotId = command.targetContactSnapshotId ?: return "INVALID_REPLY"
+        val decrypted = try {
+            val key = store.i2aKey(expectedDeviceId)
+            try {
+                SyncProtocol.decryptI2aContactSend(key, pairId, command.id, command.deviceId, snapshotId, command.createdAt, command.replyEnvelope, command.wechatUserId)
+            } finally {
+                key.fill(0)
+            }
+        } catch (_: Exception) {
+            return "INVALID_REPLY"
+        }
+        val current = try {
+            ContactsCurrentStore.get(this).read(command.wechatUserId)
+        } catch (_: Exception) {
+            return "INVALID_REPLY"
+        } ?: return "CONTACT_SNAPSHOT_STALE"
+        if (!ContactsSendPolicy.matches(current, snapshotId, command.deviceId, command.wechatUserId) ||
+            !ContactsProfileResolver.isAvailable(this, ContactsProfile(current.wechatUserId, current.userSerial, ""))
+        ) return "CONTACT_SNAPSHOT_STALE"
+        val contacts = try {
+            val key = store.messageEncryptionContext(expectedDeviceId).a2iKey
+            try {
+                SyncProtocol.decryptContactsV2(key, current.id, current.deviceId, current.capturedAt, current.wechatUserId, current.envelope)
+            } finally {
+                key.fill(0)
+            }
+        } catch (_: Exception) {
+            return "INVALID_REPLY"
+        }
+        if (!ContactsSendPolicy.hasExactMember(contacts, decrypted.conversationTitle ?: return "INVALID_REPLY")) {
+            return "CONTACT_SNAPSHOT_STALE"
+        }
+        val title = requireNotNull(decrypted.conversationTitle)
+        val result = LockscreenAccessibilityReplyService.executeConversationSend(
+            null,
+            Privacy.saltedHash(title, Privacy.salt(this)),
+            title,
+            current.wechatUserId,
+            current.userSerial,
+            decrypted.body,
+        )
+        recordSyncDiagnostic("ACCESSIBILITY_${result.stage}")
+        if (result.status == "SENT_TO_WECHAT") recordReply(result.status, null, -1)
+        return result.status
+    }
+
     private fun replySessionActive(generation: Long, expectedDeviceId: String): Boolean =
         ProbeRuntime.listenerConnected && replyGeneration == generation && SyncStore.get(this).isCurrentDevice(expectedDeviceId) && !Thread.currentThread().isInterrupted
 
@@ -752,6 +801,7 @@ class WechatNotificationListenerService : NotificationListenerService() {
         "REMOTE_INPUT_UNSUPPORTED" -> "当前通知不支持回复"
         "PENDING_INTENT_CANCELED" -> "微信已取消回复入口"
         "INVALID_REPLY" -> "回复数据无效"
+        "CONTACT_SNAPSHOT_STALE" -> "联系人快照已过期, 请重新同步"
         "FAILED" -> "发送失败"
         else -> status
     }

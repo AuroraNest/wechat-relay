@@ -148,23 +148,25 @@ interface ReplyEnvelope {
   ct: string;
 }
 interface BrowserReply {
-  v: 1 | 2 | 3;
+  v: 1 | 2 | 3 | 4;
   id: string;
-  targetMessageId: string;
   deviceId: string;
   createdAt: number;
   replyEnvelope: ReplyEnvelope;
   wechatUserId: 0 | 999;
+  targetMessageId?: string;
+  targetContactSnapshotId?: string;
 }
 interface ClaimedReply {
-  v: 1 | 2 | 3;
+  v: 1 | 2 | 3 | 4;
   id: string;
-  targetMessageId: string;
   deviceId: string;
   createdAt: number;
   replyEnvelope: ReplyEnvelope;
   wechatUserId: 0 | 999;
   pairId?: string;
+  targetMessageId?: string;
+  targetContactSnapshotId?: string;
 }
 interface ContactsEnvelope {
   alg: "A256GCM";
@@ -174,7 +176,7 @@ interface ContactsEnvelope {
   ct: string;
 }
 interface ContactsSnapshot {
-  v: 1;
+  v: 1 | 2;
   id: string;
   deviceId: string;
   wechatUserId: 0 | 999;
@@ -364,8 +366,10 @@ async function route(
     return submitBrowserReply(request, response);
   if (request.method === "GET" && url.pathname.startsWith("/api/v1/replies/"))
     return getBrowserReply(request, response, decodeURIComponent(url.pathname.slice("/api/v1/replies/".length)));
+  if (request.method === "GET" && url.pathname === "/api/v1/android/replies/v4")
+    return getAndroidReply(request, response, url, true);
   if (request.method === "GET" && url.pathname === "/api/v1/android/replies")
-    return getAndroidReply(request, response, url);
+    return getAndroidReply(request, response, url, false);
   if (request.method === "POST" && url.pathname.startsWith("/api/v1/android/replies/"))
     return acknowledgeAndroidReply(request, response, url);
   if (request.method === "GET" && url.pathname.startsWith("/api/v1/assets/"))
@@ -662,27 +666,28 @@ async function submitBrowserReply(
 ): Promise<void> {
   const { pairId } = await authorizeBrowserPair(request, true);
   const reply = validateBrowserReply((await bodyJson(request)).json, pairId);
-  const target = await dbOne<{ wechat_user_id: string | number; reply_capable: string | number; conversation_send_capable: string | number }>(
-    pool,
-    "SELECT messages.wechat_user_id, messages.reply_capable, messages.conversation_send_capable FROM messages JOIN devices ON devices.device_id = messages.device_id WHERE messages.id = ? AND messages.device_id = ? AND devices.pair_id = ?",
-    [reply.targetMessageId, reply.deviceId, pairId],
-  );
-  if (!target) throw new Error("TARGET_MESSAGE_NOT_FOUND");
-  if (dbInteger(target.reply_capable) !== 1) throw new Error("REPLY_UNSUPPORTED");
-  if (reply.v === 3 && dbInteger(target.conversation_send_capable) !== 1)
-    throw new Error("CONVERSATION_SEND_UNSUPPORTED");
-  if (dbInteger(target.wechat_user_id) !== reply.wechatUserId)
-    throw new Error("PROFILE_MISMATCH");
   const now = Date.now();
   const envelopeJson = JSON.stringify(reply.replyEnvelope);
+  const existing = await dbOne<ReplyIdentityRow>(
+    pool,
+    "SELECT pair_id, target_message_id, contact_snapshot_id, device_id, wechat_user_id, created_at, envelope_json, status FROM replies WHERE id = ?",
+    [reply.id],
+  );
+  if (existing) return replyIdempotentResponse(response, existing, reply, pairId, envelopeJson);
+
+  if (reply.v === 4)
+    await validateContactReplyTarget(reply, pairId);
+  else
+    await validateMessageReplyTarget(reply, pairId);
   try {
     await dbRun(
       pool,
-      "INSERT INTO replies(id, pair_id, target_message_id, device_id, wechat_user_id, created_at, envelope_json, status, status_at, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?)",
+      "INSERT INTO replies(id, pair_id, target_message_id, contact_snapshot_id, device_id, wechat_user_id, created_at, envelope_json, status, status_at, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?)",
       [
         reply.id,
         pairId,
-        reply.targetMessageId,
+        reply.targetMessageId ?? null,
+        reply.targetContactSnapshotId ?? null,
         reply.deviceId,
         reply.wechatUserId,
         reply.createdAt,
@@ -693,35 +698,101 @@ async function submitBrowserReply(
     );
   } catch (error) {
     if (isUniqueConstraint(error)) {
-      const existing = await dbOne<{
-        pair_id: string;
-        target_message_id: string;
-        device_id: string;
-        created_at: string | number;
-        envelope_json: string;
-        status: string;
-        wechat_user_id: string | number;
-      }>(
+      const concurrent = await dbOne<ReplyIdentityRow>(
         pool,
-        "SELECT pair_id, target_message_id, device_id, wechat_user_id, created_at, envelope_json, status FROM replies WHERE id = ?",
+        "SELECT pair_id, target_message_id, contact_snapshot_id, device_id, wechat_user_id, created_at, envelope_json, status FROM replies WHERE id = ?",
         [reply.id],
       );
-      if (
-        existing?.pair_id === pairId &&
-        existing.target_message_id === reply.targetMessageId &&
-        existing.device_id === reply.deviceId &&
-        dbInteger(existing.wechat_user_id) === reply.wechatUserId &&
-        dbInteger(existing.created_at) === reply.createdAt &&
-        existing.envelope_json === envelopeJson
-      ) return json(response, 200, { replyId: reply.id, status: existing.status });
-      throw new Error("REPLY_ID_CONFLICT");
+      if (concurrent) return replyIdempotentResponse(response, concurrent, reply, pairId, envelopeJson);
     }
     throw error;
   }
-  event("REPLY_QUEUED", { replyId: reply.id, targetMessageId: reply.targetMessageId });
+  event(
+    "REPLY_QUEUED",
+    reply.v === 4 ? { replyId: reply.id } : { replyId: reply.id, targetMessageId: reply.targetMessageId },
+  );
   replyEvents.emit("queued", reply.deviceId);
   iosEvents.emit("reply", pairId, reply.id);
   json(response, 201, { replyId: reply.id, status: "QUEUED" });
+}
+
+interface ReplyIdentityRow {
+  pair_id: string;
+  target_message_id: string | null;
+  contact_snapshot_id: string | null;
+  device_id: string;
+  created_at: string | number;
+  envelope_json: string;
+  status: string;
+  wechat_user_id: string | number;
+}
+
+function replyIdempotentResponse(
+  response: ServerResponse,
+  existing: ReplyIdentityRow,
+  reply: BrowserReply,
+  pairId: string,
+  envelopeJson: string,
+): void {
+  if (
+    existing.pair_id === pairId &&
+    existing.target_message_id === (reply.targetMessageId ?? null) &&
+    existing.contact_snapshot_id === (reply.targetContactSnapshotId ?? null) &&
+    existing.device_id === reply.deviceId &&
+    dbInteger(existing.wechat_user_id) === reply.wechatUserId &&
+    dbInteger(existing.created_at) === reply.createdAt &&
+    existing.envelope_json === envelopeJson
+  ) return json(response, 200, { replyId: reply.id, status: existing.status });
+  throw new Error("REPLY_ID_CONFLICT");
+}
+
+async function validateMessageReplyTarget(reply: BrowserReply, pairId: string): Promise<void> {
+  const target = await dbOne<{
+    wechat_user_id: string | number;
+    reply_capable: string | number;
+    conversation_send_capable: string | number;
+  }>(
+    pool,
+    "SELECT messages.wechat_user_id, messages.reply_capable, messages.conversation_send_capable FROM messages JOIN devices ON devices.device_id = messages.device_id WHERE messages.id = ? AND messages.device_id = ? AND devices.pair_id = ?",
+    [reply.targetMessageId, reply.deviceId, pairId],
+  );
+  if (!target) throw new Error("TARGET_MESSAGE_NOT_FOUND");
+  if (dbInteger(target.reply_capable) !== 1) throw new Error("REPLY_UNSUPPORTED");
+  if (reply.v === 3 && dbInteger(target.conversation_send_capable) !== 1)
+    throw new Error("CONVERSATION_SEND_UNSUPPORTED");
+  if (dbInteger(target.wechat_user_id) !== reply.wechatUserId)
+    throw new Error("PROFILE_MISMATCH");
+}
+
+async function validateContactReplyTarget(reply: BrowserReply, pairId: string): Promise<void> {
+  const snapshot = await dbOne<{
+    id: string;
+    device_id: string;
+    wechat_user_id: string | number;
+    captured_at: string | number;
+    envelope_json: string;
+  }>(
+    pool,
+    "SELECT contacts_snapshots.id, contacts_snapshots.device_id, contacts_snapshots.wechat_user_id, contacts_snapshots.captured_at, contacts_snapshots.envelope_json FROM contacts_snapshots JOIN devices ON devices.device_id = contacts_snapshots.device_id WHERE contacts_snapshots.id = ? AND contacts_snapshots.device_id = ? AND contacts_snapshots.wechat_user_id = ? AND devices.pair_id = ?",
+    [reply.targetContactSnapshotId, reply.deviceId, reply.wechatUserId, pairId],
+  );
+  if (!snapshot || !isV2ContactsEnvelope(snapshot))
+    throw new Error("TARGET_CONTACT_SNAPSHOT_NOT_FOUND");
+}
+
+function isV2ContactsEnvelope(snapshot: {
+  id: string;
+  device_id: string;
+  wechat_user_id: string | number;
+  captured_at: string | number;
+  envelope_json: string;
+}): boolean {
+  try {
+    const envelope = JSON.parse(snapshot.envelope_json) as ContactsEnvelope;
+    return envelope.aad === `AWR1|A2I_CONTACTS|2|${snapshot.id}|${snapshot.device_id}|${dbInteger(snapshot.captured_at)}|${dbInteger(snapshot.wechat_user_id)}`;
+  } catch {
+    return false;
+  }
 }
 
 async function getBrowserReply(
@@ -733,7 +804,7 @@ async function getBrowserReply(
   const { pairId } = await authorizeBrowserPair(request, false);
   const reply = await dbOne<ReplyStatusDbRow>(
     pool,
-    "SELECT id, target_message_id, device_id, wechat_user_id, created_at, status, status_at FROM replies WHERE id = ? AND pair_id = ?",
+    "SELECT id, target_message_id, contact_snapshot_id, device_id, wechat_user_id, created_at, status, status_at FROM replies WHERE id = ? AND pair_id = ?",
     [replyId, pairId],
   );
   if (!reply) throw new Error("REPLY_NOT_FOUND");
@@ -745,25 +816,29 @@ async function getAndroidReply(
   request: IncomingMessage,
   response: ServerResponse,
   url: URL,
+  includeContactReplies: boolean,
 ): Promise<void> {
-  if (url.search) throw new Error("INVALID_PATH");
+  const pathname = includeContactReplies
+    ? "/api/v1/android/replies/v4"
+    : "/api/v1/android/replies";
+  if (url.pathname !== pathname || url.search) throw new Error("INVALID_PATH");
   const bytes = await bodyBytes(request);
   if (bytes.length !== 0) throw new Error("INVALID_BODY");
   const signed = await authenticateAndroidRequest(
     request,
     bytes,
     "GET",
-    "/api/v1/android/replies",
+    pathname,
   );
   response.setHeader("Cache-Control", "no-store");
   const wake = waitForReply(signed.deviceId);
   try {
     if (response.destroyed) return;
-    let reply = await claimReply(signed.deviceId, signed.nonce);
+    let reply = await claimReply(signed.deviceId, includeContactReplies, signed.nonce);
     if (!reply) {
       await wake.wait;
       if (response.destroyed) return;
-      reply = await claimReply(signed.deviceId);
+      reply = await claimReply(signed.deviceId, includeContactReplies);
     }
     const relayPolicy = relayPolicyJson(await loadRelayPolicy(signed.pairId));
     if (!reply) return json(response, 200, { reply: null, relayPolicy });
@@ -1023,7 +1098,7 @@ async function getIosContacts(
   response.setHeader("Cache-Control", "no-store");
   json(response, 200, {
     snapshots: rows.map((row) => ({
-      v: 1,
+      v: (JSON.parse(row.envelope_json) as ContactsEnvelope).aad.startsWith("AWR1|A2I_CONTACTS|2|") ? 2 : 1,
       id: row.id,
       deviceId: row.device_id,
       wechatUserId: dbInteger(row.wechat_user_id),
@@ -1352,7 +1427,7 @@ function validateContactsSnapshot(value: unknown): ContactsSnapshot {
     keys[3] !== "id" ||
     keys[4] !== "v" ||
     keys[5] !== "wechatUserId" ||
-    snapshot.v !== 1 ||
+    (snapshot.v !== 1 && snapshot.v !== 2) ||
     !isUuidV7(snapshot.id) ||
     !isDeviceId(snapshot.deviceId) ||
     (snapshot.wechatUserId !== 0 && snapshot.wechatUserId !== 999) ||
@@ -1376,7 +1451,7 @@ function validateContactsSnapshot(value: unknown): ContactsSnapshot {
     envelope.alg !== "A256GCM" ||
     envelope.kid !== "phase1-contacts" ||
     typeof envelope.aad !== "string" ||
-    envelope.aad !== `AWR1|A2I_CONTACTS|1|${snapshot.id}|${snapshot.deviceId}|${capturedAt}|${snapshot.wechatUserId}` ||
+    envelope.aad !== `AWR1|A2I_CONTACTS|${snapshot.v}|${snapshot.id}|${snapshot.deviceId}|${capturedAt}|${snapshot.wechatUserId}` ||
     typeof envelope.iv !== "string" ||
     typeof envelope.ct !== "string"
   )
@@ -1390,14 +1465,18 @@ function validateBrowserReply(value: unknown, pairId: string): BrowserReply {
   if (!value || typeof value !== "object") throw new Error("INVALID_REPLY");
   const reply = value as Partial<BrowserReply>;
   if (
-    (reply.v !== 1 && reply.v !== 2 && reply.v !== 3) ||
+    (reply.v !== 1 && reply.v !== 2 && reply.v !== 3 && reply.v !== 4) ||
     !isUuid(reply.id) ||
-    !isUuid(reply.targetMessageId) ||
     !isDeviceId(reply.deviceId) ||
     !Number.isSafeInteger(reply.createdAt) ||
     Math.abs(Date.now() - reply.createdAt!) > 172_800_000
   )
     throw new Error("INVALID_REPLY");
+  if (
+    reply.v === 4
+      ? reply.targetMessageId !== undefined || !isUuid(reply.targetContactSnapshotId)
+      : !isUuid(reply.targetMessageId) || reply.targetContactSnapshotId !== undefined
+  ) throw new Error("INVALID_REPLY");
   const wechatUserId = reply.v === 1 ? 0 : reply.wechatUserId;
   if (wechatUserId !== 0 && wechatUserId !== 999)
     throw new Error("INVALID_PROFILE");
@@ -1414,7 +1493,9 @@ function validateBrowserReply(value: unknown, pairId: string): BrowserReply {
     throw new Error("INVALID_REPLY_ENVELOPE");
   if (
     envelope.aad !==
-    (reply.v === 3
+    (reply.v === 4
+      ? `AWR1|I2A|4|CONTACT_SEND|${pairId}|${reply.id}|${reply.deviceId}|${reply.targetContactSnapshotId}|${reply.createdAt}|${wechatUserId}`
+      : reply.v === 3
       ? `AWR1|I2A|3|CONVERSATION_SEND|${pairId}|${reply.id}|${reply.deviceId}|${reply.targetMessageId}|${reply.createdAt}|${wechatUserId}`
       : `AWR1|I2A|${reply.id}|${reply.deviceId}|${reply.targetMessageId}|${reply.createdAt}${reply.v === 2 ? `|${wechatUserId}` : ""}`)
   )
@@ -1427,6 +1508,7 @@ const replyStatuses = new Set([
   "NOTIFICATION_NOT_ACTIVE",
   "WECHAT_ACTION_CHANGED",
   "REMOTE_INPUT_UNSUPPORTED",
+  "CONTACT_SNAPSHOT_STALE",
   "PENDING_INTENT_CANCELED",
   "INVALID_REPLY",
   "FAILED",
@@ -1448,7 +1530,8 @@ interface AndroidRequest {
 }
 interface ReplyStatusDbRow {
   id: string;
-  target_message_id: string;
+  target_message_id: string | null;
+  contact_snapshot_id: string | null;
   device_id: string;
   created_at: string | number;
   status: string;
@@ -1521,6 +1604,7 @@ async function cleanExpiredNonces(): Promise<void> {
 }
 async function claimReply(
   deviceId: string,
+  includeContactReplies: boolean,
   nonce?: string,
 ): Promise<ClaimedReply | undefined> {
   const now = Date.now();
@@ -1530,14 +1614,15 @@ async function claimReply(
     const reply = await dbOne<{
       id: string;
       pair_id: string;
-      target_message_id: string;
+      target_message_id: string | null;
+      contact_snapshot_id: string | null;
       device_id: string;
       created_at: string | number;
       envelope_json: string;
       wechat_user_id: string | number;
     }>(
       connection,
-      "SELECT id, pair_id, target_message_id, device_id, wechat_user_id, created_at, envelope_json FROM replies WHERE device_id = ? AND status = 'QUEUED' ORDER BY queued_at ASC LIMIT 1 FOR UPDATE",
+      `SELECT id, pair_id, target_message_id, contact_snapshot_id, device_id, wechat_user_id, created_at, envelope_json FROM replies WHERE device_id = ? AND status = 'QUEUED'${includeContactReplies ? "" : " AND contact_snapshot_id IS NULL"} ORDER BY queued_at ASC LIMIT 1 FOR UPDATE`,
       [deviceId],
     );
     if (!reply) return undefined;
@@ -1548,15 +1633,20 @@ async function claimReply(
     );
     if (result.affectedRows !== 1) throw new Error("REPLY_CLAIM_CONFLICT");
     const replyEnvelope = JSON.parse(reply.envelope_json) as ReplyEnvelope;
+    const isContactSend = reply.contact_snapshot_id !== null;
     const isConversationSend = replyEnvelope.aad.startsWith("AWR1|I2A|3|CONVERSATION_SEND|");
+    if (isContactSend && !replyEnvelope.aad.startsWith("AWR1|I2A|4|CONTACT_SEND|"))
+      throw new Error("INVALID_STORED_REPLY");
     return {
-      v: isConversationSend ? 3 : replyEnvelope.aad.split("|").length === 7 ? 2 : 1,
+      v: isContactSend ? 4 : isConversationSend ? 3 : replyEnvelope.aad.split("|").length === 7 ? 2 : 1,
       id: reply.id,
-      targetMessageId: reply.target_message_id,
       deviceId: reply.device_id,
       createdAt: dbInteger(reply.created_at),
       replyEnvelope,
       wechatUserId: dbInteger(reply.wechat_user_id) as 0 | 999,
+      ...(isContactSend
+        ? { pairId: reply.pair_id, targetContactSnapshotId: reply.contact_snapshot_id! }
+        : { targetMessageId: reply.target_message_id! }),
       ...(isConversationSend ? { pairId: reply.pair_id } : {}),
     };
   });
@@ -1610,7 +1700,8 @@ function waitForMessage(pairId: string, afterSeq: number): { wait: Promise<void>
 function replyMetadata(reply: ReplyStatusDbRow): Record<string, unknown> {
   return {
     replyId: reply.id,
-    targetMessageId: reply.target_message_id,
+    ...(reply.target_message_id ? { targetMessageId: reply.target_message_id } : {}),
+    ...(reply.contact_snapshot_id ? { targetContactSnapshotId: reply.contact_snapshot_id } : {}),
     deviceId: reply.device_id,
     wechatUserId: dbInteger(reply.wechat_user_id),
     createdAt: dbInteger(reply.created_at),
