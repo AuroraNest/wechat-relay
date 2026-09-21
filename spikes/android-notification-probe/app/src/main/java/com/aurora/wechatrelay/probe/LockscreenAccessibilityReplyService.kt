@@ -824,6 +824,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
             handler.removeCallbacks(contactsTick)
             ProbeRuntime.contactsScanStatus = "扫描失败: $stage"
         }
+        recordAccessibilityStage("${stage}_SCANNED_${active.assembly.count()}_EXPECTED_${active.assembly.expectedCount ?: -1}")
         if (foregroundPackage() == NotificationSnapshot.WechatPackage) {
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))
         }
@@ -837,6 +838,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
             ProbeRuntime.contactsScanStatus = status
             ProbeRuntime.contactsScanCapturedAt = capturedAt
         }
+        recordAccessibilityStage("CONTACTS_SCAN_QUEUED_COUNT_${active.assembly.count()}")
         // Return only while this manual scan still owns WeChat's foreground window.
         if (foregroundPackage() == NotificationSnapshot.WechatPackage) {
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))

@@ -43,6 +43,7 @@ class ContactsPageAssembly(private val maximumContacts: Int = MaxContacts) {
     fun addStablePage(values: List<CharSequence>) {
         values.forEach { raw ->
             val name = raw.toString().trim()
+            if (name in SystemEntries) return@forEach
             require(name.isNotEmpty() && name.toByteArray(StandardCharsets.UTF_8).size <= MaxNameBytes)
             names.add(name)
             require(names.size <= maximumContacts)
@@ -67,6 +68,8 @@ class ContactsPageAssembly(private val maximumContacts: Int = MaxContacts) {
         const val MaxContacts = 10_000
         const val MaxNameBytes = 512
         const val MaxPlaintextBytes = 1_048_576
+        // ponytail: Chinese WeChat 8.0.77 excludes these from its friend total; revisit on locale or UI changes.
+        private val SystemEntries = setOf("微信团队", "文件传输助手")
 
         fun contactsJson(names: List<String>): String {
             return buildString {

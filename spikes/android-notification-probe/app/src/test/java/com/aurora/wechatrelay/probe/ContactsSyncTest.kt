@@ -22,11 +22,23 @@ class ContactsSyncTest {
         ContactsPageAssembly().addStablePage(listOf("a".repeat(513)))
     }
 
+    @Test
+    fun systemEntriesDoNotInflateTheWechatFriendTotal() {
+        val friends = (1..33).map { "Friend $it" }
+        val assembly = ContactsPageAssembly()
+        assembly.confirmTop()
+        assembly.addStablePage(friends.take(20) + " 文件传输助手 ")
+        assembly.addStablePage(friends.drop(15) + "微信团队")
+        assembly.observeFooter(33)
+        assertEquals(33, assembly.count())
+        assertEquals(friends, assembly.complete())
+    }
+
     @Test(expected = IllegalStateException::class)
     fun footerCountMismatchCannotPublish() {
         val assembly = ContactsPageAssembly()
         assembly.confirmTop()
-        assembly.addStablePage(listOf("Alice"))
+        assembly.addStablePage(listOf("Alice", "微信团队", "文件传输助手"))
         assembly.observeFooter(2)
         assembly.complete()
     }
