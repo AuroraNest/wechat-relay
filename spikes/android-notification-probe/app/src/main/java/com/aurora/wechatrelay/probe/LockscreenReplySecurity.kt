@@ -112,6 +112,15 @@ object LockscreenReplySelectors {
     internal fun isExactSingleRecipient(expectedHash: String, memberHashes: List<String>): Boolean =
         expectedHash.isNotBlank() && memberHashes.singleOrNull() == expectedHash
 
+    // The originating view can disappear before its click event is delivered during navigation.
+    internal fun matchesIssuedClick(sourceId: String?, expectedId: String, windowId: Int, expectedWindowId: Int,
+        controlClass: String?, expectedClass: String?, elapsedMillis: Long): Boolean =
+        expectedWindowId >= 0 && windowId == expectedWindowId && expectedClass != null &&
+            (controlClass == expectedClass || (expectedId == "com.tencent.mm:id/actionbar_up_indicator" &&
+                expectedClass == "android.widget.Button" && controlClass == "android.widget.LinearLayout")) &&
+            elapsedMillis in 0L..1_000L &&
+            (sourceId == null || sourceId == expectedId)
+
     internal fun hasUniqueReadySendControl(sendControls: Int): Boolean = sendControls == 1
 
     internal fun isBottomComposerBounds(left: Int, top: Int, right: Int, bottom: Int, screenHeight: Int): Boolean =

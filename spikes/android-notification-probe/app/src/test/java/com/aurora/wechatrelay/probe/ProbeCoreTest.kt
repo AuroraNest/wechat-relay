@@ -113,6 +113,24 @@ class ProbeCoreTest {
     }
 
     @Test
+    fun issuedNavigationClickSurvivesItsSourceViewDisappearing() {
+        fun matches(id: String?, window: Int = 1084, type: String? = "android.widget.ImageView", elapsed: Long = 16) =
+            LockscreenReplySelectors.matchesIssuedClick(id, "com.tencent.mm:id/fq", window, 1084,
+                type, "android.widget.ImageView", elapsed)
+        assertTrue(matches(null))
+        assertTrue(matches("com.tencent.mm:id/fq"))
+        assertFalse(matches("com.tencent.mm:id/other"))
+        assertFalse(matches(null, window = 1085))
+        assertFalse(matches(null, type = "android.widget.Button"))
+        assertFalse(matches(null, elapsed = -1))
+        assertFalse(matches(null, elapsed = 1_001))
+        assertTrue(LockscreenReplySelectors.matchesIssuedClick(null, "com.tencent.mm:id/actionbar_up_indicator",
+            1096, 1096, "android.widget.LinearLayout", "android.widget.Button", 0))
+        assertFalse(LockscreenReplySelectors.matchesIssuedClick(null, "com.tencent.mm:id/other",
+            1096, 1096, "android.widget.LinearLayout", "android.widget.Button", 0))
+    }
+
+    @Test
     fun recipientInfoRequiresExactlyOneMatchingMember() {
         assertTrue(LockscreenReplySelectors.isExactSingleRecipient("target", listOf("target")))
         assertFalse(LockscreenReplySelectors.isExactSingleRecipient("target", emptyList()))

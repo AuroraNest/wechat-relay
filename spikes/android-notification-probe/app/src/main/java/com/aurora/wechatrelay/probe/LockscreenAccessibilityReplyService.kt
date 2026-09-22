@@ -106,6 +106,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         val pin: CharArray,
         val startedLocked: Boolean,
         val completion: CountDownLatch,
+        val navigationCheckOnly: Boolean = false,
         val cancellation: ReplyCancellation = ReplyCancellation(),
         @Volatile var phase: Phase = Phase.Unlocking,
         var initialForegroundPackage: String? = null,
@@ -128,6 +129,8 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         var recipientInfoClickSeen: Boolean = false,
         var recipientBackClickSeen: Boolean = false,
         var recipientWindowSettledAt: Long = 0L,
+        var recipientInfoControlClass: String? = null,
+        var recipientBackControlClass: String? = null,
         var inputObservationDeadlineMillis: Long = 0L,
         var setTextAcceptedLogged: Boolean = false,
         var inputTextObservedLogged: Boolean = false,
@@ -274,6 +277,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         voiceIsCurrent: (() -> Boolean)? = null,
         voiceVoicesAfter: (() -> Int)? = null,
         voiceCaptureTexts: ((List<String>) -> Unit)? = null,
+        navigationCheckOnly: Boolean = false,
     ): AccessibilityReplyResult {
         preemptContactsScan()
         val keyguard = getSystemService(KeyguardManager::class.java)
@@ -299,6 +303,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
         }
 
         val startedLocked = keyguard.isDeviceLocked
+        if (navigationCheckOnly && (!BuildConfig.DEBUG || startedLocked)) return AccessibilityReplyResult("FAILED", "CHECK_REQUIRES_UNLOCKED_DEVICE")
         val completion = CountDownLatch(1)
         var creationFailure: AccessibilityReplyResult? = null
         val createdSession: Session? = LockscreenPinStore.withAuthorizationLock {
@@ -343,6 +348,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                         pin = pin,
                         startedLocked = startedLocked,
                         completion = completion,
+                        navigationCheckOnly = navigationCheckOnly,
                     ).also { session = it }
                 }
             }
@@ -354,6 +360,16 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                 return@post
             }
             try {
+                if (created.navigationCheckOnly) {
+                    if (foregroundPackage() != NotificationSnapshot.WechatPackage) {
+                        finishSession("FAILED", "CHECK_REQUIRES_CURRENT_CHAT")
+                        return@post
+                    }
+                    created.phase = Phase.OpeningWechat
+                    scheduleConversationNavigationTick(created)
+                    processWechatWindow(created)
+                    return@post
+                }
                 if (!startedLocked) created.initialForegroundPackage = runCatching(::foregroundPackage).getOrNull()
                 val started = created.cancellation.runIfActive {
                     startActivity(
@@ -957,6 +973,10 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
 
         when (active.phase) {
             Phase.OpeningWechat -> {
+                if (active.navigationCheckOnly) {
+                    finishSession("NAVIGATION_CHECK_PASSED", "RECIPIENT_CHECK_PASSED")
+                    return
+                }
                 val arguments = Bundle().apply {
                     putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, replyText.concatToString())
                 }
@@ -2004,6 +2024,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                 nodeLabels(it).any { label -> label.toString() == "更多信息" }
         }.singleOrNull() ?: return
         active.recipientComposer = input
+        active.recipientInfoControlClass = more.className?.toString()
         active.recipientInfoOpenedAt = SystemClock.uptimeMillis()
         active.phase = Phase.CheckingRecipient
         if (active.cancellation.runIfActive { more.performAction(AccessibilityNodeInfo.ACTION_CLICK) } != true) {
@@ -2045,6 +2066,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                 it.viewIdResourceName == "com.tencent.mm:id/actionbar_up_indicator"
         }.singleOrNull() ?: return
         active.phase = Phase.ReturningToChat
+        active.recipientBackControlClass = back.className?.toString()
         active.recipientBackAt = SystemClock.uptimeMillis()
         if (active.cancellation.runIfActive { back.performAction(AccessibilityNodeInfo.ACTION_CLICK) } != true) {
             finishSession("FAILED", "RECIPIENT_INFO_RETURN_FAILED")
@@ -2071,6 +2093,7 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
                 else -> null
             }
             if (event.packageName?.toString() != NotificationSnapshot.WechatPackage || event.className?.toString() != expected) {
+                recordRecipientRejection(active, event)
                 finishSession("WECHAT_ACTION_CHANGED", "RECIPIENT_NAVIGATION_CHANGED")
                 return false
             }
@@ -2087,13 +2110,34 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
             val infoClick = active.recipientBackAt == 0L || event.eventTime < active.recipientBackAt
             val expectedId = if (infoClick) "com.tencent.mm:id/fq" else "com.tencent.mm:id/actionbar_up_indicator"
             val alreadySeen = if (infoClick) active.recipientInfoClickSeen else active.recipientBackClickSeen
-            if (event.packageName?.toString() != NotificationSnapshot.WechatPackage || sourceId != expectedId || alreadySeen) {
+            val issuedAt = if (infoClick) active.recipientInfoOpenedAt else active.recipientBackAt
+            val expectedWindow = if (infoClick) active.recipientComposer?.windowId ?: -1 else active.recipientInfoWindowId
+            val expectedClass = if (infoClick) active.recipientInfoControlClass else active.recipientBackControlClass
+            if (event.packageName?.toString() != NotificationSnapshot.WechatPackage || alreadySeen ||
+                !LockscreenReplySelectors.matchesIssuedClick(sourceId, expectedId, event.windowId, expectedWindow,
+                    event.className?.toString(), expectedClass, event.eventTime - issuedAt)
+            ) {
+                recordRecipientRejection(active, event)
                 finishSession("WECHAT_ACTION_CHANGED", "RECIPIENT_NAVIGATION_CHANGED")
                 return false
             }
             if (infoClick) active.recipientInfoClickSeen = true else active.recipientBackClickSeen = true
         }
         return true
+    }
+
+    private fun recordRecipientRejection(active: Session, event: AccessibilityEvent) {
+        ProbeStore(this).append(JSONObject()
+            .put("eventType", "syncDiagnostic").put("capturedAt", System.currentTimeMillis())
+            .put("stage", "RECIPIENT_GUARD_REJECTED").put("phase", active.phase.name)
+            .put("event", event.eventType).put("package", event.packageName?.toString())
+            .put("class", event.className?.toString()).put("window", event.windowId)
+            .put("sourceId", event.source?.viewIdResourceName ?: "null")
+            .put("expectedControlClass", if (active.recipientBackAt == 0L || event.eventTime < active.recipientBackAt) active.recipientInfoControlClass else active.recipientBackControlClass)
+            .put("expectedWindow", if (active.recipientBackAt == 0L || event.eventTime < active.recipientBackAt) active.recipientComposer?.windowId else active.recipientInfoWindowId)
+            .put("sinceOpen", event.eventTime - active.recipientInfoOpenedAt)
+            .put("sinceBack", if (active.recipientBackAt == 0L) -1L else event.eventTime - active.recipientBackAt)
+            .toString())
     }
 
     private fun scheduleConversationNavigationTick(active: Session) {
@@ -2277,6 +2321,10 @@ class LockscreenAccessibilityReplyService : AccessibilityService() {
     }
 
     companion object {
+        internal fun checkCurrentConversation(title: String): AccessibilityReplyResult {
+            val service = liveService ?: return AccessibilityReplyResult("FAILED", "ACCESSIBILITY_NOT_LIVE")
+            return service.executeBlocking(null, Privacy.saltedHash(title, Privacy.salt(service)), title, 0, -1L, "", navigationCheckOnly = true)
+        }
         private const val SystemUiPackage = "com.android.systemui"
         private val SystemPinKeyViewIds = (0..9).mapTo(HashSet<String>()) { "$SystemUiPackage:id/key$it" }
         private const val UnlockTimeoutMillis = 15_000L
