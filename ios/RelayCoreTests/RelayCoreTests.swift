@@ -27,8 +27,9 @@ struct RelayCoreTests {
 
     @Test func rejectsTamperedOrCrossBoundPreview() throws {
         let valid = try previewEnvelope(profile: 0)
-        let replacement = valid.ct.last == "A" ? "B" : "A"
-        let envelope = RelayEncryptedEnvelope(kid: "phase1", iv: valid.iv, aad: valid.aad, ct: String(valid.ct.dropLast()) + replacement)
+        // Change significant ciphertext bits, not unused padding bits in the last Base64 character.
+        let replacement = valid.ct.first == "A" ? "B" : "A"
+        let envelope = RelayEncryptedEnvelope(kid: "phase1", iv: valid.iv, aad: valid.aad, ct: replacement + String(valid.ct.dropFirst()))
         let message = try RelayMessage(messageId: messageID, deviceId: deviceID, seq: 1, createdAt: 1_788_148_800_000, wechatUserId: 0, replyCapable: false, conversationSendCapable: false, previewEnvelope: envelope, assets: [], receivedAt: 1_788_148_800_000)
         #expect(throws: (any Error).self) { try RelayCrypto.decryptPreview(message, messageKey: key) }
 
