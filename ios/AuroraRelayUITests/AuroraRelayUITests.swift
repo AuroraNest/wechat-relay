@@ -26,7 +26,10 @@ final class AuroraRelayUITests: XCTestCase {
         XCTAssertTrue(app.buttons["已发往微信"].waitForExistence(timeout: 3))
         attachScreenshot("演示回复")
 
-        app.navigationBars.buttons.firstMatch.tap()
+        let back = app.navigationBars.buttons["BackButton"]
+        XCTAssertTrue(back.waitForExistence(timeout: 3))
+        XCTAssertGreaterThanOrEqual(back.frame.minY, app.buttons["source-picker"].frame.maxY)
+        back.tap()
         let friendsTab = app.tabBars.buttons["好友"]
         XCTAssertTrue(friendsTab.waitForExistence(timeout: 3))
         friendsTab.tap()

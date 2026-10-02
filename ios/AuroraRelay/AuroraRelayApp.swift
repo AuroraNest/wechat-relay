@@ -10,13 +10,7 @@ struct AuroraRelayApp: App {
 
     var body: some Scene {
         WindowGroup {
-            Group {
-                if model.selectedSource != .mixed && model.session == nil { WelcomeView() }
-                else if model.selectedSource != .mixed && model.pairing != nil { PairingView() }
-                else { RelayTabs() }
-            }
-            .id(model.selectedSource)
-            .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
                 HStack {
                     Text("消息来源").font(.subheadline).foregroundStyle(.secondary)
                     Spacer()
@@ -24,6 +18,13 @@ struct AuroraRelayApp: App {
                         ForEach(RelaySourceSelection.allCases, id: \.self) { source in Text(source.label).tag(source) }
                     }.pickerStyle(.menu).accessibilityIdentifier("source-picker")
                 }.padding(.horizontal, 20).padding(.vertical, 6).background(.bar)
+                Group {
+                    if model.selectedSource != .mixed && model.session == nil { WelcomeView() }
+                    else if model.selectedSource != .mixed && model.pairing != nil { PairingView() }
+                    else { RelayTabs() }
+                }
+                .id(model.selectedSource)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .environmentObject(model)
             .tint(Color.relayGreen)
