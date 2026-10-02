@@ -14,6 +14,7 @@ final class RelayAppModel: ObservableObject {
     private var observations = Set<AnyCancellable>()
     private var foreground = false
     private var pushUpdate: Task<Void, Never>?
+    private var pushRetry: Task<Void, Never>?
     private var pushRevision = 0
 
     private init() {
@@ -80,9 +81,21 @@ final class RelayAppModel: ObservableObject {
         foreground = true
         visible.forEach { $0.start() }
         schedulePushUpdate()
+        // Hidden connections do not poll messages, but a failed push unregister must recover too.
+        if pushRetry == nil {
+            pushRetry = Task { [weak self] in
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: .seconds(30)) } catch { break }
+                    guard let self, self.foreground else { break }
+                    self.schedulePushUpdate()
+                }
+            }
+        }
     }
     func stop() {
         foreground = false
+        pushRetry?.cancel()
+        pushRetry = nil
         connections.values.forEach { $0.stop() }
     }
     private func schedulePushUpdate() {

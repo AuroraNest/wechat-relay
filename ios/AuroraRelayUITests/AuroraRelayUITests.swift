@@ -119,7 +119,7 @@ final class AuroraRelayUITests: XCTestCase {
         selectSource("混合")
         XCTAssertTrue(app.staticTexts["Tablet route only"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.staticTexts["Phone route only"].waitForExistence(timeout: 3))
-        XCTAssertEqual(app.staticTexts["林一"].count, 2)
+        XCTAssertEqual(app.staticTexts.matching(identifier: "林一").count, 2)
         attachScreenshot("混合来源独立会话")
 
         selectSource("平板")
