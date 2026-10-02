@@ -30,9 +30,11 @@ final class AuroraRelayUITests: XCTestCase {
         let friendsTab = app.tabBars.buttons["好友"]
         XCTAssertTrue(friendsTab.waitForExistence(timeout: 3))
         friendsTab.tap()
+        let friendSearch = app.searchFields["搜索好友"]
+        XCTAssertTrue(friendSearch.waitForExistence(timeout: 3))
+        friendSearch.tap()
+        friendSearch.typeText("王珊")
         XCTAssertTrue(app.staticTexts["王珊"].waitForExistence(timeout: 3))
-        app.searchFields["搜索好友"].tap()
-        app.searchFields["搜索好友"].typeText("王珊")
         app.staticTexts["王珊"].tap()
         XCTAssertTrue(reply.waitForExistence(timeout: 3))
         reply.tap()

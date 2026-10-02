@@ -74,7 +74,7 @@ struct SettingsView: View {
                     ForEach(RelaySource.allCases, id: \.self) { source in
                         Button("管理" + source.label) { model.selectSource(source == .tablet ? .tablet : .phone) }
                     }
-                    Text("转发时段、通知预览和断开配对按来源独立保存. 选择一个来源后修改.").font(.footnote).foregroundStyle(.secondary)
+                    Text("转发时段, 通知预览和断开配对按来源独立保存. 选择一个来源后修改.").font(.footnote).foregroundStyle(.secondary)
                 }
             }
             Section {

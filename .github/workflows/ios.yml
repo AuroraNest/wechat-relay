@@ -22,4 +22,13 @@ jobs:
       - name: Source routing UI tests
         run: |
           DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; devices=json.load(sys.stdin)["devices"]; print(next(d["udid"] for runtime, group in devices.items() if "iOS" in runtime for d in group if d["name"].startswith("iPhone")))')
-          xcodebuild -project ios/AuroraRelay.xcodeproj -scheme AuroraRelay -destination "platform=iOS Simulator,id=$DEVICE_ID" CODE_SIGN_IDENTITY=- test
+          xcrun simctl boot "$DEVICE_ID"
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+          xcodebuild -project ios/AuroraRelay.xcodeproj -scheme AuroraRelay -destination "platform=iOS Simulator,id=$DEVICE_ID" -parallel-testing-enabled NO -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" CODE_SIGN_IDENTITY=- test
+      - name: UI test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-results
+          path: ${{ runner.temp }}/ios-tests.xcresult
+          retention-days: 7

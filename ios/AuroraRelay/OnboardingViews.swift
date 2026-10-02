@@ -13,7 +13,7 @@ struct WelcomeView: View {
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 12) {
                     Text("工作微信,\n随身就好.").font(.system(size: 36, weight: .bold))
-                    Text("\(model.sourceLabel)尚未连接.\n配对后在 iPhone 上收消息、看图片、回一句.")
+                    Text("\(model.sourceLabel)尚未连接.\n配对后在 iPhone 上收消息, 看图片, 回一句.")
                         .font(.title3).foregroundStyle(.secondary).lineSpacing(5)
                 }
                 Label("消息内容端到端加密", systemImage: "lock.shield").font(.subheadline).foregroundStyle(.secondary)
