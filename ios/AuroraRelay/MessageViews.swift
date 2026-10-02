@@ -31,6 +31,7 @@ struct InboxView: View {
                                     Spacer(minLength: 10)
                                     Text(Date(timeIntervalSince1970: Double(conversation.createdAt) / 1_000), style: .time).font(.caption2).foregroundStyle(.tertiary)
                                 }
+                                Text(conversation.friend.source.label + " · " + conversation.friend.profileLabel).font(.caption2).foregroundStyle(.secondary)
                                 HStack {
                                     Text(conversation.body).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                                     Spacer(minLength: 5)
@@ -48,11 +49,11 @@ struct InboxView: View {
         .listStyle(.plain)
         .overlay {
             if conversations.isEmpty {
-                ContentUnavailableView(search.isEmpty ? "消息会来到这里" : "没有找到会话", systemImage: "bubble.left.and.bubble.right", description: Text(search.isEmpty ? "Android 收到新的微信消息后, 会自动同步过来." : "试试其他名字或消息内容."))
+                ContentUnavailableView(search.isEmpty ? "消息会来到这里" : "没有找到会话", systemImage: "bubble.left.and.bubble.right", description: Text(search.isEmpty ? "所选来源收到新的微信消息后, 会自动同步过来. 未连接的来源可在顶部菜单单独配对." : "试试其他名字或消息内容."))
             }
         }
         .navigationTitle("消息")
-        .toolbar { ToolbarItem(placement: .topBarTrailing) { Text("工作微信").font(.subheadline).foregroundStyle(.secondary) } }
+        .toolbar { ToolbarItem(placement: .topBarTrailing) { Text(model.sourceLabel).font(.subheadline).foregroundStyle(.secondary) } }
         .searchable(text: $search, prompt: "搜索会话")
         .refreshable { await model.refresh() }
         .navigationDestination(for: String.self) { id in ConversationView(conversationID: id) }
@@ -73,7 +74,7 @@ struct AvatarView: View {
             if item.message.wechatUserId == 999 { Text("2").font(.system(size: 9, weight: .bold)).foregroundStyle(.white).padding(4).background(Color.relayGreen, in: Circle()).offset(x: 3, y: 3) }
         }.accessibilityHidden(true)
             .task(id: item.id) {
-                if let metadata = item.message.assets.first(where: { $0.kind == .avatar }) { image = try? await model.image(for: metadata, in: item.message) }
+                if let metadata = item.message.assets.first(where: { $0.kind == .avatar }) { image = try? await model.image(for: metadata, in: item) }
             }
     }
 }
@@ -108,7 +109,7 @@ struct FriendsView: View {
                     Label("已同步 \(model.friends.count) 位好友 · \(capturedAt.formatted(date: .abbreviated, time: .shortened))", systemImage: "person.2")
                         .font(.footnote).foregroundStyle(.secondary)
                 } else {
-                    Label("首次同步请在小米 Relay 点击同步好友.", systemImage: "arrow.triangle.2.circlepath")
+                    Label("请在对应来源同步微信好友, 然后下拉刷新.", systemImage: "arrow.triangle.2.circlepath")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Text("好友名单来自已同步的微信通讯录.")
@@ -126,8 +127,8 @@ struct FriendsView: View {
                                 FriendAvatarView(friend: friend)
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(friend.name).font(.body)
-                                    if model.friends.filter({ $0.name == friend.name }).count > 1 {
-                                        Text(friend.profileLabel).font(.caption).foregroundStyle(.secondary)
+                                    if model.selectedSource == .mixed || model.friends.filter({ $0.name == friend.name }).count > 1 {
+                                        Text(friend.source.label + " · " + friend.profileLabel).font(.caption).foregroundStyle(.secondary)
                                     }
                                 }
                             }.padding(.vertical, 4)
@@ -157,7 +158,7 @@ struct FriendsView: View {
     private var emptyDescription: String {
         if !search.isEmpty { return "试试其他名字." }
         if model.contactsAvailable == false { return "升级 Relay 服务后, 可同步微信通讯录好友名单." }
-        return "首次同步请在小米 Relay 点击同步好友."
+        return "请在对应来源同步微信好友, 然后下拉刷新."
     }
 
     private func indexInitial(_ name: String) -> String {
@@ -187,7 +188,7 @@ struct FriendAvatarView: View {
             image = nil
             guard let source = model.avatarItem(for: friend),
                   let metadata = source.message.assets.first(where: { $0.kind == .avatar }) else { return }
-            image = try? await model.image(for: metadata, in: source.message)
+            image = try? await model.image(for: metadata, in: source)
         }
     }
 }
@@ -209,7 +210,7 @@ struct ConversationView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 18) {
-                    Text(model.isDemo ? "演示数据" : "消息内容端到端加密").font(.caption2).foregroundStyle(.tertiary).padding(.top, 18)
+                    Text(model.isDemo ? "演示数据" : "\(messages.last?.source.label ?? friend?.source.label ?? model.sourceLabel) · 消息内容端到端加密").font(.caption2).foregroundStyle(.tertiary).padding(.top, 18)
                     if model.hasMore { Button("加载更早的消息") { Task { await model.loadOlder() } }.font(.footnote) }
                     ForEach(timeline, id: \.id) { entry in
                         if let item = entry.incoming {
@@ -220,7 +221,7 @@ struct ConversationView: View {
                                     VStack(alignment: .leading, spacing: 10) {
                                         Text(item.preview.body).textSelection(.enabled).font(.body).lineSpacing(4)
                                         ForEach(item.message.assets.filter { $0.kind != .avatar }) { asset in
-                                            MessageImageView(metadata: asset, message: item.message)
+                                            MessageImageView(metadata: asset, item: item)
                                         }
                                     }.padding(14).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
                                 }
@@ -278,10 +279,10 @@ struct ConversationView: View {
                         .opacity(!canSend || draft.isEmpty ? 0.4 : 1).accessibilityLabel("发送回复")
                 }
                 if !canSend && friend != nil {
-                    Text("请更新小米 Relay 并重新同步一次好友, 即可主动发送消息.").font(.caption).foregroundStyle(.secondary)
+                    Text("此来源尚未提供主动发送能力. 请更新来源端并重新同步好友.").font(.caption).foregroundStyle(.secondary)
                 }
                 if draft.count > 1_000 { Text("回复最多 1000 字").font(.caption).foregroundStyle(.red) }
-                Text("已发往微信表示 Android 已执行发送, 不代表对方已读.").font(.caption2).foregroundStyle(.secondary)
+                Text("已发往微信表示来源端已执行发送, 不代表对方已读.").font(.caption2).foregroundStyle(.secondary)
             }.padding(.horizontal, 16).padding(.vertical, 10).background(.bar)
         }
     }
@@ -300,7 +301,7 @@ struct ConversationView: View {
 struct MessageImageView: View {
     @EnvironmentObject private var model: RelayAppModel
     let metadata: RelayAssetMetadata
-    let message: RelayMessage
+    let item: InboxItem
     @State private var image: UIImage?
     @State private var failed = false
     @State private var attempt = 0
@@ -316,7 +317,7 @@ struct MessageImageView: View {
             } else { ProgressView().frame(width: 170, height: 100) }
         }
         .task(id: attempt) {
-            do { image = try await model.image(for: metadata, in: message) }
+            do { image = try await model.image(for: metadata, in: item) }
             catch { failed = true }
         }
         .fullScreenCover(isPresented: $expanded) { if let image { ImageViewer(image: image) } }

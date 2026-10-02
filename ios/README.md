@@ -53,3 +53,26 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -project ios
 build 5 固定 v3/v4 加密前 JSON 字段顺序, 兼容 Android 现有解析器. Android 0.6.30 的联系人发送会区分锁屏自动化未就绪和等待微信窗口超时, 不再统一显示为不支持通知回复; 保护触发后需在小米处理, 不自动解除保护或重发.
 
 安装成功不等于真实收发成功. 真机需分别验收配对、前台同步、锁屏通知、预览关闭、快捷回复、Android 微信实际执行、断网恢复和双微信. `已发往微信` 不代表接收方已读.
+
+## 平板 / 小米手机 / 混合来源
+
+顶部 `消息来源` 菜单提供 `平板`, `小米手机`, `混合`, 首次默认平板, 之后保留本机选择. 未连接的平板显示配对入口, 不会把旧小米连接当成平板. 切到小米可继续查看旧记录. 两个来源分别生成配对码: 小米在 Android Relay 导入, 平板由已配置的平板接入端导入; iPhone 本身不实现微信 iPad 协议登录.
+
+每个来源独立保存 session, pending pairing, 通知预览设置, 消息密钥, 回复密钥, 加密缓存, 翻页/SSE 游标和服务端转发策略. 同一 APNs device token 可分别注册到两个 iOS session. 混合模式按时间合并显示, 来源标签始终保留, 同名联系人不会合并. 会话 ID 包含来源, pairId, 微信空间及名称, 回复, 主动联系, 附件请求和重试只路由至原来源. 设置中的混合管理入口要求先选一个来源再修改其配置或断开配对.
+
+升级时只把旧 `session`, `pending-pairing`, `preview-enabled` 和 `inbox.sealed` 迁入小米来源. 先复制 Keychain/缓存, 成功后删除旧 session 入口, 重启不会复活已断开的配对. 新缓存名包含来源与 pairId, 原 AES-GCM AAD 与密钥不变; 历史会话及已读游标加载时增加命名空间. 冲突或读取失败保留已有内容并提示错误. 不重新配对小米, 不删除另一来源.
+
+只有所选来源运行前台 SSE/轮询并注册 APNs, 切换后注销非所选来源的 token, 中继采集仍继续. 同步推送注册失败会保留错误并重试. 已在途/已送达通知无法从服务端撤回, NSE 不具备可靠静默丢弃 alert 的能力: 非所选来源仍可能短暂收到无内容提醒. 重新选择来源可能收到服务端排队的补推. NSE 按 payload `pairId` 唯一匹配 session, 未知或冲突 pair 不解密; 预览仍同时要求来源选择, 本机预览开关及 payload 预览许可. 通知点击和已送达通知的快捷回复始终沿原 pair 路由.
+
+### 构建与验收接手
+
+Mac 若有尚未推送的 build 6 或其他本地改动, 先保存这些改动再集成本次差异, 不直接覆盖目录. 本次从当前仓库已有 iOS 源码修改, 没有改 App 版本号, 签名或部署生产服务. 从仓库根目录执行:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --package-path ios
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -project ios/AuroraRelay.xcodeproj -scheme AuroraRelay -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGN_IDENTITY=- test
+```
+
+新增 `RelaySourceTests` 覆盖默认选择, 同名会话隔离, 未知/歧义通知路由, 旧 Keychain 与缓存迁移及迁移冲突保留. UI 测试在 `--demo` 的两个独立虚构来源中发送不同回复, 验证切换隔离, 混合双会话和切回记录. 演示不访问服务或保存真实配对, 不能替代真实消息收发验收.
+
+当前 Linux 环境没有 Swift/Xcode, 上述测试和 iOS 编译尚未在此环境运行. Mac/CI 构建后还需真机验证: 旧版升级保留小米历史, 平板独立配对, 混合同名好友分别回复/附件, 各来源通知预览与快捷回复, 切换时离线后恢复, 双来源分别断开和重新配对. 平板接入端是否已完成真实登录, 采集, 联系人和发送能力需独立验收; iPhone 不伪造这些来源端能力.

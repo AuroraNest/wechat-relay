@@ -6,10 +6,12 @@ import SwiftUI
 import UserNotifications
 
 struct InboxItem: Identifiable {
+    let source: RelaySource
+    let pairID: String
     let message: RelayMessage
     let preview: RelayPreview
     var id: UUID { message.id }
-    var conversationID: String { "\(message.wechatUserId):\(preview.sender)" }
+    var conversationID: String { source.conversationID(pairID: pairID, profile: message.wechatUserId, name: preview.sender) }
 }
 
 struct Conversation: Identifiable {
@@ -21,17 +23,19 @@ struct Conversation: Identifiable {
 }
 
 struct RelayFriend: Identifiable, Hashable {
+    let source: RelaySource
+    let pairID: String
     let name: String
     let wechatUserId: Int
     let capturedAt: Int64
 
-    var id: String { "\(wechatUserId):\(name)" }
+    var id: String { source.conversationID(pairID: pairID, profile: wechatUserId, name: name) }
     var profileLabel: String { wechatUserId == 999 ? "微信 2" : "微信" }
 }
 
 struct OutgoingMessage: Codable, Identifiable {
     let request: RelayReplyRequest
-    let conversationID: String
+    var conversationID: String
     let body: String
     var status: RelayReplyStatus
     var id: UUID { request.id }
@@ -75,8 +79,9 @@ private struct InboxSnapshot: Codable {
 }
 
 @MainActor
-final class RelayAppModel: ObservableObject {
-    static let shared = RelayAppModel()
+final class RelayConnectionModel: ObservableObject {
+    let source: RelaySource
+    private var pushSelected = false
     static let keychainService = "com.auroramaple.wechatrelay"
     static var keychainGroup: String? { Bundle.main.object(forInfoDictionaryKey: "RelayKeychainAccessGroup") as? String }
 
@@ -109,15 +114,17 @@ final class RelayAppModel: ObservableObject {
     private var refreshRequested = false
     private var apnsToken: String?
     private var pushDirty = true
+    private var pushUpdating = false
     private var nextCursor: Int?
     private var cacheReadable = true
     private var lastStatusCheck = Date.distantPast
     private var submitting = Set<UUID>()
     private var imageCache = NSCache<NSString, UIImage>()
 
-    private init() {
+    init(source: RelaySource, demo: Bool) {
+        self.source = source
         #if DEBUG
-        isDemo = ProcessInfo.processInfo.arguments.contains("--demo")
+        isDemo = demo
         #else
         isDemo = false
         #endif
@@ -127,6 +134,7 @@ final class RelayAppModel: ObservableObject {
             return
         }
         do {
+            if source == .phone { try migrateLegacyStorage() }
             session = try loadSecret(RelaySession.self, account: "session")
             pairing = try loadSecret(RelayPairing.self, account: "pending-pairing")
             previewEnabled = try loadSecret(Bool.self, account: "preview-enabled") ?? false
@@ -139,6 +147,7 @@ final class RelayAppModel: ObservableObject {
     }
 
     var conversations: [Conversation] {
+        guard let session else { return [] }
         let incoming = Dictionary(grouping: items, by: \.conversationID)
         let sent = Dictionary(grouping: outgoing, by: \.conversationID)
         return Set(incoming.keys).union(sent.keys).compactMap { id in
@@ -146,10 +155,10 @@ final class RelayAppModel: ObservableObject {
             let latest = values.max(by: { $0.message.seq < $1.message.seq })
             let reply = sent[id]?.max(by: { $0.request.createdAt < $1.request.createdAt })
             guard let profile = latest?.message.wechatUserId ?? reply?.request.wechatUserId else { return nil }
-            let title = latest?.preview.sender ?? String(id.dropFirst("\(profile):".count))
+            let title = latest?.preview.sender ?? String(id.dropFirst("\(source.rawValue):\(session.pairId):\(profile):".count))
             let useReply = (reply?.request.createdAt ?? 0) >= (latest?.message.createdAt ?? 0)
             let time = useReply ? reply!.request.createdAt : latest!.message.createdAt
-            return Conversation(id: id, friend: RelayFriend(name: title, wechatUserId: profile, capturedAt: time), body: useReply ? reply!.body : latest!.preview.body, createdAt: time, unread: values.filter { $0.message.seq > (snapshot.readThrough[id] ?? 0) }.count)
+            return Conversation(id: id, friend: RelayFriend(source: source, pairID: session.pairId, name: title, wechatUserId: profile, capturedAt: time), body: useReply ? reply!.body : latest!.preview.body, createdAt: time, unread: values.filter { $0.message.seq > (snapshot.readThrough[id] ?? 0) }.count)
         }.sorted { $0.createdAt > $1.createdAt }
     }
 
@@ -160,7 +169,7 @@ final class RelayAppModel: ObservableObject {
     var stateTitle: String {
         if isDemo { return "演示模式 · 虚构数据" }
         if problem != nil { return "连接需要检查" }
-        if device?.paired != true { return "等待 Android 配对" }
+        if device?.paired != true { return "等待\(source.label)配对" }
         return policy.active ? "转发中" : "已暂停转发"
     }
 
@@ -286,9 +295,8 @@ final class RelayAppModel: ObservableObject {
                 policy = currentPolicy
             }
             if pushDirty {
-                try await api.updatePush(session: session, token: apnsToken, environment: pushEnvironment, previewEnabled: previewEnabled)
+                try await reconcilePush()
                 guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
-                pushDirty = false
                 let currentDevice = try await api.deviceStatus(session: session)
                 guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
                 device = currentDevice
@@ -371,7 +379,7 @@ final class RelayAppModel: ObservableObject {
             unique[message.id] = message
         }
         snapshot.messages = unique.values.sorted { $0.seq < $1.seq }
-        items = try snapshot.messages.map { InboxItem(message: $0, preview: try RelayCrypto.decryptPreview($0, messageKey: session.messageKey)) }
+        items = try snapshot.messages.map { InboxItem(source: source, pairID: session.pairId, message: $0, preview: try RelayCrypto.decryptPreview($0, messageKey: session.messageKey)) }
     }
 
     private func mergeContacts(_ incoming: [RelayContactSnapshot], currentDeviceID: String, session: RelaySession) throws {
@@ -411,8 +419,9 @@ final class RelayAppModel: ObservableObject {
     }
 
     private func refreshFriends() {
+        guard let session else { friends = []; return }
         friends = snapshot.contacts.flatMap { snapshot in
-            snapshot.contacts.map { RelayFriend(name: $0.name, wechatUserId: snapshot.wechatUserId, capturedAt: snapshot.capturedAt) }
+            snapshot.contacts.map { RelayFriend(source: source, pairID: session.pairId, name: $0.name, wechatUserId: snapshot.wechatUserId, capturedAt: snapshot.capturedAt) }
         }.sorted {
             let comparison = $0.name.localizedStandardCompare($1.name)
             if comparison == .orderedSame { return $0.wechatUserId < $1.wechatUserId }
@@ -421,7 +430,8 @@ final class RelayAppModel: ObservableObject {
     }
 
     func canSend(to friend: RelayFriend) -> Bool {
-        snapshot.contacts.contains { $0.version == 2 && $0.deviceId == device?.deviceId && $0.wechatUserId == friend.wechatUserId && $0.contacts.contains(where: { $0.name == friend.name }) }
+        guard friend.source == source, friend.pairID == session?.pairId else { return false }
+        return snapshot.contacts.contains { $0.version == 2 && $0.deviceId == device?.deviceId && $0.wechatUserId == friend.wechatUserId && $0.contacts.contains(where: { $0.name == friend.name }) }
     }
 
     func avatarItem(for friend: RelayFriend) -> InboxItem? {
@@ -435,7 +445,7 @@ final class RelayAppModel: ObservableObject {
     }
 
     func send(_ body: String, to target: InboxItem) async throws {
-        guard let session else { throw RelayError.invalidValue("session") }
+        guard let session, target.source == source, target.pairID == session.pairId else { throw RelayError.invalidValue("session") }
         let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
         let request = try RelayCrypto.makeReply(session: session, target: target.message, body: text)
         let pending = OutgoingMessage(request: request, conversationID: target.conversationID, body: text, status: .submitting)
@@ -467,7 +477,7 @@ final class RelayAppModel: ObservableObject {
     }
 
     private func submit(_ reply: OutgoingMessage) async {
-        guard let session, !submitting.contains(reply.id) else { return }
+        guard let session, source.owns(reply.conversationID, pairID: session.pairId), !submitting.contains(reply.id) else { return }
         submitting.insert(reply.id)
         defer { submitting.remove(reply.id) }
         do {
@@ -588,31 +598,70 @@ final class RelayAppModel: ObservableObject {
         do { try saveCache() } catch { snapshot = previous; cacheReadable = wasReadable; throw error }
         items = []; outgoing = []; imageCache.removeAllObjects(); hasMore = false
         problem = nil
-        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+        removeDeliveredNotifications()
     }
 
     func disconnect() throws {
         stop()
         if !isDemo {
+            let file = try cacheURL()
             try deleteSecret(account: "session")
             try deleteSecret(account: "pending-pairing")
-            if let file = try? cacheURL(), FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+            if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
         }
+        removeDeliveredNotifications()
         session = nil; pairing = nil; device = nil
         isDemo = false
         snapshot = InboxSnapshot(); items = []; outgoing = []; friends = []; conversationPath = []
         contactsAvailable = nil; contactsProblem = nil
         imageCache.removeAllObjects(); problem = nil; cacheReadable = true
         lastStatusCheck = .distantPast
-        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
-        start()
     }
 
     func disablePushAndDisconnect() async throws {
-        if !isDemo, let session {
-            try await RelayAPI(origin: session.origin).updatePush(session: session, token: nil, environment: pushEnvironment, previewEnabled: false)
+        if !isDemo {
+            pushSelected = false
+            pushDirty = true
+            while pushUpdating { try await Task.sleep(for: .milliseconds(50)) }
+            try await reconcilePush()
         }
         try disconnect()
+    }
+
+    private func removeDeliveredNotifications() {
+        guard let pairID = session?.pairId else { return }
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { notifications in
+            center.removeDeliveredNotifications(withIdentifiers: notifications.filter { $0.request.content.userInfo["pairId"] as? String == pairID }.map { $0.request.identifier })
+        }
+    }
+
+    func setPushSelected(_ selected: Bool) async {
+        if pushSelected != selected { pushSelected = selected; pushDirty = true }
+        do { try await reconcilePush() } catch { problem = Self.describe(error) }
+    }
+
+    private func reconcilePush() async throws {
+        guard !isDemo, cacheReadable, !pushUpdating else { return }
+        pushUpdating = true
+        defer { pushUpdating = false }
+        while pushDirty, let session {
+            let selected = pushSelected
+            let token = apnsToken
+            let preview = previewEnabled
+            try await RelayAPI(origin: session.origin).updatePush(session: session, token: selected ? token : nil, environment: pushEnvironment, previewEnabled: selected && preview)
+            guard self.session?.pairId == session.pairId else { return }
+            if selected == pushSelected, token == apnsToken, preview == previewEnabled { pushDirty = false }
+        }
+    }
+
+    private func secretAccount(_ account: String) -> String {
+        account == "apns-token" ? account : source.account(account)
+    }
+
+    private func migrateLegacyStorage() throws {
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        try RelayStorageMigration.migrateLegacyPhone(service: Self.keychainService, accessGroup: Self.keychainGroup, directory: directory)
     }
 
     private var pushEnvironment: RelayPushEnvironment {
@@ -620,18 +669,19 @@ final class RelayAppModel: ObservableObject {
     }
 
     private func loadSecret<T: Decodable>(_ type: T.Type, account: String) throws -> T? {
-        try RelayKeychain.load(type, account: account, service: Self.keychainService, accessGroup: Self.keychainGroup)
+        try RelayKeychain.load(type, account: secretAccount(account), service: Self.keychainService, accessGroup: Self.keychainGroup)
     }
     private func saveSecret<T: Encodable>(_ value: T, account: String) throws {
-        try RelayKeychain.save(value, account: account, service: Self.keychainService, accessGroup: Self.keychainGroup)
+        try RelayKeychain.save(value, account: secretAccount(account), service: Self.keychainService, accessGroup: Self.keychainGroup)
     }
     private func deleteSecret(account: String) throws {
-        try RelayKeychain.delete(account: account, service: Self.keychainService, accessGroup: Self.keychainGroup)
+        try RelayKeychain.delete(account: secretAccount(account), service: Self.keychainService, accessGroup: Self.keychainGroup)
     }
 
     private func cacheURL() throws -> URL {
         let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-        return directory.appendingPathComponent("inbox.sealed")
+        guard let session else { throw RelayError.invalidValue("session") }
+        return directory.appendingPathComponent("inbox-\(source.rawValue)-\(session.pairId).sealed")
     }
 
     private func restoreCache() throws {
@@ -641,6 +691,11 @@ final class RelayAppModel: ObservableObject {
         let box = try AES.GCM.SealedBox(combined: Data(contentsOf: url))
         let data = try AES.GCM.open(box, using: SymmetricKey(data: session.messageKey), authenticating: Data("AWR1|IOS_CACHE|\(session.pairId)".utf8))
         snapshot = try JSONDecoder().decode(InboxSnapshot.self, from: data)
+        let prefix = "\(source.rawValue):\(session.pairId):"
+        snapshot.readThrough = Dictionary(uniqueKeysWithValues: snapshot.readThrough.map { ($0.key.hasPrefix(prefix) ? $0.key : prefix + $0.key, $0.value) })
+        for index in snapshot.outgoing.indices where !snapshot.outgoing[index].conversationID.hasPrefix(prefix) {
+            snapshot.outgoing[index].conversationID = prefix + snapshot.outgoing[index].conversationID
+        }
         try merge([])
         refreshFriends()
         outgoing = snapshot.outgoing
@@ -674,7 +729,7 @@ final class RelayAppModel: ObservableObject {
 
     private func loadDemo() {
         do {
-            session = try RelaySession(origin: URL(string: "https://example.invalid")!, ackToken: "demo", pairId: UUID().uuidString, messageKey: Data(repeating: 7, count: 32), replyKey: Data(repeating: 9, count: 32))
+            session = try RelaySession(origin: URL(string: "https://example.invalid")!, ackToken: "demo", pairId: UUID().uuidString, messageKey: Data(repeating: source == .tablet ? 11 : 7, count: 32), replyKey: Data(repeating: source == .tablet ? 13 : 9, count: 32))
             guard let session else { return }
             let rows = [("林一", "收到, 我下午确认后回复你.", 0), ("产品讨论组", "新版的页面已经整理好了, 大家看一下.", 0), ("小周", "[语音转文字] 明天十点见, 还是老地方.", 999), ("设计协作", "这版留白很舒服, 可以继续往下做了.", 0), ("陈默", "[聊天记录] 这里有 3 条合并转发的消息.", 0), ("文件传输助手", "下午的会议资料已收到.", 0)]
             for (index, row) in rows.enumerated().reversed() {

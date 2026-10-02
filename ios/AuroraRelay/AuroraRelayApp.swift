@@ -11,9 +11,19 @@ struct AuroraRelayApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                if model.session == nil { WelcomeView() }
-                else if model.pairing != nil { PairingView() }
+                if model.selectedSource != .mixed && model.session == nil { WelcomeView() }
+                else if model.selectedSource != .mixed && model.pairing != nil { PairingView() }
                 else { RelayTabs() }
+            }
+            .id(model.selectedSource)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                HStack {
+                    Text("消息来源").font(.subheadline).foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("消息来源", selection: Binding(get: { model.selectedSource }, set: model.selectSource)) {
+                        ForEach(RelaySourceSelection.allCases, id: \.self) { source in Text(source.label).tag(source) }
+                    }.pickerStyle(.menu).accessibilityIdentifier("source-picker")
+                }.padding(.horizontal, 20).padding(.vertical, 6).background(.bar)
             }
             .environmentObject(model)
             .tint(Color.relayGreen)
@@ -68,8 +78,12 @@ final class RelayAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificatio
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        Task { @MainActor in await RelayAppModel.shared.refresh() }
-        completionHandler([.banner, .sound])
+        Task { @MainActor in
+            let model = RelayAppModel.shared
+            let accepted = model.acceptsNotification(notification.request.content.userInfo)
+            if accepted { await model.refresh() }
+            completionHandler(accepted ? [.banner, .sound] : [])
+        }
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {

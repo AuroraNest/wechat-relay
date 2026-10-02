@@ -41,3 +41,31 @@ public enum RelayKeychain {
 
     private static func keychainError(_ status: OSStatus) -> RelayError { .invalidValue("Keychain error \(status)") }
 }
+
+public enum RelayStorageMigration {
+    public static func migrateLegacyPhone(service: String, accessGroup: String? = nil, directory: URL) throws {
+        guard let legacy = try RelayKeychain.load(RelaySession.self, account: "session", service: service, accessGroup: accessGroup) else { return }
+        let account = RelaySource.phone.account("session")
+        let existing = try RelayKeychain.load(RelaySession.self, account: account, service: service, accessGroup: accessGroup)
+        guard existing == nil || existing == legacy else { throw RelayError.invalidValue("legacy pairing conflict") }
+        try RelayKeychain.save(legacy, account: account, service: service, accessGroup: accessGroup)
+        if let pending = try RelayKeychain.load(RelayPairing.self, account: "pending-pairing", service: service, accessGroup: accessGroup) {
+            guard pending.pairId == legacy.pairId else { throw RelayError.invalidValue("legacy pairing conflict") }
+            try RelayKeychain.save(pending, account: RelaySource.phone.account("pending-pairing"), service: service, accessGroup: accessGroup)
+        }
+        let previewAccount = RelaySource.phone.account("preview-enabled")
+        if let preview = try RelayKeychain.load(Bool.self, account: "preview-enabled", service: service, accessGroup: accessGroup),
+           try RelayKeychain.load(Bool.self, account: previewAccount, service: service, accessGroup: accessGroup) == nil {
+            try RelayKeychain.save(preview, account: previewAccount, service: service, accessGroup: accessGroup)
+        }
+        let old = directory.appendingPathComponent("inbox.sealed")
+        let new = directory.appendingPathComponent("inbox-phone-\(legacy.pairId).sealed")
+        if FileManager.default.fileExists(atPath: old.path), !FileManager.default.fileExists(atPath: new.path) {
+            try FileManager.default.copyItem(at: old, to: new)
+        }
+        // Copies precede deletion. A failed attempt preserves the legacy keys for a safe retry.
+        try RelayKeychain.delete(account: "pending-pairing", service: service, accessGroup: accessGroup)
+        try RelayKeychain.delete(account: "session", service: service, accessGroup: accessGroup)
+        if FileManager.default.fileExists(atPath: old.path) { try FileManager.default.removeItem(at: old) }
+    }
+}

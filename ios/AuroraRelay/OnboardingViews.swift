@@ -13,7 +13,7 @@ struct WelcomeView: View {
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 12) {
                     Text("工作微信,\n随身就好.").font(.system(size: 36, weight: .bold))
-                    Text("Android 留在原处.\n在 iPhone 上收消息、看图片、回一句.")
+                    Text("\(model.sourceLabel)尚未连接.\n配对后在 iPhone 上收消息、看图片、回一句.")
                         .font(.title3).foregroundStyle(.secondary).lineSpacing(5)
                 }
                 Label("消息内容端到端加密", systemImage: "lock.shield").font(.subheadline).foregroundStyle(.secondary)
@@ -23,9 +23,9 @@ struct WelcomeView: View {
                     Text("连接我的设备").font(.headline).frame(maxWidth: .infinity).padding(.vertical, 8)
                 }.buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
                 #if DEBUG
-                Button("浏览界面演示") { model.enterDemo() }.frame(maxWidth: .infinity)
+                Button("浏览界面演示") { model.enterDemo() }.frame(maxWidth: .infinity).disabled(!model.canEnterDemo)
                 #endif
-                Text("连接你自己的中继服务和 Android 微信.").font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity)
+                Text("每个来源独立配对. 可从顶部切回已连接的来源.").font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity)
             }.padding(28)
                 .sheet(isPresented: $showConnection) { ConnectionView() }
         }
@@ -51,11 +51,11 @@ struct ConnectionView: View {
                     Text("填服务根地址和管理员提供的接入令牌. 令牌仅用于创建本次配对.")
                 }
                 Section {
-                    Label("准备好 Android", systemImage: "iphone.and.arrow.forward")
-                    Text("下一步会生成一段配对码. 在 Android 中继 App 中粘贴, 完成连接.").foregroundStyle(.secondary)
+                    Label("准备好\(model.sourceLabel)", systemImage: "iphone.and.arrow.forward")
+                    Text("下一步会生成配对码. 小米手机在 Relay App 中粘贴; 平板来源由已配置的平板接入端导入配对码.").foregroundStyle(.secondary)
                 }
                 Section {
-                    Text("原生 App 会建立新的配对. Android 切换配对后, 原 PWA 不再接收新消息; 原来的网页历史不会迁入本机.")
+                    Text("当前来源会建立独立配对, 其他来源不受影响. 来源端切换配对后, 原 PWA 不再接收新消息; 网页历史不会迁入本机.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 if let error { Section { Text(error).foregroundStyle(.red) } }
@@ -88,8 +88,8 @@ struct PairingView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     Image(systemName: "iphone.gen3.radiowaves.left.and.right").font(.system(size: 52)).foregroundStyle(Color.relayGreen).padding(.top, 30)
-                    Text("现在, 连上 Android.").font(.largeTitle.bold())
-                    Text("复制配对码, 发送到你自己的 Android, 在中继 App 的配对页面粘贴.").foregroundStyle(.secondary)
+                    Text("现在, 连上\(model.sourceLabel).").font(.largeTitle.bold())
+                    Text("复制配对码, 在对应来源的 Relay App 或平板接入端导入. 两个来源不能共用同一配对码.").foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 14) {
                         Label("配对码包含密钥, 请勿分享给他人", systemImage: "key.horizontal")
                         TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -108,7 +108,7 @@ struct PairingView: View {
                             }
                         }
                     }.font(.subheadline).padding(20).frame(maxWidth: .infinity, alignment: .leading).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 20))
-                    HStack { ProgressView(); Text("等待 Android 完成配对...").foregroundStyle(.secondary) }
+                    HStack { ProgressView(); Text("等待\(model.sourceLabel)完成配对...").foregroundStyle(.secondary) }
                     if let problem = model.problem { Text(problem).font(.footnote).foregroundStyle(.red) }
                     Button("开启系统通知") { Task { await model.requestNotifications() } }.buttonStyle(.bordered)
                     Text("可以稍后开启通知. App 在前台时仍可同步消息.").font(.footnote).foregroundStyle(.secondary)
@@ -120,7 +120,7 @@ struct PairingView: View {
                     Button("取消连接", role: .destructive) {
                         do { try model.disconnect() } catch { model.problem = RelayAppModel.describe(error) }
                     }
-                } message: { Text("已生成的配对码将自然过期. 如果 Android 已使用它, 请在 Android 上重新配对.") }
+                } message: { Text("已生成的配对码将自然过期. 如果来源端已使用它, 请在该来源端重新配对.") }
         }
     }
 }

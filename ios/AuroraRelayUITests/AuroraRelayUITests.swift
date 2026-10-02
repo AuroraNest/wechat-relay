@@ -50,7 +50,7 @@ final class AuroraRelayUITests: XCTestCase {
         app.navigationBars.buttons.firstMatch.tap()
         app.tabBars.buttons["设置"].tap()
         app.staticTexts["设备与连接"].tap()
-        XCTAssertTrue(app.staticTexts["Android 已配对"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["来源已配对"].waitForExistence(timeout: 3))
         app.staticTexts["连接诊断"].tap()
         XCTAssertTrue(app.staticTexts["设备配对"].waitForExistence(timeout: 3))
         attachScreenshot("设备诊断")
@@ -95,6 +95,43 @@ final class AuroraRelayUITests: XCTestCase {
         XCTAssertTrue(friend.waitForExistence(timeout: 3))
         friend.tap()
         XCTAssertTrue(app.textFields["输入回复"].waitForExistence(timeout: 3))
+    }
+
+    func testSourceSwitchKeepsRepliesIsolatedAndMixedShowsBoth() {
+        app.staticTexts["林一"].firstMatch.tap()
+        let reply = app.textFields["输入回复"]
+        XCTAssertTrue(reply.waitForExistence(timeout: 3))
+        reply.tap()
+        reply.typeText("Tablet route only")
+        app.buttons["发送回复"].tap()
+        XCTAssertTrue(app.staticTexts["Tablet route only"].waitForExistence(timeout: 3))
+
+        selectSource("小米手机")
+        XCTAssertFalse(app.staticTexts["Tablet route only"].exists)
+        app.staticTexts["林一"].firstMatch.tap()
+        XCTAssertFalse(app.staticTexts["Tablet route only"].exists)
+        XCTAssertTrue(reply.waitForExistence(timeout: 3))
+        reply.tap()
+        reply.typeText("Phone route only")
+        app.buttons["发送回复"].tap()
+        XCTAssertTrue(app.staticTexts["Phone route only"].waitForExistence(timeout: 3))
+
+        selectSource("混合")
+        XCTAssertTrue(app.staticTexts["Tablet route only"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["Phone route only"].waitForExistence(timeout: 3))
+        XCTAssertEqual(app.staticTexts["林一"].count, 2)
+        attachScreenshot("混合来源独立会话")
+
+        selectSource("平板")
+        XCTAssertTrue(app.staticTexts["Tablet route only"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.staticTexts["Phone route only"].exists)
+    }
+
+    private func selectSource(_ label: String) {
+        let picker = app.buttons["source-picker"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 3))
+        picker.tap()
+        app.buttons[label].firstMatch.tap()
     }
 
     private func attachScreenshot(_ name: String) {

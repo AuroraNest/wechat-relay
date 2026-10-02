@@ -8,8 +8,8 @@ struct DevicesView: View {
             Section {
                 VStack(alignment: .leading, spacing: 18) {
                     Image(systemName: "iphone.gen3.radiowaves.left.and.right").font(.system(size: 38, weight: .light)).foregroundStyle(Color.relayGreen)
-                    Text("工作微信").font(.title2.bold())
-                    Label(model.device?.paired == true ? "Android 已配对" : "正在检查连接", systemImage: model.device?.paired == true ? "checkmark.circle.fill" : "ellipsis.circle").foregroundStyle(Color.relayGreen).font(.subheadline)
+                    Text(model.sourceLabel).font(.title2.bold())
+                    Label(model.device?.paired == true ? "来源已配对" : "正在检查连接", systemImage: model.device?.paired == true ? "checkmark.circle.fill" : "ellipsis.circle").foregroundStyle(Color.relayGreen).font(.subheadline)
                     if let seen = model.device?.lastSeenAt {
                         LabeledContent("最近联系", value: Date(timeIntervalSince1970: Double(seen) / 1_000).formatted(date: .abbreviated, time: .shortened)).font(.footnote).foregroundStyle(.secondary)
                     }
@@ -43,11 +43,11 @@ struct DiagnosticsView: View {
             Section {
                 Button { Task { await model.refreshNotificationPermission(); await model.refresh() } } label: {
                     HStack { Text("重新检查"); Spacer(); if model.isRefreshing { ProgressView() } }
-                }.disabled(model.isRefreshing)
+                }.disabled(model.isRefreshing || model.selectedSource == .mixed)
             }
             Section("收不到消息时") {
-                Label("确认 Android 中继仍在运行, 并且能访问服务.", systemImage: "1.circle")
-                Label("在 Android 上检查通知读取权限、无障碍和电池限制.", systemImage: "2.circle")
+                Label("确认当前来源的中继仍在运行, 并且能访问服务.", systemImage: "1.circle")
+                Label("小米检查权限和电池限制; 平板来源检查登录状态与接入端同步.", systemImage: "2.circle")
                 Label("检查转发时间段, 暂停期间的新消息不会补发.", systemImage: "3.circle")
                 Label("在 iPhone 系统设置中允许通知, 并检查专注模式.", systemImage: "4.circle")
             }.font(.subheadline)
@@ -69,18 +69,27 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 5) { Text("Relay").font(.title2.bold()); Text("工作微信, 随身就好.").font(.subheadline).foregroundStyle(.secondary) }
                 }.padding(.vertical, 8)
             }
+            if model.selectedSource == .mixed {
+                Section("分别管理来源") {
+                    ForEach(RelaySource.allCases, id: \.self) { source in
+                        Button("管理" + source.label) { model.selectSource(source == .tablet ? .tablet : .phone) }
+                    }
+                    Text("转发时段、通知预览和断开配对按来源独立保存. 选择一个来源后修改.").font(.footnote).foregroundStyle(.secondary)
+                }
+            }
             Section {
                 NavigationLink { RelayPolicyView() } label: { Label("转发与时间段", systemImage: "clock") }
                 NavigationLink { NotificationSettingsView() } label: { Label("通知与隐私", systemImage: "bell.badge") }
                 NavigationLink { DevicesView() } label: { Label("设备与连接", systemImage: "iphone.gen3.radiowaves.left.and.right") }
             }
+            .disabled(model.selectedSource == .mixed)
             Section {
                 Button { clear = true } label: { Label("清空本机记录", systemImage: "trash") }
                 NavigationLink { AboutView() } label: { Label("关于 Relay", systemImage: "info.circle") }
             }
             Section {
-                Button("断开并重新配对", role: .destructive) { disconnect = true }.disabled(model.isRefreshing)
-            } footer: { Text("只影响本机连接. Android 和微信中的记录不会被删除.") }
+                Button("断开并重新配对", role: .destructive) { disconnect = true }.disabled(model.isRefreshing || model.selectedSource == .mixed)
+            } footer: { Text("只断开当前来源. 另一来源的配对和记录会保留, 微信记录不会被删除.") }
             if let error { Section { Text(error).foregroundStyle(.red) } }
         }.navigationTitle("设置")
             .confirmationDialog("清空本机记录?", isPresented: $clear, titleVisibility: .visible) {
@@ -106,7 +115,7 @@ struct RelayPolicyView: View {
         Form {
             Section {
                 Toggle("接收转发", isOn: $enabled)
-            } footer: { Text("关闭或不在时间段内时, Android 不转发新消息. 之后恢复不会补发暂停期间的消息.") }
+            } footer: { Text("关闭或不在时间段内时, 当前来源不转发新消息. 之后恢复不会补发暂停期间的消息.") }
             Section {
                 Toggle("仅在指定时间转发", isOn: $scheduled)
                 if scheduled {
