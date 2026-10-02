@@ -1,0 +1,20 @@
+[Unit]
+Description=Aurora tablet read-only WeChat collector
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/.local/share/aurora-tablet-relay/device.json
+
+[Service]
+Type=simple
+UMask=0077
+ExecStart=/usr/bin/python3 %h/Aurora/wechat-ipad-relay-research/relay-tablet/spikes/tablet-original-sync/collector.py run --silk-decoder %h/.local/share/aurora-tablet-relay-tools/decoder --reader-command /bin/bash %h/Aurora/wechat-ipad-relay-research/android-pad-probe/guest-ssh.sh python3 /home/probe/tablet-original-sync/source_reader.py
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=20
+MemoryMax=512M
+CPUQuota=100%
+NoNewPrivileges=true
+LimitCORE=0
+
+[Install]
+WantedBy=default.target

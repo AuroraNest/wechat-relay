@@ -82,6 +82,7 @@ struct ConnectionView: View {
 struct PairingView: View {
     @EnvironmentObject private var model: RelayAppModel
     @State private var copied = false
+    @State private var copiedToOtherDevices = false
     @State private var cancel = false
     var body: some View {
         NavigationStack {
@@ -97,12 +98,15 @@ struct PairingView: View {
                             if expiration > context.date {
                                 Text("有效期至 \(expiration.formatted(date: .omitted, time: .shortened))").foregroundStyle(.secondary)
                                 Button(copied ? "已复制" : "复制配对码") {
-                                    do {
-                                        guard let pairing = model.pairing else { return }
-                                        UIPasteboard.general.setItems([[UIPasteboard.typeAutomatic: try RelayCrypto.makePairingCode(pairing)]], options: [.localOnly: true, .expirationDate: expiration])
-                                        copied = true
-                                    } catch { model.problem = RelayAppModel.describe(error) }
+                                    copyPairingCode(localOnly: true, expiration: expiration)
                                 }.buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                                Button("复制到我的其他 Apple 设备") {
+                                    copyPairingCode(localOnly: false, expiration: expiration)
+                                }.buttonStyle(.bordered).buttonBorderShape(.capsule)
+                                if copiedToOtherDevices {
+                                    Text("已复制, 可尝试在本人其他 Apple 设备粘贴.").foregroundStyle(.secondary)
+                                }
+                                Text("仅供本人使用同一 Apple Account 且已开启 Handoff 的设备接力复制, 两端需打开 Wi-Fi 和蓝牙. 配对码包含密钥, 请勿粘贴到聊天.").font(.footnote).foregroundStyle(.secondary)
                             } else {
                                 Text("配对码已过期. 请返回重新连接.").foregroundStyle(.orange)
                             }
@@ -122,5 +126,15 @@ struct PairingView: View {
                     }
                 } message: { Text("已生成的配对码将自然过期. 如果来源端已使用它, 请在该来源端重新配对.") }
         }
+    }
+
+    private func copyPairingCode(localOnly: Bool, expiration: Date) {
+        guard let pairing = model.pairing else { return }
+        guard expiration > Date() else { model.problem = "配对码已过期. 请返回重新连接."; return }
+        do {
+            UIPasteboard.general.setItems([[UIPasteboard.typeAutomatic: try RelayCrypto.makePairingCode(pairing)]], options: [.localOnly: localOnly, .expirationDate: expiration])
+            copied = localOnly
+            copiedToOtherDevices = !localOnly
+        } catch { model.problem = RelayAppModel.describe(error) }
     }
 }

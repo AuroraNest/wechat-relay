@@ -1,48 +1,56 @@
-# 平板原始消息同步研究
+# 平板原始消息同步
 
-2026-10-02 的目标是从已登录的 Mini Android 平板微信读取原始消息和附件, 经 Relay 加密通道交给原生 iPhone 客户端. 包括原始语音, 不以转写, 截图或转发到共同群替代. 本目录记录研究结论, 尚无正式采集服务.
+从已登录的 Mini Android 平板微信只读采集消息和原附件, 通过 Relay v6 端到端加密通道交给原生 iPhone. 不把缩略图当原图, 不用语音转写替代音频. 当前适配的是 ARM64 QEMU guest / redroid 14 / 官方微信 8.0.78 的已验证实例, 不是所有微信版本的通用适配器.
 
-## 已取得的本地证据
+## 组件
 
-运行环境为 Mini 上 ARM64 QEMU guest 内的 redroid 14, 官方签名微信 8.0.78. 用户确认平板登录成功且手机和 Mac 会话保留. 长期在线和宿主重启恢复尚未验收.
+- `source_reader.py`: 在 guest 的私有 mount namespace 内建立只读视图. 源 DB/WAL/SHM 的可写打开应返回 EROFS, SQLCipher 4.5.6 使用 `mode=ro`, `query_only` 和短读事务. 不使用 `immutable=1`, 不 checkpoint/rekey, 不重启微信. 媒体路径拒绝 symlink, 校验大小, 文件签名和可用哈希.
+- `collector.py`: 在 Mini 保存私有 SQLite outbox, 使用稳定消息身份去重, 对未完成附件轮转回扫. 首次发送前持久化 seq 和密文, 重试复用同一密文. 遇到账号变化或已有消息身份冲突时停止该轮采集.
+- `audio_codec.py`: 原始 SILK 独立保留, 在受限子进程中生成 WAV 播放副本. 二者有不同 assetId, WAV 通过 `derivedFrom` 关联原件. 依赖说明见 [SILK-NOTICE.md](third-party/SILK-NOTICE.md).
+- [PROTOCOL.md](PROTOCOL.md): 完整内容与预览分离, 原附件独立加密上传. Server 只保存密文. iOS 提供全文, 音频播放, 视频/文件预览和记录内附件.
 
-官方 SQLCipher 4.5.6 已读取当前 `EnMicroMsg.db` 的私有诊断副本, `sqlite_master` 查询与 `PRAGMA quick_check` 通过. 数据格式使用 1024 字节页, PBKDF2-HMAC-SHA1/4000 和 HMAC off. 密钥在本地派生, 仅经进程 stdin 传入, 不保存到代码或日志. 此证据针对当前实例, 不能推广为所有微信版本都可读取.
+## 当前验证
 
-| 类型 | 当前证据 | 尚未完成 |
-| --- | --- | --- |
-| 文字 | `message` 中存在并可查询 | 增量采集和 iPhone 真实收件 |
-| 图片 | `ImgInfo2` 可关联消息, 找到 JPEG 缩略图 | 原图下载, 原文件关联和逐字节验收 |
-| 表情, 引用, 链接 | 存在对应消息/XML类型 | 完整解析, 资源获取和原生展示 |
-| 语音 | `voiceinfo.MsgLocalId` 提供关联字段, 当时0行 | 实际样本, 原始音频获取和播放 |
-| 视频 | `videoinfo2.msglocalid` 提供关联字段, 当时0行 | 实际样本, 原文件获取和播放 |
-| 文件 | `appattach.msgInfoId` 提供关联字段, 当时0行 | 实际样本, 原文件获取和打开/分享 |
-| 合并聊天记录 | 尚无完整样本 | 嵌套消息, 媒体关联及展示 |
+2026-10-02, 本地真实样本已验证语音原件 5543 bytes, WAV 171884 bytes / 3580 ms, PDF 2796797 bytes, MP4 4997631 bytes. 在一次性私有 outbox 中加密后解密, 原件 SHA-256 与只读源一致. 这些结果不等于已经到达 iPhone.
 
-`iscomplete=1` 不能单独证明原图已经下载. 数据库可读也不能证明远端媒体已存在于平板文件系统. 缺少原附件时应保持等待状态, 不把缩略图标为原图.
+独立的 Python -> Node -> MySQL -> authenticated GET -> 解密集成测试已实际运行通过, 覆盖全文/XML, 原件与播放副本, 迟到附件, 密文幂等和 pair 隔离. iOS Core tests, App/NSE build 和来源 UI tests 已通过 GitHub Actions. 实际 iPhone 收件, 播放, 导出文件哈希和长时间运行仍需配对后验收.
 
-SQLCipher 使用 Ubuntu noble 官方 `sqlcipher/libsqlcipher1 4.5.6-1build2`, 仅解压到 guest 的私有诊断目录. 该版本复用已有 OpenSSL 3, 通过官方兼容参数读取旧格式, 没有系统安装或重启服务, 尚未成为 Relay 运行依赖.
+图片只有在完整原图落盘且符合原图 metadata 时才就绪. 微信 `iscomplete=1` 不足以证明原件存在. 视频, 文件和合并记录子附件可能需要先在官方微信中打开/下载; 当前采集器不会自动操作微信 UI 或自行请求未知 CDN 协议. 未下载及无法可靠识别的表情资源保留等待状态.
 
-## 采集路线和一致性边界
+## 安全配对和运行
 
-平板本地消息库/媒体 -> Mini 只读增量采集 -> 扩展既有端到端加密协议 -> iPhone 原生展示.
+宿主使用 `/usr/bin/python3` 及已安装的 `cryptography` 41.0.7. 不将配对码, 私钥, 消息正文或源库写入 Git, 命令参数或日志. 状态默认在 `~/.local/share/aurora-tablet-relay`, 目录 0700, 文件 0600. 日志仅记录固定状态和数量.
 
-诊断时只读取得 DB/WAL, 再重复读取比较, 在私有临时目录内查询副本, 结束即删除. 双读相同和 `quick_check` 通过可以支持格式研究, 不能保证在线事务绝无遗漏. 私有只读 bind 视图试验未成功, SQLCipher 在线只读事务未执行. 未修改源库, 未 checkpoint/rekey, 未暂停或重启微信.
+1. iPhone 原生 Relay 选择平板来源, 连接自己的 Relay 服务并生成独立配对码. 不共用小米来源配对.
+2. 在本人 Mac 的 SSH 终端运行 `bash deploy/tablet/pair-tablet.sh` (从仓库根目录). iPhone 可主动选择 "复制到我的其他 Apple 设备", 然后在隐藏输入提示处粘贴. 默认复制按钮仍只限 iPhone 本机. 不把配对码发到聊天或截图.
+3. 脚本完成配对后启动已安装的 `aurora-tablet-relay.service`. 用 `systemctl --user status aurora-tablet-relay.service` 查看服务, 用 `journalctl --user -u aurora-tablet-relay.service -n 10` 查看聚合状态.
 
-正式读取应使用 `SQLITE_OPEN_READONLY`/`mode=ro` 和短事务, 或经过验证的 Online Backup API. 源目录应提供只读视图, 遇到锁或只读限制就退出重试, 不降级为可写访问. 不在活跃数据库上使用 `immutable=1`.
+配对需要实际运行的 v6 Relay backend, guest reader, 私有 guest SSH 凭据以及已安装的宿主 service/decoder. 仓库中的 unit 是当前 Mini 布局的部署模板, 不会自行安装. guest SQLCipher 使用 Ubuntu noble 官方 4.5.6-1build2 解压版本, 保留在 guest 的私有工具目录.
 
-增量不能只按 `rowid` 递增. 稳定消息键, 重叠回扫和待下载附件状态必须覆盖旧消息更新及迟到附件. 原文件按字节保留, 用大小与 SHA-256 验证传输一致性. 若 iOS 播放需要派生格式, 原文件仍应保留, 派生文件不能冒充原始附件.
+配对请求发生网络错误时会保留原 deviceId/密钥以便重试, 不自动删掉重建. 已配对的状态不会被新码覆盖. 若服务已接受但响应丢失, 应先确认服务端配对状态, 不盲目删除本地密钥. `device.json` 与 outbox 必须一起保留; 删除会丢失解密/去重连续性.
 
-## 与本次 iOS 修改的关系
+## 已知边界
 
-[iOS 来源选择](../../ios/README.md#平板--小米手机--混合来源)已提供平板/小米手机/混合, 默认平板, 两端独立配对与缓存, 混合视图按来源路由回复和附件. 来源选择不产生平板采集能力, 当前还不能通过平板配对码完成原始收件.
+- 每条完整内容最多 1 MiB, 最多 8 个附件, 每个附件最多 8 MiB. 超限有明确本地状态, 不截断原文或伪造文件大小.
+- 首次消息限最近 48 小时. 更早历史不改时间冒充新消息. 原附件未就绪时可能暂缓整条消息, 以保持不可变 metadata 的真实性.
+- Server 原件保留 7 天, 每个 pair 声明额度 256 MiB. iPhone 缓存与 Server 保留期不同. 本地 outbox 当前保留已确认密文和去重索引, 需监测磁盘; 自动压缩/归档尚未实现.
+- 平板采集目前只读, 所有 v6 消息明确关闭回复和会话发送能力.
+- 宿主采集 unit 可恢复进程故障, 不代表现有 QEMU/Android 的宿主重启恢复已验收. 保留当前 VM, disk, NVRAM 和登录数据; 不运行首次初始化脚本重建 VM.
 
-现有 Relay 附件协议和 iOS 解码仅接受 JPEG/PNG/WebP 图片. 原始语音, 视频, 文件和合并记录还需版本化的完整内容/通用附件协议及原生展示. 服务器继续只接收密文, 不把微信数据库, 登录材料或媒体明文上传. 本地库读取也不提供微信原生发送能力, 不应据此启用未实现的回复标志.
+## 检查
 
-下一阶段先验证在线只读事务和真实原媒体样本, 再实现一条原始文字加原文件的端到端链路. 验收包括会话/发送者/顺序, 源文件与 iPhone 导出文件一致性, 连续来信, 断线补收, 迟到附件和重复事件去重. 原始收件完成前, 不把来源菜单或数据库诊断视为替代小米成功.
+在本目录运行:
 
-## 上游依据
+```bash
+/usr/bin/python3 -m unittest discover -p 'test_*.py' -v
+```
 
-- [SQLCipher 密钥验证](https://www.zetetic.net/sqlcipher/sqlcipher-api/#testing-the-key): 实际查询 schema 才能验证密钥, 设置 PRAGMA 本身不足.
-- [SQLite 只读 WAL](https://www.sqlite.org/wal.html#read_only_databases)与[Online Backup API](https://www.sqlite.org/backup.html): 正式一致性读取的依据.
-- [WeChat_backup](https://github.com/mkcs121/WeChat_backup)仅用于格式研究, 未见明确许可证, 没有复制代码或执行暂停微信的脚本.
-- [wechat-dump](https://github.com/ppwwyyxx/wechat-dump)为 GPL-3.0 解析参考, 未拷入 MIT Relay, 不作为当前8.0.78的兼容保证.
+无集成环境时 `test_protocol_integration.py` 明确 skip. 对一次性测试环境设置 `AWR_INTEGRATION_ORIGIN` 和 `AWR_INTEGRATION_TEST_TOKEN` 才会实际执行, 不对正式 pair 运行 fixture 测试.
+
+解码器由 `build-silk-decoder.sh <output-directory>` 构建, 固定 upstream commit 和 archive SHA-256, 保留两套许可证, 临时源码自动删除. 仅在源文件发生变更或需要重新部署时重建.
+
+## 依据
+
+- [SQLite 只读 WAL](https://www.sqlite.org/wal.html#read_only_databases), [SQLCipher 密钥验证](https://www.zetetic.net/sqlcipher/sqlcipher-api/#testing-the-key).
+- [iOS 来源隔离](../../ios/README.md#平板--小米手机--混合来源).
+- `WeChat_backup` 和 `wechat-dump` 仅为早期格式研究参考, 未将其代码拷入本 MIT 项目.
