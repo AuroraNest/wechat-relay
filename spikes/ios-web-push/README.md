@@ -4,7 +4,7 @@
 
 PWA 在本地生成并保存不可导出的 AES-GCM `CryptoKey`, 在本地解密预览并加密回复. 服务端仅处理密文信封, 配对元数据和 Push Subscription.
 
-同一后端也支持原生 iPhone Relay. 原生 App 与 PWA 共用配对, 消息, 回复, 策略和资源 API, 但使用独立的 APNs destination. 两种客户端可以继续使用既有数据库结构, 已有 Web Push subscription 无需迁移.
+同一后端也支持原生 iPhone Relay. 原生 App 与 PWA 共用配对, 消息, 回复, 策略和资源 API, 但使用独立的 APNs destination. 当前服务要求 schema v8, 已有 Web Push subscription 无需迁移.
 
 ## 本地开发
 
@@ -24,7 +24,7 @@ npm run dev
 
 `.env.development` 是 `npm run dev` 唯一读取的环境文件. 启动前会校验 `NODE_ENV=development`, `MYSQL_HOST=127.0.0.1`, `MYSQL_PORT=23306`, `MYSQL_DATABASE=wechat_relay_dev`, `DATA_DIR=data/development`, 并要求 `REDIS_URL` 为空. `npm run dev:db` 使用 `compose.development.yml` 创建独立 MySQL 8.4 volume. 初始迁移只会在新 volume 创建时导入. 已有 volume 应按版本应用增量迁移, 不要为重新初始化迁移删除数据.
 
-联系人快照和联系人发信要求 schema v7. 对已有数据库先顺序应用 `scripts/migrations/006-contacts-snapshots.sql` 与 `scripts/migrations/007-contact-send-replies.sql`; 表只保存每个 Android device 和 profile 的最新 AES-GCM 密文信封及校验元数据.
+当前服务严格要求 schema v8 和 MySQL `max_allowed_packet >= 16777216` (16 MiB). 既有数据库按版本依次应用尚未执行的迁移, 包括 `scripts/migrations/008-native-content.sql`. 联系人表仍只保存每个 Android device 和 profile 的最新 AES-GCM 密文信封及校验元数据.
 
 开发 Origin 只能用于本机检查. 若要在 iPhone 上安装 PWA 或接收 Web Push, 请配置自己的 HTTPS Origin, 并将它写入 development 配置的 `PUBLIC_ORIGIN`.
 
@@ -52,7 +52,25 @@ npm run start:production
 
 `deploy/phase0a` 提供通用 Docker 和 Nginx 示例, 不会直接替换任何已有环境. 忽略规则不能代替对 `.env.production`, Push Subscription, 配对码和密钥的访问控制.
 
-### schema v7 升级与回退
+### schema v8 与原生完整内容
+
+升级前备份数据库, 再应用 migration 008, 确认 `SELECT MAX(version) FROM schema_migrations` 为 8, 并检查 `SELECT @@max_allowed_packet` 至少为 16 MiB. 服务启动时会拒绝版本, 必要列或 packet 限制不满足的环境.
+
+```bash
+mysql --defaults-extra-file=/path/to/mysql.cnf "$MYSQL_DATABASE" < scripts/migrations/008-native-content.sql
+```
+
+v1-v5 消息及旧附件缓存行为保持兼容. v6 只读, 必须同时提交 `replyCapable:false` 和 `conversationSendCapable:false`. 完整契约见 [`PROTOCOL.md`](../tablet-original-sync/PROTOCOL.md). 正文密文保存于 `native_contents`, 随消息保留, 列表只增加 `hasNativeContent` 和 `nativeAssets`; `GET /api/v1/ios/messages/{messageId}/content` 独立返回 `{contentEnvelope}`.
+
+附件声明保存在 `native_assets`, ciphertext 在 `native_asset_payloads` 中事务性发布, 单附件最多 8 MiB, 每 pair 预留明文配额为 256 MiB. TTL 为首次消息 `received_at` 起 7 天, 重试不延长; 启动, 每分钟和新声明预留前清理过期 ciphertext, 保留声明以区分过期与未知附件. 需要大文件或数据库负载增长时再迁移到分块对象存储.
+
+`POST /api/v1/android/messages/{messageId}/assets/{assetId}` 使用既有 Android ECDSA 签名认证, 首次 durable write 返回 `201 {id,idempotent:false}`, 相同 envelope 重试返回 `200 {id,idempotent:true}`, 不同 envelope 返回 `409 {error:"NATIVE_ASSET_CONFLICT"}`. 声明接受不表示附件上传完成. Nginx 新上传路径限制 12 MiB body.
+
+`GET /api/v1/ios/assets/{assetId}` 使用现有 session/pair 认证, pending 返回 `409 {error:"ASSET_PENDING"}`, expired 返回 `410 {error:"ASSET_EXPIRED"}`, unknown 或其他 pair 返回 `404 {error:"NOT_FOUND"}`. 上传不会增加 message sequence; 客户端应在用户重试, 重连或有限前台刷新时重新获取 pending 附件.
+
+schema v7 旧服务不能直接在 schema v8 启动. 不要仅删除版本记录或删除新表回退, 否则会失去完整内容和附件. 回退应使用升级前备份及对应旧服务, 并单独处理升级后的新数据. 下节仅记录历史 v7 -> v6 流程, 不适用于 schema v8.
+
+### 历史 schema v7 升级与回退
 
 升级前先备份数据库, 再在停止接收新 v4 reply 的窗口执行 migration 007 并确认 `schema_migrations` 的最大版本为 7. 例如可由部署环境的受控 MySQL 凭据执行:
 
@@ -60,7 +78,7 @@ npm run start:production
 mysql --defaults-extra-file=/path/to/mysql.cnf "$MYSQL_DATABASE" < scripts/migrations/007-contact-send-replies.sql
 ```
 
-新镜像严格要求 schema v7; 旧镜像严格要求 schema v6, 因而不能在 schema v7 上直接作为回滚镜像启动.
+当时的 v7 镜像严格要求 schema v7, v6 镜像严格要求 schema v6, 因而不能在 schema v7 上直接作为回滚镜像启动.
 
 如需回退到旧镜像, 先确认没有任何 v4 reply. 以下 SQL 每一步都以 `@awr_v4_rows = 0` 为前提; 非零时只执行 `DO 0`, 不会删除 v4 数据或改变 schema. 它只适用于 v4 未产生任何行的回退窗口, 不应在有 v4 数据时执行.
 

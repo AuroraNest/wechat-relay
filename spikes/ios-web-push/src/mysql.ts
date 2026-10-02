@@ -24,7 +24,7 @@ export const pool: Pool = mysql.createPool({
   bigNumberStrings: true,
 });
 
-const requiredSchemaVersion = 7;
+const requiredSchemaVersion = 8;
 const requiredColumns: Record<string, readonly string[]> = {
   schema_migrations: ["version", "name", "applied_at"],
   pairings: ["pair_id", "secret_hash", "expires_at", "consumed_at"],
@@ -36,11 +36,19 @@ const requiredColumns: Record<string, readonly string[]> = {
   browser_sessions: ["session_id", "ack_token_hash", "subscription_envelope", "pair_id", "created_at", "updated_at", "invalidated_at"],
   relay_policies: ["pair_id", "enabled", "schedule_enabled", "weekdays_mask", "start_minutes", "end_minutes", "updated_at"],
   contacts_snapshots: ["id", "device_id", "wechat_user_id", "captured_at", "body_hash", "envelope_json", "received_at"],
+  native_contents: ["message_id", "envelope_json", "assets_json"],
+  native_assets: ["id", "message_id", "byte_length", "metadata_json", "expires_at"],
+  native_asset_payloads: ["asset_id", "envelope_json", "envelope_hash"],
 };
 
 export async function verifySchema(): Promise<void> {
   const connection = await pool.getConnection();
   try {
+    const [packetRows] = await connection.query<(RowDataPacket & { max_packet: number })[]>(
+      "SELECT @@max_allowed_packet AS max_packet",
+    );
+    if (Number(packetRows[0]?.max_packet ?? 0) < 16 * 1024 * 1024)
+      throw new Error("MYSQL_PACKET_LIMIT_TOO_SMALL");
     const [versionRows] = await connection.query<(RowDataPacket & { version: number | null })[]>(
       "SELECT MAX(version) AS version FROM schema_migrations",
     );

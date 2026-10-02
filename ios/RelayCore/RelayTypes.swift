@@ -9,6 +9,8 @@ public enum RelayError: Error, Equatable, LocalizedError {
     case httpStatus(Int)
     case redirectRejected
     case invalidResponse
+    case assetPending
+    case assetExpired
 
     public var errorDescription: String? {
         switch self {
@@ -20,6 +22,8 @@ public enum RelayError: Error, Equatable, LocalizedError {
         case .httpStatus(let status): return "Relay request failed with HTTP \(status)"
         case .redirectRejected: return "Relay redirect changed origin"
         case .invalidResponse: return "Invalid relay response"
+        case .assetPending: return "Original attachment is still uploading"
+        case .assetExpired: return "Original attachment has expired"
         }
     }
 }
@@ -156,15 +160,23 @@ public struct RelayMessage: Codable, Identifiable, Sendable, Equatable {
     public let previewEnvelope: RelayEncryptedEnvelope
     public let assets: [RelayAssetMetadata]
     public let receivedAt: Int64
+    public let hasNativeContent: Bool
+    public let nativeAssets: [RelayNativeAssetMetadata]
 
     public var id: UUID { messageId }
 
-    public init(messageId: UUID, deviceId: String, seq: Int, createdAt: Int64, wechatUserId: Int, replyCapable: Bool, conversationSendCapable: Bool, previewEnvelope: RelayEncryptedEnvelope, assets: [RelayAssetMetadata], receivedAt: Int64) throws {
+    public init(messageId: UUID, deviceId: String, seq: Int, createdAt: Int64, wechatUserId: Int, replyCapable: Bool, conversationSendCapable: Bool, previewEnvelope: RelayEncryptedEnvelope, assets: [RelayAssetMetadata], receivedAt: Int64, hasNativeContent: Bool = false, nativeAssets: [RelayNativeAssetMetadata] = []) throws {
         guard RelayValidation.isDeviceId(deviceId), seq > 0, createdAt > 0, receivedAt > 0,
               RelayValidation.isWechatUserId(wechatUserId), !(conversationSendCapable && !replyCapable), assets.count <= 2,
               Set(assets.map(\.id)).count == assets.count else {
             throw RelayError.invalidValue("message")
         }
+        try RelayNativeAssetMetadata.validate(nativeAssets)
+        guard hasNativeContent ? (!replyCapable && !conversationSendCapable && assets.isEmpty) : nativeAssets.isEmpty else {
+            throw RelayError.invalidValue("native message")
+        }
+        self.hasNativeContent = hasNativeContent
+        self.nativeAssets = nativeAssets
         self.messageId = messageId
         self.deviceId = deviceId
         self.seq = seq
@@ -175,6 +187,12 @@ public struct RelayMessage: Codable, Identifiable, Sendable, Equatable {
         self.previewEnvelope = previewEnvelope
         self.assets = assets
         self.receivedAt = receivedAt
+    }
+    private enum CodingKeys: String, CodingKey { case messageId, deviceId, seq, createdAt, wechatUserId, replyCapable, conversationSendCapable, previewEnvelope, assets, receivedAt, hasNativeContent, nativeAssets }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(messageId: values.decode(UUID.self, forKey: .messageId), deviceId: values.decode(String.self, forKey: .deviceId), seq: values.decode(Int.self, forKey: .seq), createdAt: values.decode(Int64.self, forKey: .createdAt), wechatUserId: values.decode(Int.self, forKey: .wechatUserId), replyCapable: values.decode(Bool.self, forKey: .replyCapable), conversationSendCapable: values.decode(Bool.self, forKey: .conversationSendCapable), previewEnvelope: values.decode(RelayEncryptedEnvelope.self, forKey: .previewEnvelope), assets: values.decode([RelayAssetMetadata].self, forKey: .assets), receivedAt: values.decode(Int64.self, forKey: .receivedAt), hasNativeContent: values.decodeIfPresent(Bool.self, forKey: .hasNativeContent) ?? false, nativeAssets: values.decodeIfPresent([RelayNativeAssetMetadata].self, forKey: .nativeAssets) ?? [])
     }
 }
 

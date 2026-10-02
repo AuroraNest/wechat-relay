@@ -97,6 +97,17 @@ public final class RelayAPI: NSObject, @unchecked Sendable {
         try await request(path: "/api/v1/assets/\(id.uuidString.lowercased())", session: relaySession)
     }
 
+    public func nativeContent(session relaySession: RelaySession, messageID: UUID) async throws -> RelayEncryptedEnvelope {
+        let response: RelayNativeContentResponse = try await request(path: "/api/v1/ios/messages/\(messageID.uuidString.lowercased())/content", session: relaySession)
+        return response.contentEnvelope
+    }
+
+    public func nativeAsset(session relaySession: RelaySession, id: UUID) async throws -> RelayNativeAsset {
+        do { return try await request(path: "/api/v1/ios/assets/\(id.uuidString.lowercased())", session: relaySession) }
+        catch RelayError.httpStatus(409) { throw RelayError.assetPending }
+        catch RelayError.httpStatus(410) { throw RelayError.assetExpired }
+    }
+
     public func submitReply(session relaySession: RelaySession, request reply: RelayReplyRequest) async throws -> RelayReplyResult {
         try validateReplyRequest(reply, pairId: relaySession.pairId)
         return try await request(path: "/api/v1/replies", method: "POST", session: relaySession, body: try encodedBody(reply))
@@ -353,3 +364,5 @@ private final class RelayResponseDelegate: NSObject, URLSessionDataDelegate, @un
         finish(.failure(CancellationError()))
     }
 }
+
+private struct RelayNativeContentResponse: Decodable { let contentEnvelope: RelayEncryptedEnvelope }

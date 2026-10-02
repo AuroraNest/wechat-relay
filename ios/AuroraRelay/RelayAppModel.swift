@@ -10,8 +10,16 @@ struct InboxItem: Identifiable {
     let pairID: String
     let message: RelayMessage
     let preview: RelayPreview
+    var nativeContent: RelayNativeContent? = nil
     var id: UUID { message.id }
-    var conversationID: String { source.conversationID(pairID: pairID, profile: message.wechatUserId, name: preview.sender) }
+    var pendingConversationID: String { "\(source.rawValue):\(pairID):pending:\(message.wechatUserId):\(message.id.uuidString.lowercased())" }
+    var conversationID: String {
+        if let nativeContent { return source.nativeConversationID(pairID: pairID, profile: message.wechatUserId, conversationID: nativeContent.conversationId) }
+        if message.hasNativeContent { return pendingConversationID }
+        return source.conversationID(pairID: pairID, profile: message.wechatUserId, name: preview.sender)
+    }
+    var conversationName: String { nativeContent?.conversationName.isEmpty == false ? nativeContent!.conversationName : preview.sender }
+    var body: String { nativeContent?.text.isEmpty == false ? nativeContent!.text : preview.body }
 }
 
 struct Conversation: Identifiable {
@@ -28,8 +36,9 @@ struct RelayFriend: Identifiable, Hashable {
     let name: String
     let wechatUserId: Int
     let capturedAt: Int64
+    var stableConversationID: String? = nil
 
-    var id: String { source.conversationID(pairID: pairID, profile: wechatUserId, name: name) }
+    var id: String { stableConversationID ?? source.conversationID(pairID: pairID, profile: wechatUserId, name: name) }
     var profileLabel: String { wechatUserId == 999 ? "微信 2" : "微信" }
 }
 
@@ -56,8 +65,9 @@ private struct InboxSnapshot: Codable {
     var readThrough: [String: Int] = [:]
     var clearedThrough: Int = 0
     var contacts: [CachedContacts] = []
+    var nativeContents: [String: RelayNativeContent] = [:]
 
-    enum CodingKeys: String, CodingKey { case messages, outgoing, readThrough, clearedThrough, contacts }
+    enum CodingKeys: String, CodingKey { case messages, outgoing, readThrough, clearedThrough, contacts, nativeContents }
 
     init(messages: [RelayMessage] = [], outgoing: [OutgoingMessage] = [], readThrough: [String: Int] = [:], clearedThrough: Int = 0, contacts: [CachedContacts] = []) {
         self.messages = messages
@@ -75,6 +85,7 @@ private struct InboxSnapshot: Codable {
         clearedThrough = try values.decode(Int.self, forKey: .clearedThrough)
         // Cache versions before Friends did not have this key.
         contacts = try values.decodeIfPresent([CachedContacts].self, forKey: .contacts) ?? []
+        nativeContents = try values.decodeIfPresent([String: RelayNativeContent].self, forKey: .nativeContents) ?? [:]
     }
 }
 
@@ -106,6 +117,10 @@ final class RelayConnectionModel: ObservableObject {
     @Published var conversationPath: [String] = []
     @Published private(set) var isDemo: Bool
 
+    @Published private(set) var nativeContentProblems: [UUID: String] = [:]
+    private var nativeContentTasks: [UUID: (id: UUID, task: Task<RelayNativeContent, Error>)] = [:]
+    private var nativeContentTerminal = Set<UUID>()
+    private let nativeStore: RelayNativeStore
     private var snapshot = InboxSnapshot()
     private var loop: Task<Void, Never>?
     private var stream: Task<Void, Never>?
@@ -123,6 +138,7 @@ final class RelayConnectionModel: ObservableObject {
 
     init(source: RelaySource, demo: Bool) {
         self.source = source
+        nativeStore = RelayNativeStore(source: source)
         #if DEBUG
         isDemo = demo
         #else
@@ -155,10 +171,10 @@ final class RelayConnectionModel: ObservableObject {
             let latest = values.max(by: { $0.message.seq < $1.message.seq })
             let reply = sent[id]?.max(by: { $0.request.createdAt < $1.request.createdAt })
             guard let profile = latest?.message.wechatUserId ?? reply?.request.wechatUserId else { return nil }
-            let title = latest?.preview.sender ?? String(id.dropFirst("\(source.rawValue):\(session.pairId):\(profile):".count))
+            let title = latest?.conversationName ?? String(id.dropFirst("\(source.rawValue):\(session.pairId):\(profile):".count))
             let useReply = (reply?.request.createdAt ?? 0) >= (latest?.message.createdAt ?? 0)
             let time = useReply ? reply!.request.createdAt : latest!.message.createdAt
-            return Conversation(id: id, friend: RelayFriend(source: source, pairID: session.pairId, name: title, wechatUserId: profile, capturedAt: time), body: useReply ? reply!.body : latest!.preview.body, createdAt: time, unread: values.filter { $0.message.seq > (snapshot.readThrough[id] ?? 0) }.count)
+            return Conversation(id: id, friend: RelayFriend(source: source, pairID: session.pairId, name: title, wechatUserId: profile, capturedAt: time, stableConversationID: id), body: useReply ? reply!.body : latest!.body, createdAt: time, unread: values.filter { $0.nativeContent?.isOutgoing != true && $0.message.seq > (snapshot.readThrough[id] ?? 0) }.count)
         }.sorted { $0.createdAt > $1.createdAt }
     }
 
@@ -196,6 +212,7 @@ final class RelayConnectionModel: ObservableObject {
         foregroundRun = nil
         loop?.cancel(); loop = nil
         stream?.cancel(); stream = nil
+        nativeContentTasks.values.forEach { $0.task.cancel() }
         streamConnected = false
         refreshRequested = false
     }
@@ -287,6 +304,8 @@ final class RelayConnectionModel: ObservableObject {
             }
             try await syncMessages(api: api, session: session)
             guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
+            await refreshNativeContents()
+            guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             try await refreshReplies(api: api, session: session)
             guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             if policy.updatedAt == 0 || Date().timeIntervalSince(lastStatusCheck) < 2 {
@@ -337,6 +356,7 @@ final class RelayConnectionModel: ObservableObject {
             self.nextCursor = page.nextCursor.flatMap(Int.init)
             hasMore = page.hasMore && self.nextCursor != nil
             try saveCache()
+            await refreshNativeContents()
         } catch {
             if self.session?.pairId == session.pairId, !Task.isCancelled { problem = Self.describe(error) }
         }
@@ -379,7 +399,7 @@ final class RelayConnectionModel: ObservableObject {
             unique[message.id] = message
         }
         snapshot.messages = unique.values.sorted { $0.seq < $1.seq }
-        items = try snapshot.messages.map { InboxItem(source: source, pairID: session.pairId, message: $0, preview: try RelayCrypto.decryptPreview($0, messageKey: session.messageKey)) }
+        items = try snapshot.messages.map { InboxItem(source: source, pairID: session.pairId, message: $0, preview: try RelayCrypto.decryptPreview($0, messageKey: session.messageKey), nativeContent: snapshot.nativeContents[$0.id.uuidString]) }
     }
 
     private func mergeContacts(_ incoming: [RelayContactSnapshot], currentDeviceID: String, session: RelaySession) throws {
@@ -589,6 +609,62 @@ final class RelayConnectionModel: ObservableObject {
         return image
     }
 
+    func loadNativeContent(for item: InboxItem) async throws -> RelayNativeContent {
+        guard let session, item.source == source, item.pairID == session.pairId, item.message.hasNativeContent else { throw RelayError.invalidValue("content source") }
+        if let cached = snapshot.nativeContents[item.id.uuidString] { return cached }
+        let requestID: UUID
+        let task: Task<RelayNativeContent, Error>
+        if let pending = nativeContentTasks[item.id] {
+            requestID = pending.id
+            task = pending.task
+        } else {
+            requestID = UUID()
+            task = Task {
+                let envelope = try await RelayAPI(origin: session.origin).nativeContent(session: session, messageID: item.id)
+                try Task.checkCancellation()
+                return try RelayCrypto.decryptNativeContent(envelope, for: item.message, messageKey: session.messageKey)
+            }
+            nativeContentTasks[item.id] = (requestID, task)
+        }
+        defer { if nativeContentTasks[item.id]?.id == requestID { nativeContentTasks[item.id] = nil } }
+        do {
+            let content = try await task.value
+            guard self.session?.pairId == session.pairId, snapshot.messages.contains(where: { $0.id == item.id }), !Task.isCancelled else { throw CancellationError() }
+            snapshot.nativeContents[item.id.uuidString] = content
+            if let read = snapshot.readThrough.removeValue(forKey: item.pendingConversationID) {
+                let stable = source.nativeConversationID(pairID: session.pairId, profile: item.message.wechatUserId, conversationID: content.conversationId)
+                snapshot.readThrough[stable] = max(snapshot.readThrough[stable] ?? 0, read)
+            }
+            try merge([])
+            try saveCache()
+            nativeContentProblems[item.id] = nil
+            nativeContentTerminal.remove(item.id)
+            return content
+        } catch {
+            if self.session?.pairId == session.pairId, !(error is CancellationError) {
+                nativeContentProblems[item.id] = Self.describe(error)
+                if error as? RelayError == .httpStatus(404) || error as? RelayError == .httpStatus(410) { nativeContentTerminal.insert(item.id) }
+            }
+            throw error
+        }
+    }
+
+    private func refreshNativeContents() async {
+        // Bound foreground backfill independently of SSE seq. Visible cards can request an older item directly.
+        for item in items.reversed().filter({ $0.message.hasNativeContent && $0.nativeContent == nil && !nativeContentTerminal.contains($0.id) }).prefix(8) {
+            guard !Task.isCancelled else { return }
+            _ = try? await loadNativeContent(for: item)
+        }
+    }
+
+    func nativeAssetURL(_ metadata: RelayNativeAssetMetadata, in item: InboxItem) async throws -> URL {
+        guard let session, item.source == source, item.pairID == session.pairId else { throw RelayError.invalidValue("asset source") }
+        let content = try await loadNativeContent(for: item)
+        let url = try await nativeStore.file(metadata: metadata, message: item.message, content: content, session: session)
+        guard self.session?.pairId == session.pairId, snapshot.messages.contains(where: { $0.id == item.id }) else { throw CancellationError() }
+        return url
+    }
+
     func clearHistory() throws {
         let cutoff = max(snapshot.clearedThrough, snapshot.messages.map(\.seq).max() ?? 0)
         let previous = snapshot
@@ -596,7 +672,9 @@ final class RelayConnectionModel: ObservableObject {
         snapshot = InboxSnapshot(clearedThrough: cutoff, contacts: snapshot.contacts)
         cacheReadable = true
         do { try saveCache() } catch { snapshot = previous; cacheReadable = wasReadable; throw error }
+        nativeContentProblems = [:]; nativeContentTerminal = []
         items = []; outgoing = []; imageCache.removeAllObjects(); hasMore = false
+        if let session { try nativeStore.clear(session: session) }
         problem = nil
         removeDeliveredNotifications()
     }
@@ -605,11 +683,13 @@ final class RelayConnectionModel: ObservableObject {
         stop()
         if !isDemo {
             let file = try cacheURL()
+            if let session { try nativeStore.clear(session: session) }
             try deleteSecret(account: "session")
             try deleteSecret(account: "pending-pairing")
             if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
         }
         removeDeliveredNotifications()
+        nativeContentProblems = [:]; nativeContentTerminal = []
         session = nil; pairing = nil; device = nil
         isDemo = false
         snapshot = InboxSnapshot(); items = []; outgoing = []; friends = []; conversationPath = []
@@ -717,6 +797,8 @@ final class RelayConnectionModel: ObservableObject {
 
     static func describe(_ error: Error) -> String {
         switch error {
+        case RelayError.assetPending: return "原始附件仍在上传, 稍后会自动重试, 也可手动刷新."
+        case RelayError.assetExpired: return "原始附件已超过服务端保留期, 无法重新下载."
         case RelayError.invalidOrigin: return "请填写完整的 HTTPS 服务地址, 不带路径或参数."
         case RelayError.httpStatus(401), RelayError.httpStatus(403): return "连接凭证已失效或没有权限. 请检查服务配置与配对状态."
         case RelayError.httpStatus(404): return "当前服务尚未提供此接口, 或消息已过期."
@@ -742,6 +824,9 @@ final class RelayConnectionModel: ObservableObject {
                 let envelope = try RelayCrypto.encrypt(JSONEncoder().encode(preview), key: session.messageKey, kid: "phase1", aad: "AWR1|A2I|\(id.uuidString.lowercased())|\(deviceID)|\(seq)|\(timestamp)|\(row.2)")
                 snapshot.messages.append(try RelayMessage(messageId: id, deviceId: deviceID, seq: seq, createdAt: timestamp, wechatUserId: row.2, replyCapable: true, conversationSendCapable: true, previewEnvelope: envelope, assets: [], receivedAt: timestamp))
             }
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--demo-native") { try loadNativeDemo(session: session) }
+            #endif
             try merge([])
             snapshot.contacts = [
                 CachedContacts(version: 2, id: try UUIDv7.make(now: Date()), deviceId: "demo_android_0001", wechatUserId: 0, capturedAt: Int64(Date().timeIntervalSince1970 * 1_000), contacts: [try RelayContact(name: "林一"), try RelayContact(name: "陈默"), try RelayContact(name: "文件传输助手"), try RelayContact(name: "王珊")]),
@@ -753,6 +838,28 @@ final class RelayConnectionModel: ObservableObject {
             lastSync = Date()
         } catch { problem = Self.describe(error) }
     }
+    #if DEBUG
+    private func loadNativeDemo(session: RelaySession) throws {
+        let assetID = try UUIDv7.make()
+        let bytes = Data("原始附件演示字节, 不进行摘要或转写.\n".utf8)
+        let metadata = try RelayNativeAssetMetadata(id: assetID, kind: .file, mimeType: "text/plain", byteLength: bytes.count, role: .original)
+        let id = try UUIDv7.make()
+        let createdAt = Int64(Date().timeIntervalSince1970 * 1_000)
+        let deviceID = "demo_native_0001"
+        let preview = RelayPreview(sender: "原始内容演示", body: "完整原始消息和附件")
+        let envelope = try RelayCrypto.encrypt(JSONEncoder().encode(preview), key: session.messageKey, kid: "phase1", aad: "AWR1|A2I|\(id.uuidString.lowercased())|\(deviceID)|7|\(createdAt)|0")
+        let message = try RelayMessage(messageId: id, deviceId: deviceID, seq: 7, createdAt: createdAt, wechatUserId: 0, replyCapable: false, conversationSendCapable: false, previewEnvelope: envelope, assets: [], receivedAt: createdAt, hasNativeContent: true, nativeAssets: [metadata])
+        let payload: [String: Any] = ["v": 1, "conversationId": "native-demo-room", "conversationName": "原始内容演示", "senderId": "demo-sender", "senderName": "原发送者", "kind": "reference", "text": "完整正文开头\n" + String(repeating: "这一段保留完整原始文本. ", count: 40) + "\n完整正文结束", "rawXML": "<msg><script>仅作为原始文本显示</script></msg>", "attachments": [["assetId": assetID.uuidString.lowercased(), "name": "original-demo.txt"]], "records": [["senderName": "嵌套记录发送者", "kind": "record", "text": "嵌套记录完整文本", "rawXML": "<record><nested>完整保留</nested></record>"]]]
+        snapshot.messages.append(message)
+        snapshot.nativeContents[id.uuidString] = try JSONDecoder().decode(RelayNativeContent.self, from: JSONSerialization.data(withJSONObject: payload))
+        let assetAAD = "AWR1|A2I_ASSET|6|\(id.uuidString.lowercased())|\(assetID.uuidString.lowercased())|\(deviceID)|7|\(createdAt)|0|file|text/plain|\(bytes.count)|original|"
+        let assetEnvelope = try RelayCrypto.encrypt(bytes, key: session.messageKey, kid: "phase2-asset", aad: assetAAD)
+        var assetObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(metadata)) as! [String: Any]
+        assetObject["envelope"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(assetEnvelope))
+        nativeStore.seedDemo(try JSONDecoder().decode(RelayNativeAsset.self, from: JSONSerialization.data(withJSONObject: assetObject)))
+    }
+    #endif
+
 }
 
 extension RelayReplyStatus {

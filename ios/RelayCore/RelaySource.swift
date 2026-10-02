@@ -8,6 +8,9 @@ public enum RelaySource: String, Codable, CaseIterable, Sendable {
     public func conversationID(pairID: String, profile: Int, name: String) -> String {
         "\(rawValue):\(pairID.lowercased()):\(profile):\(name)"
     }
+    public func nativeConversationID(pairID: String, profile: Int, conversationID: String) -> String {
+        "\(rawValue):\(pairID.lowercased()):native:\(profile):\(conversationID)"
+    }
     public func owns(_ conversationID: String, pairID: String) -> Bool {
         conversationID.hasPrefix("\(rawValue):\(pairID.lowercased()):")
     }

@@ -200,11 +200,12 @@ struct ConversationView: View {
     @State private var sending = false
     @State private var error: String?
     @FocusState private var inputFocused: Bool
-    private var messages: [InboxItem] { model.items.filter { $0.conversationID == conversationID } }
+    private var resolvedID: String { model.resolvedConversationID(conversationID) }
+    private var messages: [InboxItem] { model.items.filter { $0.conversationID == resolvedID } }
     private var target: InboxItem? { messages.last(where: { $0.message.replyCapable }) }
-    private var friend: RelayFriend? { model.friends.first { $0.id == conversationID } }
+    private var friend: RelayFriend? { model.friends.first { $0.id == resolvedID } }
     private var canSend: Bool { target != nil || friend.map { model.canSend(to: $0) } == true }
-    private var replies: [OutgoingMessage] { model.outgoing.filter { $0.conversationID == conversationID } }
+    private var replies: [OutgoingMessage] { model.outgoing.filter { $0.conversationID == resolvedID } }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -215,17 +216,19 @@ struct ConversationView: View {
                     ForEach(timeline, id: \.id) { entry in
                         if let item = entry.incoming {
                             HStack(alignment: .top, spacing: 10) {
-                                AvatarView(item: item).scaleEffect(0.75).frame(width: 40, height: 40)
+                                if item.nativeContent?.isOutgoing == true { Spacer(minLength: 30) }
+                                else { AvatarView(item: item).scaleEffect(0.75).frame(width: 40, height: 40) }
                                 VStack(alignment: .leading, spacing: 7) {
                                     Text(Date(timeIntervalSince1970: Double(item.message.createdAt) / 1_000), format: .dateTime.month().day().hour().minute()).font(.caption2).foregroundStyle(.secondary)
                                     VStack(alignment: .leading, spacing: 10) {
-                                        Text(item.preview.body).textSelection(.enabled).font(.body).lineSpacing(4)
+                                        if item.message.hasNativeContent { NativeContentView(item: item) }
+                                        else { Text(item.preview.body).textSelection(.enabled).font(.body).lineSpacing(4) }
                                         ForEach(item.message.assets.filter { $0.kind != .avatar }) { asset in
                                             MessageImageView(metadata: asset, item: item)
                                         }
-                                    }.padding(14).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+                                    }.padding(14).background(item.nativeContent?.isOutgoing == true ? Color.relayGreen.opacity(0.13) : Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
                                 }
-                                Spacer(minLength: 30)
+                                if item.nativeContent?.isOutgoing != true { Spacer(minLength: 30) }
                             }.id(entry.id)
                         } else if let reply = entry.outgoing {
                             HStack {
@@ -251,7 +254,7 @@ struct ConversationView: View {
             }
             .onChange(of: inputFocused) { _, focused in if focused { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } } }
         }
-        .navigationTitle(messages.last?.preview.sender ?? friend?.name ?? model.conversations.first(where: { $0.id == conversationID })?.friend.name ?? "会话").navigationBarTitleDisplayMode(.inline)
+        .navigationTitle(messages.last?.conversationName ?? friend?.name ?? model.conversations.first(where: { $0.id == resolvedID })?.friend.name ?? "会话").navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 8) {
@@ -277,6 +280,9 @@ struct ConversationView: View {
                     } label: { Image(systemName: "arrow.up").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44).foregroundStyle(.white).background(Color.relayGreen, in: Circle()) }
                         .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.count > 1_000 || sending)
                         .opacity(!canSend || draft.isEmpty ? 0.4 : 1).accessibilityLabel("发送回复")
+                }
+                if messages.contains(where: { $0.message.hasNativeContent }) {
+                    Text("原始消息目前仅支持查看.").font(.caption).foregroundStyle(.secondary)
                 }
                 if !canSend && friend != nil {
                     Text("此来源尚未提供主动发送能力. 请更新来源端并重新同步好友.").font(.caption).foregroundStyle(.secondary)

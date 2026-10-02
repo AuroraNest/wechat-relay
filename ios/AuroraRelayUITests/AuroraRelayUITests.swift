@@ -132,6 +132,31 @@ final class AuroraRelayUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["Phone route only"].exists)
     }
 
+    func testNativeFullContentRawXMLAndOriginalFile() {
+        app.terminate()
+        app.launchArguments = ["--demo", "--demo-native"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["原始内容演示"].firstMatch.waitForExistence(timeout: 5))
+        app.staticTexts["原始内容演示"].firstMatch.tap()
+        let full = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "完整正文结束")).firstMatch
+        XCTAssertTrue(full.waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["原始消息目前仅支持查看."].exists)
+        let download = app.buttons["下载附件"].firstMatch
+        for _ in 0..<5 where !download.isHittable { app.swipeUp() }
+        XCTAssertTrue(download.waitForExistence(timeout: 3))
+        download.tap()
+        XCTAssertTrue(app.buttons["保存或分享原件"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["预览文件"].exists)
+        let raw = app.buttons["查看原始 XML"].firstMatch
+        for _ in 0..<5 where !raw.isHittable { app.swipeDown() }
+        raw.tap()
+        XCTAssertTrue(app.staticTexts["<msg><script>仅作为原始文本显示</script></msg>"].waitForExistence(timeout: 3))
+        app.buttons["完成"].tap()
+        selectSource("混合")
+        XCTAssertEqual(app.staticTexts["原始内容演示"].count, 2)
+        attachScreenshot("完整原始内容与来源隔离")
+    }
+
     private func selectSource(_ label: String) {
         let picker = app.buttons["source-picker"]
         XCTAssertTrue(picker.waitForExistence(timeout: 3))

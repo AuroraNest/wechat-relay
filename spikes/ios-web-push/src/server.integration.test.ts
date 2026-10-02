@@ -16,6 +16,7 @@ import { join } from "node:path";
 import test from "node:test";
 import mysql, { type Connection } from "mysql2/promise";
 import webpush from "web-push";
+import type { NativeAsset } from "./native-content.js";
 
 const adminUser = process.env.MYSQL_TEST_ADMIN_USER;
 const port = Number(process.env.AWR_TEST_PORT ?? 18_081);
@@ -702,9 +703,11 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
     },
   })).status, 200);
 
+  const nativePersisted = await testNativeContent(db, sessionA, a);
   await stop(server);
   server = startServer(database, dataDir, captureFile, apnsCaptureFile, apnsKeyPath);
   await waitUntilReady(server);
+  await nativePersisted();
   const persisted = await browserJson<{ messages: Array<{ messageId: string }> }>(
     "/api/v1/messages",
     sessionA,
@@ -729,9 +732,120 @@ interface DeviceFixture {
   privateKey: KeyObject;
 }
 
+async function testNativeContent(db: Connection, foreignSession: string, foreignDevice: DeviceFixture): Promise<() => Promise<void>> {
+  const session = await createIosSession();
+  const device = await pairDevice(session);
+  const original: NativeAsset = { id: randomUUID(), kind: "audio", mimeType: "audio/silk", byteLength: 8 * 1024 * 1024, role: "original" };
+  const playback: NativeAsset = { id: randomUUID(), kind: "audio", mimeType: "audio/wav", byteLength: 2048, role: "playback", derivedFrom: original.id };
+  function message(seq: number, nativeAssets: NativeAsset[], profile = 999) {
+    const id = randomUUID();
+    const createdAt = Date.now();
+    const sealed = (kid: string, aad: string) => ({ alg: "A256GCM", kid, aad, iv: randomBytes(12).toString("base64url"), ct: randomBytes(32).toString("base64url") });
+    return {
+      v: 6, id, deviceId: device.deviceId, seq, createdAt, wechatUserId: profile,
+      replyCapable: false, conversationSendCapable: false, assets: [], nativeAssets,
+      previewEnvelope: sealed("phase1", `AWR1|A2I|${id}|${device.deviceId}|${seq}|${createdAt}|${profile}`),
+      contentEnvelope: sealed("phase2-content", `AWR1|A2I_CONTENT|6|${id}|${device.deviceId}|${seq}|${createdAt}|${profile}`),
+    };
+  }
+  const first = message(1, [original, playback]);
+  const post = (value: object) => {
+    const body = JSON.stringify(value);
+    return fetch(`${origin}/api/v1/android/messages`, { method: "POST", headers: signedHeaders(device, body, "POST", "/api/v1/android/messages"), body });
+  };
+  const get = (path: string, token = session, pairId = device.pairId) => fetch(`${origin}${path}`, { headers: browserHeaders(token, pairId) });
+  await assertResponseStatus(await post(first), 202);
+  const repeated = await post(first);
+  assert.deepEqual(await repeated.json(), { id: first.id, idempotent: true });
+  await assertResponseStatus(await post({ ...first, replyCapable: true }), 400);
+  await assertResponseStatus(await post({ ...first, conversationSendCapable: true }), 400);
+  await assertResponseStatus(await post({ ...first, contentEnvelope: { ...first.contentEnvelope, ct: randomBytes(32).toString("base64url") } }), 400);
+  const sequenceCollision = await post(message(1, [], 0));
+  assert.deepEqual(await sequenceCollision.json(), { error: "INVALID_SEQUENCE" });
+  await updateRelayPolicy(session, device.pairId, false, false);
+  assert.deepEqual(await (await post(first)).json(), { id: first.id, idempotent: true });
+  await updateRelayPolicy(session, device.pairId, true, false);
+
+  const list = await browserJson<{ messages: Array<Record<string, unknown>> }>("/api/v1/messages", session, device.pairId);
+  assert.equal(list.messages[0]!.hasNativeContent, true);
+  assert.deepEqual(list.messages[0]!.nativeAssets, [original, playback]);
+  assert.equal(list.messages[0]!.contentEnvelope, undefined);
+  assert.equal(list.messages[0]!.replyCapable, false);
+  assert.equal(list.messages[0]!.conversationSendCapable, false);
+  const contentPath = `/api/v1/ios/messages/${first.id}/content`;
+  assert.deepEqual(await (await get(contentPath)).json(), { contentEnvelope: first.contentEnvelope });
+  await assertResponseStatus(await get(contentPath, foreignSession, foreignDevice.pairId), 404);
+  await assertResponseStatus(await get(`/api/v1/ios/messages/${randomUUID()}/content`), 404);
+  const originalPath = `/api/v1/ios/assets/${original.id}`;
+  const pending = await get(originalPath);
+  assert.equal(pending.status, 409);
+  assert.deepEqual(await pending.json(), { error: "ASSET_PENDING" });
+  await assertResponseStatus(await get(originalPath, foreignSession, foreignDevice.pairId), 404);
+  await assertResponseStatus(await get(`/api/v1/ios/assets/${randomUUID()}`), 404);
+
+  function assetEnvelope(asset: NativeAsset) {
+    return { alg: "A256GCM", kid: "phase2-asset", iv: randomBytes(12).toString("base64url"),
+      aad: `AWR1|A2I_ASSET|6|${first.id}|${asset.id}|${device.deviceId}|1|${first.createdAt}|999|${asset.kind}|${asset.mimeType}|${asset.byteLength}|${asset.role}|${asset.derivedFrom ?? ""}`,
+      ct: randomBytes(asset.byteLength + 16).toString("base64url") };
+  }
+  const originalEnvelope = assetEnvelope(original);
+  const playbackEnvelope = assetEnvelope(playback);
+  const upload = (asset: NativeAsset, envelope: object, signedDevice = device, messageId = first.id) => {
+    const path = `/api/v1/android/messages/${messageId}/assets/${asset.id}`;
+    const body = JSON.stringify({ envelope });
+    return fetch(`${origin}${path}`, { method: "POST", headers: signedHeaders(signedDevice, body, "POST", path), body });
+  };
+  await assertResponseStatus(await upload(original, originalEnvelope, foreignDevice), 404);
+  await assertResponseStatus(await upload(original, originalEnvelope, device, randomUUID()), 404);
+  await assertResponseStatus(await upload(original, { ...originalEnvelope, ct: randomBytes(1041).toString("base64url") }), 400);
+  const uploaded = await upload(original, originalEnvelope);
+  assert.equal(uploaded.status, 201);
+  assert.deepEqual(await uploaded.json(), { id: original.id, idempotent: false });
+  const retry = await upload(original, originalEnvelope);
+  assert.equal(retry.status, 200);
+  assert.deepEqual(await retry.json(), { id: original.id, idempotent: true });
+  const conflicting = await upload(original, assetEnvelope(original));
+  assert.equal(conflicting.status, 409);
+  assert.deepEqual(await conflicting.json(), { error: "NATIVE_ASSET_CONFLICT" });
+  assert.deepEqual(await (await get(originalPath)).json(), { ...original, envelope: originalEnvelope });
+  const concurrentUploads = await Promise.all([upload(playback, playbackEnvelope), upload(playback, playbackEnvelope)]);
+  assert.deepEqual(concurrentUploads.map((response) => response.status).sort(), [200, 201]);
+  await assertResponseStatus(await post(message(2, [original])), 409);
+
+  // Reserve almost the full quota without allocating ciphertext for pending declarations.
+  const large = (): NativeAsset => ({ id: randomUUID(), kind: "file", mimeType: "application/octet-stream", byteLength: 8 * 1024 * 1024, role: "original" });
+  for (let seq = 2; seq <= 5; seq++)
+    await assertResponseStatus(await post(message(seq, Array.from({ length: seq === 5 ? 6 : 8 }, large))), 202);
+  const racers = await Promise.all([6, 7].map((seq) => post(message(seq, [{ ...large(), byteLength: 5 * 1024 * 1024 }]))));
+  assert.equal(racers.filter((response) => response.status === 202).length, 1);
+  assert.equal(racers.filter((response) => response.status === 409 || response.status === 400).length, 1);
+  const quotaRejected = await post(message(8, [large()]));
+  assert.equal(quotaRejected.status, 409);
+  assert.deepEqual(await quotaRejected.json(), { error: "NATIVE_QUOTA_EXCEEDED" });
+  const [[reserved]] = await db.query<(mysql.RowDataPacket & { total: string })[]>(
+    "SELECT SUM(byte_length) AS total FROM native_assets JOIN messages ON messages.id = native_assets.message_id WHERE messages.device_id = ?", [device.deviceId]);
+  assert.ok(Number(reserved!.total) <= 256 * 1024 * 1024);
+
+  await db.execute("UPDATE native_assets SET expires_at = ? WHERE id = ?", [Date.now() - 1, original.id]);
+  await assertResponseStatus(await post(message(8, [])), 202);
+  const expired = await get(originalPath);
+  assert.equal(expired.status, 410);
+  assert.deepEqual(await expired.json(), { error: "ASSET_EXPIRED" });
+  await assertResponseStatus(await upload(original, originalEnvelope), 410);
+  assert.deepEqual(await (await post(first)).json(), { id: first.id, idempotent: true });
+  const [[removed]] = await db.query<(mysql.RowDataPacket & { count: number })[]>("SELECT COUNT(*) AS count FROM native_asset_payloads WHERE asset_id = ?", [original.id]);
+  assert.equal(Number(removed!.count), 0);
+
+  return async () => {
+    assert.deepEqual(await (await get(contentPath)).json(), { contentEnvelope: first.contentEnvelope });
+    assert.deepEqual(await (await get(`/api/v1/ios/assets/${playback.id}`)).json(), { ...playback, envelope: playbackEnvelope });
+    await assertResponseStatus(await get(originalPath), 410);
+  };
+}
+
 async function applyMigrations(admin: Connection, database: string): Promise<void> {
   await admin.query(`USE \`${database}\``);
-  for (const name of ["001-baseline.sql", "002-multi-pair-browser-sessions.sql", "003-message-reply-capability.sql", "004-conversation-send-capability.sql", "005-relay-policy.sql", "006-contacts-snapshots.sql", "007-contact-send-replies.sql"])
+  for (const name of ["001-baseline.sql", "002-multi-pair-browser-sessions.sql", "003-message-reply-capability.sql", "004-conversation-send-capability.sql", "005-relay-policy.sql", "006-contacts-snapshots.sql", "007-contact-send-replies.sql", "008-native-content.sql"])
     await admin.query(await readFile(new URL(`../scripts/migrations/${name}`, import.meta.url), "utf8"));
 }
 

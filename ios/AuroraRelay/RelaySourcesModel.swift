@@ -140,7 +140,7 @@ final class RelayAppModel: ObservableObject {
     }
     func canSend(to friend: RelayFriend) -> Bool { connections[friend.source]?.canSend(to: friend) == true }
     func avatarItem(for friend: RelayFriend) -> InboxItem? { connections[friend.source]?.avatarItem(for: friend) }
-    func markRead(_ conversationID: String) { connection(for: conversationID)?.markRead(conversationID) }
+    func markRead(_ conversationID: String) { let id = resolvedConversationID(conversationID); connection(for: id)?.markRead(id) }
     func send(_ body: String, to item: InboxItem) async throws {
         guard let connection = connections[item.source], connection.session?.pairId == item.pairID else { throw RelayError.invalidValue("message source") }
         try await connection.send(body, to: item)
@@ -153,6 +153,17 @@ final class RelayAppModel: ObservableObject {
     func image(for metadata: RelayAssetMetadata, in item: InboxItem) async throws -> UIImage {
         guard let connection = connections[item.source], connection.session?.pairId == item.pairID else { throw RelayError.invalidValue("asset source") }
         return try await connection.image(for: metadata, in: item.message)
+    }
+    func resolvedConversationID(_ id: String) -> String { items.first(where: { $0.pendingConversationID == id })?.conversationID ?? id }
+    func loadNativeContent(for item: InboxItem) async throws -> RelayNativeContent {
+        guard let connection = connections[item.source], connection.session?.pairId == item.pairID else { throw RelayError.invalidValue("content source") }
+        return try await connection.loadNativeContent(for: item)
+    }
+    func nativeContentProblem(for item: InboxItem) -> String? { connections[item.source]?.nativeContentProblems[item.id] }
+    func nativeLastSync(for item: InboxItem) -> Date? { connections[item.source]?.lastSync }
+    func nativeAssetURL(_ metadata: RelayNativeAssetMetadata, in item: InboxItem) async throws -> URL {
+        guard let connection = connections[item.source], connection.session?.pairId == item.pairID else { throw RelayError.invalidValue("asset source") }
+        return try await connection.nativeAssetURL(metadata, in: item)
     }
     private func connection(for conversationID: String) -> RelayConnectionModel? {
         connections.values.first { connection in connection.session.map { connection.source.owns(conversationID, pairID: $0.pairId) } == true }

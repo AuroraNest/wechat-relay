@@ -76,3 +76,17 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -project ios
 新增 `RelaySourceTests` 覆盖默认选择, 同名会话隔离, 未知/歧义通知路由, 旧 Keychain 与缓存迁移及迁移冲突保留. UI 测试在 `--demo` 的两个独立虚构来源中发送不同回复, 验证切换隔离, 混合双会话和切回记录. 演示不访问服务或保存真实配对, 不能替代真实消息收发验收.
 
 当前 Linux 环境没有 Swift/Xcode, 上述测试和 iOS 编译尚未在此环境运行. Mac/CI 构建后还需真机验证: 旧版升级保留小米历史, 平板独立配对, 混合同名好友分别回复/附件, 各来源通知预览与快捷回复, 切换时离线后恢复, 双来源分别断开和重新配对. 平板接入端是否已完成真实登录, 采集, 联系人和发送能力需独立验收; iPhone 不伪造这些来源端能力.
+
+## v6 原始正文与附件
+
+兼容旧预览/图片消息. 新消息通过 `hasNativeContent` 与独立 `nativeAssets` 声明原始内容, 消息列表不包含完整正文密文. App 使用当前来源的 pair/session 单独 GET `/api/v1/ios/messages/:messageId/content`, 校验 `phase2-content` AAD 后解密. 正文允许至 1 MiB, 不用 600-byte 通知预览替代正文. 前台每轮最多补取 8 条缺少正文的消息, 打开消息可立即请求该条. 正文保存在原有来源/pair 的加密 inbox cache 中.
+
+会话身份使用原始稳定 `conversationId`, 加上 source, pairId 和微信空间, 同名或改名不会造成跨会话合并. 群内 `senderName` 独立显示. 可选 `isOutgoing=true` 表示本人已发送的原消息, 在右侧展示且不计未读; 缺省按收到消息处理. v6 只读, 不借用旧通知的回复入口. 完整文本和嵌套记录提供的文本直接展示, `rawXML` 可查看或分享, 始终按纯文本处理, 不运行 HTML/JavaScript. 没有提供的记录内嵌文件不会伪装成可下载附件.
+
+原始附件走 GET `/api/v1/ios/assets/:assetId`, 校验消息/asset/设备/seq/时间/空间/kind/MIME/大小/role/derivedFrom 全部 AAD 字段, 校验实际字节数, 若加密正文提供 SHA-256 则同时验证. 每附件上限 8 MiB, 每消息至多 8 件. `original` 和 `playback` 分开显示, 衍生播放版本必须指向同消息中同种类的原件, 不覆盖原始字节. 图片原件可保存和分享; 屏幕预览降采样到 2048, 原件分享不降采样. 音频/视频使用 AVPlayer, PDF/文本等使用系统文件预览. iPhone 无法播放的原始编码 (例如 SILK) 明确提示保存原件, 不转写为文本, 不隐式转码.
+
+附件 cache 仅保留密文 envelope, 按 source/pair/message/asset 分开, 每来源/pair 上限 128 MiB并淘汰较旧缓存. 播放/文件分享需要本机临时明文文件, 这些文件使用完整 Data Protection, 在下一次 App 启动以及清空记录/断开对应来源时清除. 临时文件名只取已解密名称的安全 basename. 用户通过系统分享另存的副本由所选目标应用管理.
+
+已声明但未上传完成的附件返回 `409 ASSET_PENDING`, 到期返回 `410 ASSET_EXPIRED`. 图片显示时请求, 其他类型点下载后请求. pending 附件按 0/5/15 秒间隔重试, 每个可见卡片每轮前台至多 6 次; 前台同步完成可触发剩余次数, 手动重试或 App 重新进入前台重置次数. 不依赖新的消息 seq. 到期/其他失败不自动循环下载. 切后台/离开卡片会取消其等待或请求.
+
+新增 `RelayNativeContentTests` 验证旧消息兼容, 全文和记录/XML保真, 自发消息方向, 稳定身份与source/pair隔离, 原始SILK字节保真, 元数据/AAD/密钥/摘要/长度拒绝, playback关系及409/410/404状态. `--demo --demo-native` 可查看纯虚构的完整引用/记录/文件, UI 测试检查完整正文, 安全XML文本, 原件下载/分享入口和混合来源隔离. 当前 Linux 无 Swift/Xcode, 这些新测试及原生编译仍需 macOS CI执行. 真实微信附件是否可提取, 原始格式是否可播放, APNs跳转和实际真机保存仍需来源端与真机联合验收.

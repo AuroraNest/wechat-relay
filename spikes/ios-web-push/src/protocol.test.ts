@@ -80,6 +80,7 @@ test("Nginx separates control, data, and long-lived protocol traffic", async () 
     assert.match(config, /location @control_rate_limited \{[\s\S]*?add_header Retry-After 6 always/);
     assert.match(config, /location @data_rate_limited \{[\s\S]*?add_header Retry-After 1 always/);
     assert.match(config, /location = \/api\/v1\/android\/messages \{[\s\S]*?client_max_body_size 24m;[\s\S]*?limit_req zone=awr_data burst=20 nodelay;/);
+    assert.match(config, /location ~ \^\/api\/v1\/android\/messages\/\[\^\/\]\+\/assets\/\[\^\/\]\+\$ \{\s*client_max_body_size 12m;/);
     for (const path of ["/api/v1/messages/stream", "/api/v1/ios/events", "/api/v1/android/replies", "/api/v1/android/replies/v4"]) {
       const location = config.match(new RegExp(`location = ${path.replaceAll("/", "\\/")} \\{([\\s\\S]*?)\\n    \\}`))?.[1] ?? "";
       assert.match(location, /limit_req zone=awr_data burst=20 nodelay/);
@@ -110,7 +111,7 @@ test("message v4/v5 reply capability is persisted and defaults legacy messages t
   const server = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
   const migration = await readFile(new URL("../scripts/migrations/003-message-reply-capability.sql", import.meta.url), "utf8");
   const android = await readFile(new URL("../../android-notification-probe/app/src/main/java/com/aurora/wechatrelay/probe/SyncNetwork.kt", import.meta.url), "utf8");
-  assert.match(server, /message\.v === 4 \|\| message\.v === 5 \? message\.replyCapable : false/);
+  assert.match(server, /message\.v === 4 \|\| message\.v === 5 \|\| message\.v === 6 \? message\.replyCapable : false/);
   assert.match(server, /throw new Error\("REPLY_UNSUPPORTED"\)/);
   assert.match(migration, /ADD COLUMN reply_capable TINYINT\(1\) NOT NULL DEFAULT 0/);
   assert.match(android, /\\"v\\":5/);

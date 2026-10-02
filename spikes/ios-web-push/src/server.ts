@@ -35,6 +35,16 @@ import { createClient, type RedisClientType } from "redis";
 import { pool, transaction, verifySchema } from "./mysql.js";
 import { classifyRequestError } from "./errors.js";
 import {
+  MAX_NATIVE_ASSET_BODY_BYTES,
+  NATIVE_ASSET_TTL_MS,
+  NATIVE_PAIR_QUOTA_BYTES,
+  validateNativeAssets,
+  validateNativeAssetUpload,
+  validateNativeContent,
+  validateNativePreview,
+  type NativeAsset,
+} from "./native-content.js";
+import {
   DEFAULT_RELAY_POLICY,
   relayActive,
   relayPolicyJson,
@@ -120,7 +130,7 @@ interface MessageRecord {
   pairId: string;
 }
 interface AndroidMessage {
-  v: 1 | 2 | 3 | 4 | 5;
+  v: 1 | 2 | 3 | 4 | 5 | 6;
   id: string;
   deviceId: string;
   seq: number;
@@ -130,6 +140,8 @@ interface AndroidMessage {
   wechatUserId: 0 | 999;
   replyCapable: boolean;
   conversationSendCapable: boolean;
+  contentEnvelope?: PreviewEnvelope;
+  nativeAssets?: NativeAsset[];
 }
 interface AndroidAsset {
   id: string;
@@ -227,6 +239,7 @@ if (storageKey.length !== 32)
 await mkdir(dataDir, { recursive: true, mode: 0o700 });
 await mkdir(messagesDir, { recursive: true, mode: 0o700 });
 await verifySchema();
+await cleanExpiredNativeAssets();
 await importLegacySubscription();
 await initializeCache();
 webpush.setVapidDetails(vapidSubject, vapidPublicKey, vapidPrivateKey);
@@ -236,6 +249,8 @@ const outboxPoll = setInterval(() => void recoverOutbox(), 30_000);
 outboxPoll.unref();
 const nonceCleanup = setInterval(() => void cleanExpiredNonces(), 60_000);
 nonceCleanup.unref();
+const nativeAssetCleanup = setInterval(() => void cleanExpiredNativeAssets().catch(() => event("NATIVE_ASSET_CLEANUP_FAILED", {})), 60_000);
+nativeAssetCleanup.unref();
 
 createServer(async (request, response) => {
   try {
@@ -358,6 +373,14 @@ async function route(
     return updateBrowserRelayPolicy(request, response);
   if (request.method === "POST" && url.pathname === "/api/v1/android/messages")
     return uploadAndroidMessage(request, response);
+  const nativeUpload = /^\/api\/v1\/android\/messages\/([^/]+)\/assets\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "POST" && nativeUpload)
+    return uploadNativeAsset(request, response, url.pathname, nativeUpload[1]!, nativeUpload[2]!);
+  const nativeContent = /^\/api\/v1\/ios\/messages\/([^/]+)\/content$/.exec(url.pathname);
+  if (request.method === "GET" && nativeContent)
+    return getNativeContent(request, response, nativeContent[1]!);
+  if (request.method === "GET" && url.pathname.startsWith("/api/v1/ios/assets/"))
+    return getNativeAsset(request, response, url.pathname.slice("/api/v1/ios/assets/".length));
   if (request.method === "POST" && url.pathname === "/api/v1/android/contacts")
     return uploadAndroidContacts(request, response);
   if (request.method === "GET" && url.pathname === "/api/v1/ios/contacts")
@@ -455,9 +478,10 @@ async function route(
       wechat_user_id: string | number;
       reply_capable: string | number;
       conversation_send_capable: string | number;
+      native_assets_json: string | null;
     }>(
       pool,
-      "SELECT messages.id, messages.device_id, messages.wechat_user_id, messages.reply_capable, messages.conversation_send_capable, messages.seq, messages.created_at, messages.envelope_json, messages.assets_json, messages.received_at FROM messages JOIN devices ON devices.device_id = messages.device_id WHERE devices.pair_id = ? AND messages.seq < ? ORDER BY messages.seq DESC, messages.wechat_user_id DESC LIMIT 21",
+      "SELECT messages.id, messages.device_id, messages.wechat_user_id, messages.reply_capable, messages.conversation_send_capable, messages.seq, messages.created_at, messages.envelope_json, messages.assets_json, messages.received_at, native_contents.assets_json AS native_assets_json FROM messages JOIN devices ON devices.device_id = messages.device_id LEFT JOIN native_contents ON native_contents.message_id = messages.id WHERE devices.pair_id = ? AND messages.seq < ? ORDER BY messages.seq DESC, messages.wechat_user_id DESC LIMIT 21",
       [pairId, beforeSeq ?? Number.MAX_SAFE_INTEGER],
     );
     const hasMore = messages.length > 20;
@@ -476,6 +500,7 @@ async function route(
         receivedAt: dbInteger(message.received_at),
         previewEnvelope: JSON.parse(message.envelope_json),
         assets: message.assets_json ? JSON.parse(message.assets_json).map(assetMetadata) : [],
+        ...(message.native_assets_json !== null ? { hasNativeContent: true, nativeAssets: JSON.parse(message.native_assets_json) } : {}),
       })),
       nextCursor: hasMore ? String(dbInteger(page.at(-1)!.seq)) : null,
       hasMore,
@@ -943,14 +968,14 @@ async function uploadAndroidMessage(
     );
     if (!lockedDevice) throw new Error("DEVICE_UNKNOWN");
     await consumeAndroidNonce(connection, message.deviceId, nonce, now);
-    const policy = await loadRelayPolicy(lockedDevice.pair_id, connection);
-    if (!relayActive(policy))
-      return { idempotent: false, pairId: lockedDevice.pair_id, dropped: true };
     const existing = await dbOne<{ body_hash: Buffer }>(
       connection,
       "SELECT body_hash FROM messages WHERE id = ?",
       [message.id],
     );
+    const policy = await loadRelayPolicy(lockedDevice.pair_id, connection);
+    if (!relayActive(policy) && !(message.v === 6 && existing))
+      return { idempotent: false, pairId: lockedDevice.pair_id, dropped: true };
     if (existing) {
       if (!timingSafeBufferEqual(existing.body_hash, bodyHash))
         throw new Error("MESSAGE_ID_CONFLICT");
@@ -989,6 +1014,28 @@ async function uploadAndroidMessage(
       "INSERT INTO push_outbox(message_id, payload, queued_at) VALUES (?, ?, ?)",
       [message.id, payload, now],
     );
+    if (message.v === 6) {
+      const assets = message.nativeAssets!;
+      await cleanExpiredNativeAssets(connection, now);
+      const quota = await dbOne<{ reserved: string | number }>(
+        connection,
+        "SELECT COALESCE(SUM(native_assets.byte_length), 0) AS reserved FROM native_assets JOIN messages ON messages.id = native_assets.message_id WHERE messages.device_id = ? AND native_assets.expires_at > ?",
+        [message.deviceId, now],
+      );
+      if (dbInteger(quota?.reserved ?? 0) + assets.reduce((sum, asset) => sum + asset.byteLength, 0) > NATIVE_PAIR_QUOTA_BYTES)
+        throw new Error("NATIVE_QUOTA_EXCEEDED");
+      await dbRun(connection, "INSERT INTO native_contents(message_id, envelope_json, assets_json) VALUES (?, ?, ?)",
+        [message.id, JSON.stringify(message.contentEnvelope), JSON.stringify(assets)]);
+      for (const asset of assets) {
+        try {
+          await dbRun(connection, "INSERT INTO native_assets(id, message_id, byte_length, metadata_json, expires_at) VALUES (?, ?, ?, ?, ?)",
+            [asset.id, message.id, asset.byteLength, JSON.stringify(asset), now + NATIVE_ASSET_TTL_MS]);
+        } catch (error) {
+          if (isUniqueConstraint(error)) throw new Error("NATIVE_ASSET_CONFLICT");
+          throw error;
+        }
+      }
+    }
     return { idempotent: false, pairId: lockedDevice.pair_id, dropped: false };
   });
   if (stored.dropped) {
@@ -1074,6 +1121,81 @@ async function uploadAndroidContacts(
     return false;
   });
   json(response, idempotent ? 200 : 201, { id: snapshot.id, idempotent });
+}
+
+async function cleanExpiredNativeAssets(executor: DbExecutor = pool, now = Date.now()): Promise<void> {
+  await dbRun(executor,
+    "DELETE native_asset_payloads FROM native_asset_payloads JOIN native_assets ON native_assets.id = native_asset_payloads.asset_id WHERE native_assets.expires_at <= ?",
+    [now]);
+}
+
+async function uploadNativeAsset(
+  request: IncomingMessage,
+  response: ServerResponse,
+  pathname: string,
+  messageId: string,
+  assetId: string,
+): Promise<void> {
+  const { bytes, json: value } = await bodyJson(request, MAX_NATIVE_ASSET_BODY_BYTES);
+  const signed = await authenticateAndroidRequest(request, bytes, "POST", pathname);
+  const result = await transaction(async (connection) => {
+    // Share the reservation lock with message acceptance to serialize uploads and expiry checks.
+    await dbOne(connection, "SELECT device_id FROM devices WHERE device_id = ? FOR UPDATE", [signed.deviceId]);
+    const now = Date.now();
+    await consumeAndroidNonce(connection, signed.deviceId, signed.nonce, now);
+    const asset = await dbOne<{
+      metadata_json: string;
+      expires_at: string | number;
+      seq: string | number;
+      created_at: string | number;
+      wechat_user_id: 0 | 999;
+    }>(connection,
+      "SELECT native_assets.metadata_json, native_assets.expires_at, messages.seq, messages.created_at, messages.wechat_user_id FROM native_assets JOIN messages ON messages.id = native_assets.message_id WHERE native_assets.id = ? AND messages.id = ? AND messages.device_id = ?",
+      [assetId, messageId, signed.deviceId]);
+    if (!asset) return { status: 404, body: { error: "NOT_FOUND" } };
+    if (dbInteger(asset.expires_at) <= now) return { status: 410, body: { error: "ASSET_EXPIRED" } };
+    const envelope = validateNativeAssetUpload(value, {
+      id: messageId, deviceId: signed.deviceId, seq: dbInteger(asset.seq),
+      createdAt: dbInteger(asset.created_at), wechatUserId: asset.wechat_user_id,
+    }, JSON.parse(asset.metadata_json) as NativeAsset);
+    const serialized = JSON.stringify(envelope);
+    if (Buffer.byteLength(serialized) > MAX_NATIVE_ASSET_BODY_BYTES) throw new Error("BODY_TOO_LARGE");
+    const hash = createHash("sha256").update(serialized).digest();
+    const existing = await dbOne<{ envelope_hash: Buffer }>(connection,
+      "SELECT envelope_hash FROM native_asset_payloads WHERE asset_id = ?", [assetId]);
+    if (existing) {
+      if (!timingSafeBufferEqual(existing.envelope_hash, hash)) throw new Error("NATIVE_ASSET_CONFLICT");
+      return { status: 200, body: { id: assetId, idempotent: true } };
+    }
+    await dbRun(connection,
+      "INSERT INTO native_asset_payloads(asset_id, envelope_json, envelope_hash) VALUES (?, ?, ?)",
+      [assetId, serialized, hash]);
+    return { status: 201, body: { id: assetId, idempotent: false } };
+  });
+  response.setHeader("Cache-Control", "no-store");
+  json(response, result.status, result.body);
+}
+
+async function getNativeContent(request: IncomingMessage, response: ServerResponse, messageId: string): Promise<void> {
+  const { pairId } = await authorizeBrowserPair(request, false);
+  const content = await dbOne<{ envelope_json: string }>(pool,
+    "SELECT native_contents.envelope_json FROM native_contents JOIN messages ON messages.id = native_contents.message_id JOIN devices ON devices.device_id = messages.device_id WHERE native_contents.message_id = ? AND devices.pair_id = ?",
+    [messageId, pairId]);
+  response.setHeader("Cache-Control", "no-store");
+  if (!content) return json(response, 404, { error: "NOT_FOUND" });
+  json(response, 200, { contentEnvelope: JSON.parse(content.envelope_json) });
+}
+
+async function getNativeAsset(request: IncomingMessage, response: ServerResponse, assetId: string): Promise<void> {
+  const { pairId } = await authorizeBrowserPair(request, false);
+  const asset = await dbOne<{ metadata_json: string; expires_at: string | number; envelope_json: string | null }>(pool,
+    "SELECT native_assets.metadata_json, native_assets.expires_at, native_asset_payloads.envelope_json FROM native_assets JOIN messages ON messages.id = native_assets.message_id JOIN devices ON devices.device_id = messages.device_id LEFT JOIN native_asset_payloads ON native_asset_payloads.asset_id = native_assets.id WHERE native_assets.id = ? AND devices.pair_id = ?",
+    [assetId, pairId]);
+  response.setHeader("Cache-Control", "no-store");
+  if (!asset) return json(response, 404, { error: "NOT_FOUND" });
+  if (dbInteger(asset.expires_at) <= Date.now()) return json(response, 410, { error: "ASSET_EXPIRED" });
+  if (!asset.envelope_json) return json(response, 409, { error: "ASSET_PENDING" });
+  json(response, 200, { ...JSON.parse(asset.metadata_json), envelope: JSON.parse(asset.envelope_json) });
 }
 
 async function getIosContacts(
@@ -1360,7 +1482,7 @@ function validateAndroidMessage(value: unknown): AndroidMessage {
   if (!value || typeof value !== "object") throw new Error("INVALID_MESSAGE");
   const message = value as Partial<AndroidMessage>;
   if (
-    (message.v !== 1 && message.v !== 2 && message.v !== 3 && message.v !== 4 && message.v !== 5) ||
+    (message.v !== 1 && message.v !== 2 && message.v !== 3 && message.v !== 4 && message.v !== 5 && message.v !== 6) ||
     !isUuid(message.id) ||
     !isDeviceId(message.deviceId) ||
     !Number.isSafeInteger(message.seq) ||
@@ -1369,15 +1491,15 @@ function validateAndroidMessage(value: unknown): AndroidMessage {
     Math.abs(Date.now() - message.createdAt!) > 172_800_000
   )
     throw new Error("INVALID_MESSAGE");
-  const profileVersion = message.v === 3 || message.v === 4 || message.v === 5;
+  const profileVersion = message.v === 3 || message.v === 4 || message.v === 5 || message.v === 6;
   const wechatUserId = profileVersion ? message.wechatUserId : 0;
   if (wechatUserId !== 0 && wechatUserId !== 999)
     throw new Error("INVALID_PROFILE");
-  const replyCapable = message.v === 4 || message.v === 5 ? message.replyCapable : false;
-  if ((message.v === 4 || message.v === 5) && typeof replyCapable !== "boolean")
+  const replyCapable = message.v === 4 || message.v === 5 || message.v === 6 ? message.replyCapable : false;
+  if ((message.v === 4 || message.v === 5 || message.v === 6) && (typeof replyCapable !== "boolean" || (message.v === 6 && replyCapable)))
     throw new Error("INVALID_REPLY_CAPABILITY");
-  const conversationSendCapable = message.v === 5 ? message.conversationSendCapable : false;
-  if (message.v === 5 && typeof conversationSendCapable !== "boolean")
+  const conversationSendCapable = message.v === 5 || message.v === 6 ? message.conversationSendCapable : false;
+  if ((message.v === 5 || message.v === 6) && (typeof conversationSendCapable !== "boolean" || (message.v === 6 && conversationSendCapable)))
     throw new Error("INVALID_CONVERSATION_SEND_CAPABILITY");
   if (conversationSendCapable && !replyCapable)
     throw new Error("INVALID_CONVERSATION_SEND_CAPABILITY");
@@ -1400,6 +1522,13 @@ function validateAndroidMessage(value: unknown): AndroidMessage {
   if (message.v === 1 && message.assets !== undefined) throw new Error("INVALID_ASSETS");
   const assets = message.assets ?? [];
   if (!Array.isArray(assets) || assets.length > 2) throw new Error("INVALID_ASSETS");
+  if (message.v === 6) {
+    if (assets.length) throw new Error("INVALID_ASSETS");
+    const context = message as AndroidMessage;
+    validateNativePreview(message.previewEnvelope, context);
+    validateNativeContent(message.contentEnvelope, context);
+    validateNativeAssets(message.nativeAssets);
+  }
   const ids = new Set<string>();
   for (const asset of assets) {
     if (!asset || typeof asset !== "object") throw new Error("INVALID_ASSET");

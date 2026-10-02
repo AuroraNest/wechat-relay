@@ -1,6 +1,8 @@
 const conflictErrorCodes = new Set([
   "CONTACTS_ID_CONFLICT",
   "CONTACTS_SNAPSHOT_STALE",
+  "NATIVE_ASSET_CONFLICT",
+  "NATIVE_QUOTA_EXCEEDED",
 ]);
 
 const clientErrorCodes = new Set([
@@ -29,6 +31,8 @@ const clientErrorCodes = new Set([
   "INVALID_IOS_SESSION",
   "INVALID_KID",
   "INVALID_MESSAGE",
+  "INVALID_NATIVE_ASSETS",
+  "INVALID_NATIVE_ENVELOPE",
   "INVALID_MESSAGE_ID",
   "INVALID_NONCE",
   "INVALID_ORIGIN",
