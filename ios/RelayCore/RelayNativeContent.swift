@@ -61,6 +61,14 @@ public struct RelayNativeContent: Codable, Sendable, Equatable {
         public let assetId: UUID
         public let name: String
         public let sha256: String?
+        public let recordItemIndex: Int?
+
+        public init(assetId: UUID, name: String, sha256: String? = nil, recordItemIndex: Int? = nil) {
+            self.assetId = assetId
+            self.name = name
+            self.sha256 = sha256
+            self.recordItemIndex = recordItemIndex
+        }
     }
     public struct Record: Codable, Sendable, Equatable {
         public let senderName: String
@@ -85,6 +93,9 @@ public struct RelayNativeContent: Codable, Sendable, Equatable {
               attachments.count <= 8, Set(attachments.map(\.assetId)).count == attachments.count,
               Set(attachments.map(\.assetId)) == Set(message.nativeAssets.map(\.id)) else { throw RelayError.invalidResponse }
         for attachment in attachments {
+            if let index = attachment.recordItemIndex {
+                guard let records, records.indices.contains(index) else { throw RelayError.invalidResponse }
+            }
             if let sha256 = attachment.sha256 {
                 guard sha256.range(of: "^[a-fA-F0-9]{64}$", options: .regularExpression) != nil else { throw RelayError.invalidResponse }
             }

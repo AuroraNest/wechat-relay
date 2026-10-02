@@ -22,17 +22,22 @@ struct NativeContentView: View {
                 if !content.text.isEmpty { Text(verbatim: content.text).textSelection(.enabled).font(.body).lineSpacing(4) }
                 if let records = content.records, !records.isEmpty {
                     DisclosureGroup("聊天记录 (\(records.count) 条)") {
-                        ForEach(Array(records.enumerated()), id: \.offset) { _, record in
+                        ForEach(Array(records.enumerated()), id: \.offset) { index, record in
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(verbatim: record.senderName + " · " + record.kind.label).font(.caption).foregroundStyle(.secondary)
                                 if !record.text.isEmpty { Text(verbatim: record.text).textSelection(.enabled) }
                                 if let xml = record.rawXML, !xml.isEmpty { NativeRawTextLink(text: xml) }
+                                ForEach(content.attachments.filter { $0.recordItemIndex == index }, id: \.assetId) { reference in
+                                    if let metadata = item.message.nativeAssets.first(where: { $0.id == reference.assetId }) {
+                                        NativeAttachmentView(metadata: metadata, reference: reference, item: item)
+                                    }
+                                }
                             }.padding(.vertical, 6)
                         }
                     }
                 }
                 if let xml = content.rawXML, !xml.isEmpty { NativeRawTextLink(text: xml) }
-                ForEach(item.message.nativeAssets) { metadata in
+                ForEach(item.message.nativeAssets.filter { metadata in content.attachments.first(where: { $0.assetId == metadata.id })?.recordItemIndex == nil }) { metadata in
                     NativeAttachmentView(metadata: metadata, reference: content.attachments.first { $0.assetId == metadata.id }, item: item)
                 }
                 if (content.kind == .record || content.kind == .reference) && item.message.nativeAssets.isEmpty {

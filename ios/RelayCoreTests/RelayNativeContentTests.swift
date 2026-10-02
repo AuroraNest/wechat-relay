@@ -95,6 +95,25 @@ struct RelayNativeContentTests {
         #expect(throws: RelayError.invalidResponse) { try content(attachments: [.init(assetId: UUID(), name: "unknown.txt", sha256: nil)]).validate(for: message(assets: [original])) }
     }
 
+    @Test func recordAttachmentAssociationAcceptsValidIndexAndRejectsOutOfBounds() throws {
+        let metadata = try RelayNativeAssetMetadata(id: assetID, kind: .image, mimeType: "image/jpeg", byteLength: 16, role: .original)
+        let message = try message(assets: [metadata])
+        let associated = content(attachments: [.init(assetId: assetID, name: "record-image.jpg", recordItemIndex: 0)])
+        let decoded = try JSONDecoder().decode(RelayNativeContent.self, from: JSONEncoder().encode(associated))
+        try decoded.validate(for: message)
+        #expect(decoded.attachments.first?.recordItemIndex == 0)
+        for index in [-1, 1, Int.max] {
+            #expect(throws: RelayError.invalidResponse) {
+                try content(attachments: [.init(assetId: assetID, name: "record-image.jpg", recordItemIndex: index)]).validate(for: message)
+            }
+        }
+        var missingRecords = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(associated)) as? [String: Any])
+        missingRecords.removeValue(forKey: "records")
+        let invalid = try JSONDecoder().decode(RelayNativeContent.self, from: JSONSerialization.data(withJSONObject: missingRecords))
+        #expect(throws: RelayError.invalidResponse) { try invalid.validate(for: message) }
+        try content(attachments: [.init(assetId: assetID, name: "top-level.jpg")]).validate(for: message)
+    }
+
     @Test func contentAndAssetAPIsKeepPairHeadersAndReportPendingExpiry() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [NativeURLProtocol.self]

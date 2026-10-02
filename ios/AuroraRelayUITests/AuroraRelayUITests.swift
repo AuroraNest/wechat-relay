@@ -153,7 +153,7 @@ final class AuroraRelayUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["<msg><script>仅作为原始文本显示</script></msg>"].waitForExistence(timeout: 3))
         app.buttons["完成"].tap()
         selectSource("混合")
-        XCTAssertEqual(app.staticTexts["原始内容演示"].count, 2)
+        XCTAssertEqual(app.staticTexts.matching(identifier: "原始内容演示").count, 2)
         attachScreenshot("完整原始内容与来源隔离")
     }
 
