@@ -81,4 +81,37 @@ struct RelaySourceTests {
         #expect(try RelayKeychain.load(RelaySession.self, account: "session", service: service) == legacy)
         #expect(try RelayKeychain.load(RelaySession.self, account: "phone.session", service: service) == existing)
     }
+
+    @Test func interruptedCacheMigrationPreservesConflictsAndAcceptsIdenticalCopies() throws {
+        let service = "relay-source-test-\(UUID().uuidString)"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            for account in ["session", "phone.session"] { try? RelayKeychain.delete(account: account, service: service) }
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let legacy = try session()
+        try RelayKeychain.save(legacy, account: "session", service: service)
+        try RelayKeychain.save(legacy, account: "phone.session", service: service)
+        let old = directory.appendingPathComponent("inbox.sealed")
+        let new = directory.appendingPathComponent("inbox-phone-\(legacy.pairId).sealed")
+        let oldBytes = Data("opaque-cache-with-newer-history".utf8)
+        let newBytes = Data("older-or-incomplete-cache".utf8)
+        try oldBytes.write(to: old)
+        try newBytes.write(to: new)
+        #expect(throws: RelayError.invalidValue("legacy cache conflict")) {
+            try RelayStorageMigration.migrateLegacyPhone(service: service, directory: directory)
+        }
+        #expect(try Data(contentsOf: old) == oldBytes)
+        #expect(try Data(contentsOf: new) == newBytes)
+        #expect(try RelayKeychain.load(RelaySession.self, account: "session", service: service) == legacy)
+        #expect(try RelayKeychain.load(RelaySession.self, account: "phone.session", service: service) == legacy)
+
+        try oldBytes.write(to: new)
+        try RelayStorageMigration.migrateLegacyPhone(service: service, directory: directory)
+        #expect(!FileManager.default.fileExists(atPath: old.path))
+        #expect(try Data(contentsOf: new) == oldBytes)
+        #expect(try RelayKeychain.load(RelaySession.self, account: "session", service: service) == nil)
+        #expect(try RelayKeychain.load(RelaySession.self, account: "phone.session", service: service) == legacy)
+    }
 }

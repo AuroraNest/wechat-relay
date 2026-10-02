@@ -48,6 +48,13 @@ public enum RelayStorageMigration {
         let account = RelaySource.phone.account("session")
         let existing = try RelayKeychain.load(RelaySession.self, account: account, service: service, accessGroup: accessGroup)
         guard existing == nil || existing == legacy else { throw RelayError.invalidValue("legacy pairing conflict") }
+        let old = directory.appendingPathComponent("inbox.sealed")
+        let new = directory.appendingPathComponent("inbox-phone-\(legacy.pairId).sealed")
+        // An interrupted migration or an older app can leave a different cache under the same pair.
+        if FileManager.default.fileExists(atPath: old.path), FileManager.default.fileExists(atPath: new.path),
+           !FileManager.default.contentsEqual(atPath: old.path, andPath: new.path) {
+            throw RelayError.invalidValue("legacy cache conflict")
+        }
         try RelayKeychain.save(legacy, account: account, service: service, accessGroup: accessGroup)
         if let pending = try RelayKeychain.load(RelayPairing.self, account: "pending-pairing", service: service, accessGroup: accessGroup) {
             guard pending.pairId == legacy.pairId else { throw RelayError.invalidValue("legacy pairing conflict") }
@@ -58,8 +65,6 @@ public enum RelayStorageMigration {
            try RelayKeychain.load(Bool.self, account: previewAccount, service: service, accessGroup: accessGroup) == nil {
             try RelayKeychain.save(preview, account: previewAccount, service: service, accessGroup: accessGroup)
         }
-        let old = directory.appendingPathComponent("inbox.sealed")
-        let new = directory.appendingPathComponent("inbox-phone-\(legacy.pairId).sealed")
         if FileManager.default.fileExists(atPath: old.path), !FileManager.default.fileExists(atPath: new.path) {
             try FileManager.default.copyItem(at: old, to: new)
         }
