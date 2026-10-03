@@ -4,7 +4,7 @@
 
 PWA 在本地生成并保存不可导出的 AES-GCM `CryptoKey`, 在本地解密预览并加密回复. 服务端仅处理密文信封, 配对元数据和 Push Subscription.
 
-同一后端也支持原生 iPhone Relay. 原生 App 与 PWA 共用配对, 消息, 回复, 策略和资源 API, 但使用独立的 APNs destination. 当前服务要求 schema v8, 已有 Web Push subscription 无需迁移.
+同一后端也支持原生 iPhone Relay. 原生 App 与 PWA 共用配对, 消息, 回复, 策略和资源 API, 但使用独立的 APNs destination. 当前服务要求 schema v9, 已有 Web Push subscription 无需迁移.
 
 ## 本地开发
 
@@ -24,7 +24,7 @@ npm run dev
 
 `.env.development` 是 `npm run dev` 唯一读取的环境文件. 启动前会校验 `NODE_ENV=development`, `MYSQL_HOST=127.0.0.1`, `MYSQL_PORT=23306`, `MYSQL_DATABASE=wechat_relay_dev`, `DATA_DIR=data/development`, 并要求 `REDIS_URL` 为空. `npm run dev:db` 使用 `compose.development.yml` 创建独立 MySQL 8.4 volume. 初始迁移只会在新 volume 创建时导入. 已有 volume 应按版本应用增量迁移, 不要为重新初始化迁移删除数据.
 
-当前服务严格要求 schema v8 和 MySQL `max_allowed_packet >= 16777216` (16 MiB). 既有数据库按版本依次应用尚未执行的迁移, 包括 `scripts/migrations/008-native-content.sql`. 联系人表仍只保存每个 Android device 和 profile 的最新 AES-GCM 密文信封及校验元数据.
+当前服务严格要求 schema v9 和 MySQL `max_allowed_packet >= 16777216` (16 MiB). 既有数据库按版本依次应用尚未执行的迁移, 包括 `scripts/migrations/008-native-content.sql` 和 `scripts/migrations/009-native-asset-slots.sql`. 联系人表仍只保存每个 Android device 和 profile 的最新 AES-GCM 密文信封及校验元数据.
 
 开发 Origin 只能用于本机检查. 若要在 iPhone 上安装 PWA 或接收 Web Push, 请配置自己的 HTTPS Origin, 并将它写入 development 配置的 `PUBLIC_ORIGIN`.
 
@@ -52,23 +52,27 @@ npm run start:production
 
 `deploy/phase0a` 提供通用 Docker 和 Nginx 示例, 不会直接替换任何已有环境. 忽略规则不能代替对 `.env.production`, Push Subscription, 配对码和密钥的访问控制.
 
-### schema v8 与原生完整内容
+### schema v9 与 immutable media slots
 
-升级前备份数据库, 再应用 migration 008, 确认 `SELECT MAX(version) FROM schema_migrations` 为 8, 并检查 `SELECT @@max_allowed_packet` 至少为 16 MiB. 服务启动时会拒绝版本, 必要列或 packet 限制不满足的环境.
+升级前备份数据库并停止旧服务写入, 按顺序应用尚未执行的 migration 008/009, 确认 `SELECT MAX(version) FROM schema_migrations` 为 9, 并检查 `SELECT @@max_allowed_packet` 至少为 16 MiB. 服务启动会检查版本, 必要列和 packet 限制.
 
 ```bash
-mysql --defaults-extra-file=/path/to/mysql.cnf "$MYSQL_DATABASE" < scripts/migrations/008-native-content.sql
+mysql --defaults-extra-file=/path/to/mysql.cnf "$MYSQL_DATABASE" < scripts/migrations/009-native-asset-slots.sql
 ```
 
-v1-v5 消息及旧附件缓存行为保持兼容. v6 只读, 必须同时提交 `replyCapable:false` 和 `conversationSendCapable:false`. 完整契约见 [`PROTOCOL.md`](../tablet-original-sync/PROTOCOL.md). 正文密文保存于 `native_contents`, 随消息保留, 列表只增加 `hasNativeContent` 和 `nativeAssets`; `GET /api/v1/ios/messages/{messageId}/content` 独立返回 `{contentEnvelope}`.
+v1-v7 消息保持兼容, v6 只读. v8 使用最多 8 个 immutable `nativeAssetSlots: [{id,kind,role,derivedFrom?}]`, 首包禁止 `nativeAssets`. 未知附件无需猜测 MIME 或长度, 正文和 slots 接受后不再改写. v8 `replyCapable` 沿用 v7 私聊边界, `conversationSendCapable` 必须为 false. 完整合同见 [`MEDIA_SLOTS.md`](../tablet-original-sync/MEDIA_SLOTS.md).
 
-附件声明保存在 `native_assets`, ciphertext 在 `native_asset_payloads` 中事务性发布, 单附件最多 8 MiB, 每 pair 预留明文配额为 256 MiB. TTL 为首次消息 `received_at` 起 7 天, 重试不延长; 启动, 每分钟和新声明预留前清理过期 ciphertext, 保留声明以区分过期与未知附件. 需要大文件或数据库负载增长时再迁移到分块对象存储.
+migration 009 新增 `native_asset_slots`, 并登记旧 `native_assets` ID; 新 v6/v7 声明也占用同一 PK, 防止不同 pair 并发跨版本复用 ID. 旧消息的列表顺序和 metadata 仍来自原 `assets_json`, 不改变旧投影. v8 在 `native_contents.assets_json` 保存 slots 顺序, 在 `native_asset_slots` 保存各 slot 的不可变身份和首次消息接收起 7 天的 expiry. 只有成功解析的 metadata 和 ciphertext 才进入 `native_assets` 和 `native_asset_payloads`.
 
-`POST /api/v1/android/messages/{messageId}/assets/{assetId}` 使用既有 Android ECDSA 签名认证, 首次 durable write 返回 `201 {id,idempotent:false}`, 相同 envelope 重试返回 `200 {id,idempotent:true}`, 不同 envelope 返回 `409 {error:"NATIVE_ASSET_CONFLICT"}`. 声明接受不表示附件上传完成. Nginx 新上传路径限制 12 MiB body.
+v8 `POST /api/v1/android/messages/{messageId}/assets/{assetId}` body 为 `{metadata,envelope}`. Metadata 必须与 slot 的 ID/kind/role/derivedFrom 完全匹配, 单附件实际长度为 1 byte 至 8 MiB. 在 device transaction lock 下检查实际 256 MiB 配额, 并原子插入 metadata/ciphertext. v6/v7 继续在首包预留配额. Playback 可以先于 original 解析, 关系由 slots 校验.
 
-`GET /api/v1/ios/assets/{assetId}` 使用现有 session/pair 认证, pending 返回 `409 {error:"ASSET_PENDING"}`, expired 返回 `410 {error:"ASSET_EXPIRED"}`, unknown 或其他 pair 返回 `404 {error:"NOT_FOUND"}`. 上传不会增加 message sequence; 客户端应在用户重试, 重连或有限前台刷新时重新获取 pending 附件.
+Collector 必须在首次请求前持久化完整加密请求 bytes 并原样重试. 首次成功返回 `201 {id,idempotent:false}`, 完全相同 bytes 返回 `200 {id,idempotent:true}`, 改变 metadata/ciphertext 或重新序列化后的不同 bytes 返回 `409 {error:"NATIVE_ASSET_CONFLICT"}`. v6/v7 继续采用原 envelope 幂等规则. 成功事务提交后向所属 pair 发布 `asset-ready` SSE hint, 不增加消息 sequence.
 
-schema v7 旧服务不能直接在 schema v8 启动. 不要仅删除版本记录或删除新表回退, 否则会失去完整内容和附件. 回退应使用升级前备份及对应旧服务, 并单独处理升级后的新数据. 下节仅记录历史 v7 -> v6 流程, 不适用于 schema v8.
+v8 content/asset AAD 在版本 8 后插入 authenticated pairId, preview AAD 不变. `GET /api/v1/messages` 及 `GET /api/v1/ios/messages/{messageId}/content` 返回 immutable `nativeAssetSlots` 和已解析的 `nativeAssets` 子集. Content envelope 始终不变; v6/v7 content API 仍只返回 `{contentEnvelope}`. 过期清理只删除 ciphertext, 保留 metadata 和 slots.
+
+`GET /api/v1/ios/assets/{assetId}` 在所属 pair 内 pending 返回 409, expired 返回 410; unknown 或其他 pair 返回 404. 客户端收到 `asset-ready` 或重连后重新获取同一消息的 manifest, 将新 metadata 合并到原消息而不清除正文或已读状态. 未解析 playback 不应隐藏 original.
+
+schema v8 旧服务不能在 schema v9 启动. 回退应恢复升级前备份及对应旧服务并处理升级后的新数据, 不应仅删除 migration 记录或新表. 下节仅记录历史 v7 -> v6 流程.
 
 ### 历史 schema v7 升级与回退
 

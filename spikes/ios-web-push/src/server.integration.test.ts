@@ -16,11 +16,11 @@ import { join } from "node:path";
 import test from "node:test";
 import mysql, { type Connection } from "mysql2/promise";
 import webpush from "web-push";
-import type { NativeAsset } from "./native-content.js";
+import type { NativeAsset, NativeAssetSlot } from "./native-content.js";
 
 const adminUser = process.env.MYSQL_TEST_ADMIN_USER;
 const port = Number(process.env.AWR_TEST_PORT ?? 18_081);
-const origin = `http://127.0.0.1:${port}`;
+const origin = `http://0.0.0.0:${port}`;
 const testToken = "integration-test-token";
 const secondTestToken = "integration-test-token-b";
 const storageKey = Buffer.alloc(32, 7);
@@ -632,7 +632,9 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
     { v: claimedSend.reply.v, pairId: claimedSend.reply.pairId, id: claimedSend.reply.id, deviceId: claimedSend.reply.deviceId, wechatUserId: claimedSend.reply.wechatUserId },
     { v: 3, pairId: a.pairId, id: sendId, deviceId: a.deviceId, wechatUserId: 999 },
   );
-  await expectError(`/api/v1/replies/${replyId}`, sessionB, b.pairId, "REPLY_NOT_FOUND");
+  const crossPairReply = await fetch(`${origin}/api/v1/replies/${replyId}`, { headers: browserHeaders(sessionB, b.pairId) });
+  await assertResponseStatus(crossPairReply, 404);
+  assert.deepEqual(await crossPairReply.json(), { error: "REPLY_NOT_FOUND" });
 
   const crossAck = await fetch(`${origin}/api/acks`, {
     method: "POST",
@@ -704,10 +706,13 @@ test("MySQL backend isolates browser sessions, pairs, profiles, SSE, replies, ac
   })).status, 200);
 
   const nativePersisted = await testNativeContent(db, sessionA, a);
+  const slotsPersisted = await testNativeSlots(db, sessionA, a);
+  await testTabletReplies(db, sessionA, a);
   await stop(server);
   server = startServer(database, dataDir, captureFile, apnsCaptureFile, apnsKeyPath);
   await waitUntilReady(server);
   await nativePersisted();
+  await slotsPersisted();
   const persisted = await browserJson<{ messages: Array<{ messageId: string }> }>(
     "/api/v1/messages",
     sessionA,
@@ -730,6 +735,212 @@ interface DeviceFixture {
   pairId: string;
   deviceId: string;
   privateKey: KeyObject;
+}
+
+async function testTabletReplies(db: Connection, foreignSession: string, foreignDevice: DeviceFixture): Promise<void> {
+  const session = await createIosSession();
+  const device = await pairDevice(session);
+  const sealed = (kid: string, aad: string) => ({ alg: "A256GCM", kid, aad, iv: randomBytes(12).toString("base64url"), ct: randomBytes(32).toString("base64url") });
+  const targets = [];
+  for (const version of [6, 7, 8]) {
+    const id = randomUUID(), createdAt = Date.now(), seq = version - 5;
+    const value = { v: version, id, deviceId: device.deviceId, seq, createdAt, wechatUserId: 0,
+      replyCapable: version >= 7, conversationSendCapable: false, assets: [],
+      ...(version === 8 ? { nativeAssetSlots: [] } : { nativeAssets: [] }),
+      previewEnvelope: sealed("phase1", `AWR1|A2I|${id}|${device.deviceId}|${seq}|${createdAt}|0`),
+      contentEnvelope: sealed("phase2-content", `AWR1|A2I_CONTENT|${version}|${version === 8 ? `${device.pairId}|` : ""}${id}|${device.deviceId}|${seq}|${createdAt}|0`) };
+    const body = JSON.stringify(value), path = "/api/v1/android/messages";
+    await assertResponseStatus(await fetch(origin + path, { method: "POST", headers: signedHeaders(device, body, "POST", path), body }), 202);
+    targets.push(value);
+  }
+  const statusResponse = await fetch(origin + "/api/v1/ios/status", { headers: browserHeaders(session, device.pairId, true) });
+  await assertResponseStatus(statusResponse, 200);
+  const status = await statusResponse.json() as { tabletRepliesAvailable: boolean; tabletContactSendAvailable: boolean };
+  assert.equal(status.tabletRepliesAvailable, true);
+  assert.equal(status.tabletContactSendAvailable, true);
+  const messages = await browserJson<{ messages: Array<{ nativeVersion: number; replyCapable: boolean }> }>("/api/v1/messages", session, device.pairId);
+  assert.deepEqual(messages.messages.map((value) => [value.nativeVersion, value.replyCapable]), [[8, true], [7, true], [6, false]]);
+  function command(version: 5 | 6, targetMessageId: string) {
+    const id = randomUUID(), createdAt = Date.now();
+    return { v: version, id, deviceId: device.deviceId, targetMessageId, createdAt, wechatUserId: 0,
+      replyEnvelope: sealed(version === 6 ? "phase2-reply-bootstrap" : "phase1-reply",
+        `AWR1|I2A|${version}|${version === 6 ? "REPLY_KEY_BOOTSTRAP" : "TABLET_SEND"}|${device.pairId}|${id}|${device.deviceId}|${targetMessageId}|${createdAt}|0`) };
+  }
+  const post = (value: object, token = session, pairId = device.pairId) => fetch(origin + "/api/v1/replies", {
+    method: "POST", headers: { ...browserHeaders(token, pairId, true), "Content-Type": "application/json" }, body: JSON.stringify(value),
+  });
+  const bootstrap = command(6, targets[0]!.id);
+  const missingBootstrap = await fetch(origin + `/api/v1/replies/${bootstrap.id}`, { headers: browserHeaders(session, device.pairId) });
+  await assertResponseStatus(missingBootstrap, 404);
+  assert.deepEqual(await missingBootstrap.json(), { error: "REPLY_NOT_FOUND" });
+  assert.equal(missingBootstrap.headers.get("Cache-Control"), "no-store");
+  await assertResponseStatus(await fetch(origin + `/api/v1/replies/${bootstrap.id}`), 400);
+  await assertResponseStatus(await post(bootstrap), 201);
+  const ownBootstrap = await fetch(origin + `/api/v1/replies/${bootstrap.id}`, { headers: browserHeaders(session, device.pairId) });
+  await assertResponseStatus(ownBootstrap, 200);
+  const foreignBootstrap = await fetch(origin + `/api/v1/replies/${bootstrap.id}`, { headers: browserHeaders(foreignSession, foreignDevice.pairId) });
+  await assertResponseStatus(foreignBootstrap, 404);
+  assert.deepEqual(await foreignBootstrap.json(), { error: "REPLY_NOT_FOUND" });
+  await assertResponseStatus(await post(bootstrap), 200);
+  await assertResponseStatus(await post(command(5, targets[0]!.id)), 400);
+  await assertResponseStatus(await post(command(6, targets[0]!.id), foreignSession, foreignDevice.pairId), 400);
+  // A legacy poll must not consume the tablet bootstrap, even before the new worker is installed.
+  const abort = new AbortController();
+  const oldPath = "/api/v1/android/replies/v4";
+  const legacy = fetch(origin + oldPath, { headers: signedHeaders(device, "", "GET", oldPath), signal: abort.signal }).catch(() => undefined);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  abort.abort();
+  await legacy;
+  const [[queued]] = await db.query<(mysql.RowDataPacket & { status: string })[]>("SELECT status FROM replies WHERE id = ?", [bootstrap.id]);
+  assert.equal(queued!.status, "QUEUED");
+  const poll = async () => {
+    const path = "/api/v1/android/replies/tablet";
+    const response = await fetch(origin + path, { headers: signedHeaders(device, "", "GET", path) });
+    await assertResponseStatus(response, 200);
+    return await response.json() as { reply: { id: string; v: number; pairId: string } };
+  };
+  assert.equal((await poll()).reply.id, bootstrap.id);
+  assert.equal((await poll()).reply.id, bootstrap.id);
+  const ack = (id: string, status: string) => {
+    const path = `/api/v1/android/replies/${id}/ack`, body = JSON.stringify({ status });
+    return fetch(origin + path, { method: "POST", headers: signedHeaders(device, body, "POST", path), body });
+  };
+  await assertResponseStatus(await ack(bootstrap.id, "SENT_TO_WECHAT"), 400);
+  await assertResponseStatus(await ack(bootstrap.id, "REPLY_KEY_INSTALLED"), 202);
+  await assertResponseStatus(await ack(bootstrap.id, "REPLY_KEY_INSTALLED"), 202);
+  const reply = command(5, targets[1]!.id);
+  await assertResponseStatus(await post(reply), 201);
+  assert.deepEqual((await poll()).reply.id, reply.id);
+  await assertResponseStatus(await ack(reply.id, "SEND_UNCONFIRMED"), 202);
+  await assertResponseStatus(await ack(reply.id, "SENT_TO_WECHAT"), 400);
+  const reply8 = command(5, targets[2]!.id);
+  await assertResponseStatus(await post(reply8), 201);
+  assert.deepEqual((await poll()).reply.id, reply8.id);
+  await assertResponseStatus(await ack(reply8.id, "SEND_UNCONFIRMED"), 202);
+  await testTabletContactReplies(db, foreignSession, foreignDevice);
+}
+
+async function testTabletContactReplies(db: Connection, foreignSession: string, foreignDevice: DeviceFixture): Promise<void> {
+  // A contacts-only device must be able to install its key and send without a message target.
+  const session = await createIosSession();
+  const device = await pairDevice(session);
+  const capturedAt = Date.now();
+  const upload = (snapshot: ContactsSnapshotFixture) => {
+    const body = JSON.stringify(snapshot);
+    return postContacts(body, signedHeaders(device, body, "POST", "/api/v1/android/contacts"));
+  };
+  const snapshot = contactsSnapshot(device, 0, capturedAt, 3);
+  await assertResponseStatus(await upload(snapshot), 201);
+  await assertResponseStatus(await upload(snapshot), 200);
+  await assertResponseStatus(await upload(contactsSnapshot(device, 999, capturedAt, 3)), 400);
+  const invalidAad = contactsSnapshot(device, 0, capturedAt + 1, 3);
+  invalidAad.contactsEnvelope.aad = invalidAad.contactsEnvelope.aad.replace("|3|", "|2|");
+  await assertResponseStatus(await upload(invalidAad), 400);
+  const listed = await browserJson<{ snapshots: ContactsSnapshotFixture[] }>("/api/v1/ios/contacts", session, device.pairId);
+  assert.deepEqual(listed.snapshots, [snapshot]);
+  function command(version: 4 | 7 | 8, targetContactSnapshotId = snapshot.id, targetDevice = device, pairId = device.pairId, profile = 0) {
+    const id = randomUUID(), createdAt = Date.now();
+    const action = version === 8 ? "TABLET_CONTACT_REPLY_KEY_BOOTSTRAP" : version === 7 ? "TABLET_CONTACT_SEND" : "CONTACT_SEND";
+    return { v: version, id, deviceId: targetDevice.deviceId, targetContactSnapshotId, createdAt, wechatUserId: profile,
+      replyEnvelope: { alg: "A256GCM", kid: version === 8 ? "phase2-reply-bootstrap" : "phase1-reply",
+        aad: `AWR1|I2A|${version}|${action}|${pairId}|${id}|${targetDevice.deviceId}|${targetContactSnapshotId}|${createdAt}|${profile}`,
+        iv: randomBytes(12).toString("base64url"), ct: randomBytes(32).toString("base64url") } };
+  }
+  const post = (value: object, token = session, pairId = device.pairId) => fetch(origin + "/api/v1/replies", {
+    method: "POST", headers: { ...browserHeaders(token, pairId, true), "Content-Type": "application/json" }, body: JSON.stringify(value),
+  });
+  await assertResponseStatus(await post(command(4)), 400);
+  await assertResponseStatus(await post(command(7, snapshot.id, foreignDevice)), 400);
+  await assertResponseStatus(await post(command(7, snapshot.id, device, foreignDevice.pairId), foreignSession, foreignDevice.pairId), 400);
+  await assertResponseStatus(await post(command(7, snapshot.id, device, device.pairId, 999)), 400);
+  await assertResponseStatus(await post(command(8, snapshot.id, device, device.pairId, 999)), 400);
+  await assertResponseStatus(await post({ ...command(7), targetMessageId: randomUUID() }), 400);
+  const invalidKid = command(7);
+  invalidKid.replyEnvelope.kid = "phase2-reply-bootstrap";
+  await assertResponseStatus(await post(invalidKid), 400);
+  const oversized = command(7);
+  oversized.replyEnvelope.ct = randomBytes(8193).toString("base64url");
+  await assertResponseStatus(await post(oversized), 400);
+  const wrongAad = command(8);
+  wrongAad.replyEnvelope.aad = wrongAad.replyEnvelope.aad.replace("TABLET_CONTACT_REPLY_KEY_BOOTSTRAP", "REPLY_KEY_BOOTSTRAP");
+  await assertResponseStatus(await post(wrongAad), 400);
+  const bootstrap = command(8);
+  await assertResponseStatus(await post(bootstrap), 201);
+  await assertResponseStatus(await post(bootstrap), 200);
+  const send = command(7);
+  // Tablet contact payloads retain the tablet ciphertext limit, above the phone v4 limit.
+  send.replyEnvelope.ct = randomBytes(8192).toString("base64url");
+  await assertResponseStatus(await post(send), 201);
+  await assertResponseStatus(await post(send), 200);
+  await assertResponseStatus(await post({ ...send, replyEnvelope: { ...send.replyEnvelope, ct: randomBytes(32).toString("base64url") } }), 400);
+  for (const path of ["/api/v1/android/replies", "/api/v1/android/replies/v4"]) {
+    const abort = new AbortController();
+    const legacy = fetch(origin + path, { headers: signedHeaders(device, "", "GET", path), signal: abort.signal }).catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    abort.abort();
+    await legacy;
+  }
+  const [queued] = await db.query<(mysql.RowDataPacket & { id: string; status: string })[]>("SELECT id, status FROM replies WHERE device_id = ?", [device.deviceId]);
+  assert.deepEqual(queued.map((row) => row.status), ["QUEUED", "QUEUED"]);
+  const poll = async () => {
+    const path = "/api/v1/android/replies/tablet";
+    const response = await fetch(origin + path, { headers: signedHeaders(device, "", "GET", path) });
+    await assertResponseStatus(response, 200);
+    return (await response.json() as { reply: { id: string; v: number; pairId: string; targetContactSnapshotId: string; targetMessageId?: string } }).reply;
+  };
+  const ack = (id: string, status: string, targetDevice = device) => {
+    const path = `/api/v1/android/replies/${id}/ack`, body = JSON.stringify({ status });
+    return fetch(origin + path, { method: "POST", headers: signedHeaders(targetDevice, body, "POST", path), body });
+  };
+  await assertResponseStatus(await ack(bootstrap.id, "REPLY_KEY_INSTALLED"), 400);
+  const claimed = await poll();
+  assert.deepEqual([claimed.id, claimed.v, claimed.pairId, claimed.targetContactSnapshotId, claimed.targetMessageId], [bootstrap.id, 8, device.pairId, snapshot.id, undefined]);
+  assert.deepEqual(await poll(), claimed);
+  await assertResponseStatus(await ack(bootstrap.id, "SEND_UNCONFIRMED"), 400);
+  await assertResponseStatus(await ack(bootstrap.id, "SENT_TO_WECHAT"), 400);
+  await assertResponseStatus(await ack(bootstrap.id, "REPLY_KEY_INSTALLED", foreignDevice), 400);
+  await assertResponseStatus(await ack(bootstrap.id, "REPLY_KEY_INSTALLED"), 202);
+  await assertResponseStatus(await ack(bootstrap.id, "REPLY_KEY_INSTALLED"), 202);
+  await assertResponseStatus(await ack(send.id, "SEND_UNCONFIRMED"), 400);
+  const claimedSend = await poll();
+  assert.deepEqual([claimedSend.id, claimedSend.v, claimedSend.pairId, claimedSend.targetContactSnapshotId], [send.id, 7, device.pairId, snapshot.id]);
+  assert.deepEqual(await poll(), claimedSend);
+  await assertResponseStatus(await ack(send.id, "REPLY_KEY_INSTALLED"), 400);
+  await assertResponseStatus(await ack(send.id, "CONTACT_SNAPSHOT_STALE"), 202);
+  await assertResponseStatus(await ack(send.id, "CONTACT_SNAPSHOT_STALE"), 202);
+  await assertResponseStatus(await ack(send.id, "SENT_TO_WECHAT"), 400);
+  const replacement = contactsSnapshot(device, 0, capturedAt + 2, 3);
+  await assertResponseStatus(await upload(replacement), 201);
+  await assertResponseStatus(await post(command(7)), 400);
+  await assertResponseStatus(await post(command(8)), 400);
+  const currentSend = command(7, replacement.id);
+  await assertResponseStatus(await post(currentSend), 201);
+  assert.equal((await poll()).id, currentSend.id);
+  await assertResponseStatus(await ack(currentSend.id, "SEND_UNCONFIRMED"), 202);
+  await assertResponseStatus(await ack(currentSend.id, "SEND_UNCONFIRMED"), 202);
+  await assertResponseStatus(await ack(currentSend.id, "SENT_TO_WECHAT"), 400);
+  for (const version of [1, 2] as const) {
+    const legacy = contactsSnapshot(device, 0, capturedAt + version + 2, version);
+    await assertResponseStatus(await upload(legacy), 201);
+    await assertResponseStatus(await post(command(7, legacy.id)), 400);
+    await assertResponseStatus(await post(command(8, legacy.id)), 400);
+    if (version === 2) {
+      const phoneSend = command(4, legacy.id);
+      await assertResponseStatus(await post(phoneSend), 201);
+      const path = "/api/v1/android/replies/tablet", abort = new AbortController();
+      const tablet = fetch(origin + path, { headers: signedHeaders(device, "", "GET", path), signal: abort.signal }).catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      abort.abort();
+      await tablet;
+      const [[queuedPhone]] = await db.query<(mysql.RowDataPacket & { status: string })[]>("SELECT status FROM replies WHERE id = ?", [phoneSend.id]);
+      assert.equal(queuedPhone!.status, "QUEUED");
+      const phonePath = "/api/v1/android/replies/v4";
+      const phoneResponse = await fetch(origin + phonePath, { headers: signedHeaders(device, "", "GET", phonePath) });
+      await assertResponseStatus(phoneResponse, 200);
+      const phoneClaim = await phoneResponse.json() as { reply: { id: string; v: number } };
+      assert.deepEqual([phoneClaim.reply.id, phoneClaim.reply.v], [phoneSend.id, 4]);
+    }
+  }
 }
 
 async function testNativeContent(db: Connection, foreignSession: string, foreignDevice: DeviceFixture): Promise<() => Promise<void>> {
@@ -790,6 +1001,14 @@ async function testNativeContent(db: Connection, foreignSession: string, foreign
   }
   const originalEnvelope = assetEnvelope(original);
   const playbackEnvelope = assetEnvelope(playback);
+  // The existing foreign fixture is a PWA session, which cannot subscribe to native iOS events.
+  const foreignNativeSession = await createIosSession(secondTestToken);
+  const foreignNativeDevice = await pairDevice(foreignNativeSession, secondTestToken);
+  const ownStream = await openIosEvents(session, device.pairId, 1);
+  const foreignStream = await openIosEvents(foreignNativeSession, foreignNativeDevice.pairId, 0);
+  assert.equal((await ownStream.next())?.event, "ready");
+  assert.equal((await foreignStream.next())?.event, "ready");
+  const foreignHint = foreignStream.next();
   const upload = (asset: NativeAsset, envelope: object, signedDevice = device, messageId = first.id) => {
     const path = `/api/v1/android/messages/${messageId}/assets/${asset.id}`;
     const body = JSON.stringify({ envelope });
@@ -801,6 +1020,13 @@ async function testNativeContent(db: Connection, foreignSession: string, foreign
   const uploaded = await upload(original, originalEnvelope);
   assert.equal(uploaded.status, 201);
   assert.deepEqual(await uploaded.json(), { id: original.id, idempotent: false });
+  assert.deepEqual(await ownStream.next(), { event: "asset-ready", data: original.id });
+  // The hint is observable only after the payload transaction commits.
+  assert.equal((await get(originalPath)).status, 200);
+  assert.equal(await Promise.race([foreignHint.then(() => "hint"), delay(150).then(() => "timeout")]), "timeout");
+  await ownStream.close();
+  await foreignStream.close();
+  await foreignHint;
   const retry = await upload(original, originalEnvelope);
   assert.equal(retry.status, 200);
   assert.deepEqual(await retry.json(), { id: original.id, idempotent: true });
@@ -843,9 +1069,134 @@ async function testNativeContent(db: Connection, foreignSession: string, foreign
   };
 }
 
+async function testNativeSlots(db: Connection, foreignSession: string, foreignDevice: DeviceFixture): Promise<() => Promise<void>> {
+  const session = await createIosSession(), device = await pairDevice(session);
+  const slots: NativeAssetSlot[] = [
+    { id: randomUUID(), kind: "image", role: "original" },
+    { id: randomUUID(), kind: "file", role: "original" },
+  ];
+  const sealed = (kid: string, aad: string, size = 32) => ({ alg: "A256GCM", kid, aad,
+    iv: randomBytes(12).toString("base64url"), ct: randomBytes(size).toString("base64url") });
+  function message(seq: number, declarations: NativeAssetSlot[] = slots, signer = device) {
+    const id = randomUUID(), createdAt = Date.now();
+    return { v: 8, id, deviceId: signer.deviceId, seq, createdAt, wechatUserId: 999,
+      replyCapable: true, conversationSendCapable: false, nativeAssetSlots: declarations,
+      previewEnvelope: sealed("phase1", `AWR1|A2I|${id}|${signer.deviceId}|${seq}|${createdAt}|999`),
+      contentEnvelope: sealed("phase2-content", `AWR1|A2I_CONTENT|8|${signer.pairId}|${id}|${signer.deviceId}|${seq}|${createdAt}|999`) };
+  }
+  const post = (value: object, signer = device) => {
+    const path = "/api/v1/android/messages", body = JSON.stringify(value);
+    return fetch(origin + path, { method: "POST", headers: signedHeaders(signer, body, "POST", path), body });
+  };
+  const get = (path: string, token = session, pair = device.pairId) => fetch(origin + path, { headers: browserHeaders(token, pair) });
+  const first = message(1);
+  const plaintext = { body: "mixed record text arrives first", attachments: slots.map((slot, itemIndex) => ({ ...slot, itemIndex })) };
+  const key = randomBytes(32), iv = Buffer.from(first.contentEnvelope.iv, "base64url");
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(first.contentEnvelope.aad));
+  first.contentEnvelope.ct = Buffer.concat([cipher.update(JSON.stringify(plaintext)), cipher.final(), cipher.getAuthTag()]).toString("base64url");
+  await assertResponseStatus(await post({ ...first, nativeAssets: [] }), 400);
+  await assertResponseStatus(await post({ ...first, conversationSendCapable: true }), 400);
+  await assertResponseStatus(await post({ ...first, contentEnvelope: { ...first.contentEnvelope, aad: first.contentEnvelope.aad.replace(device.pairId, foreignDevice.pairId) } }), 400);
+  await assertResponseStatus(await post({ ...first, v: 7, nativeAssets: [], nativeAssetSlots: undefined }), 400);
+  await assertResponseStatus(await post(first), 202);
+  assert.deepEqual(await (await post(first)).json(), { id: first.id, idempotent: true });
+  const contentPath = `/api/v1/ios/messages/${first.id}/content`;
+  const initial = await (await get(contentPath)).json() as { contentEnvelope: typeof first.contentEnvelope; nativeAssets: NativeAsset[]; nativeAssetSlots: NativeAssetSlot[] };
+  assert.deepEqual(initial.nativeAssetSlots, slots);
+  assert.deepEqual(initial.nativeAssets, []);
+  const contentBytes = Buffer.from(initial.contentEnvelope.ct, "base64url");
+  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAAD(Buffer.from(initial.contentEnvelope.aad));
+  decipher.setAuthTag(contentBytes.subarray(-16));
+  assert.deepEqual(JSON.parse(Buffer.concat([decipher.update(contentBytes.subarray(0, -16)), decipher.final()]).toString()), plaintext);
+  for (const slot of slots) await assertResponseStatus(await get(`/api/v1/ios/assets/${slot.id}`), 409);
+  await assertResponseStatus(await get(contentPath, foreignSession, foreignDevice.pairId), 404);
+  await assertResponseStatus(await get(`/api/v1/ios/assets/${slots[0]!.id}`, foreignSession, foreignDevice.pairId), 404);
+  function uploadBody(target: ReturnType<typeof message>, metadata: NativeAsset) {
+    return { metadata, envelope: sealed("phase2-asset", `AWR1|A2I_ASSET|8|${device.pairId}|${target.id}|${metadata.id}|${device.deviceId}|${target.seq}|${target.createdAt}|999|${metadata.kind}|${metadata.mimeType}|${metadata.byteLength}|${metadata.role}|${metadata.derivedFrom ?? ""}`, metadata.byteLength + 16) };
+  }
+  const upload = (target: ReturnType<typeof message>, assetId: string, value: object | string, signer = device) => {
+    const path = `/api/v1/android/messages/${target.id}/assets/${assetId}`, body = typeof value === "string" ? value : JSON.stringify(value);
+    return fetch(origin + path, { method: "POST", headers: signedHeaders(signer, body, "POST", path), body });
+  };
+  const metadata: NativeAsset = { ...slots[0]!, mimeType: "image/png", byteLength: 123 };
+  const body = uploadBody(first, metadata);
+  await assertResponseStatus(await upload(first, metadata.id, body, foreignDevice), 404);
+  await assertResponseStatus(await upload(first, metadata.id, { ...body, envelope: { ...body.envelope, aad: body.envelope.aad.replace(`|8|${device.pairId}|`, "|7|") } }), 400);
+  await assertResponseStatus(await upload(first, metadata.id, { ...body, envelope: { ...body.envelope, aad: body.envelope.aad.replace(device.pairId, foreignDevice.pairId) } }), 400);
+  const stream = await openIosEvents(session, device.pairId, 1);
+  assert.equal((await stream.next())?.event, "ready");
+  await assertResponseStatus(await upload(first, metadata.id, body), 201);
+  assert.deepEqual(await stream.next(), { event: "asset-ready", data: metadata.id });
+  await stream.close();
+  await assertResponseStatus(await upload(first, metadata.id, JSON.stringify(body)), 200);
+  await assertResponseStatus(await upload(first, metadata.id, JSON.stringify(body, null, 2)), 409);
+  await assertResponseStatus(await upload(first, metadata.id, { ...body, metadata: { ...metadata, byteLength: 124 } }), 409);
+  await assertResponseStatus(await upload(first, metadata.id, uploadBody(first, { ...metadata, mimeType: "image/jpeg" })), 409);
+  await assertResponseStatus(await upload(first, metadata.id, uploadBody(first, metadata)), 409);
+  const resolved = await (await get(contentPath)).json() as typeof initial;
+  assert.deepEqual(resolved.contentEnvelope, initial.contentEnvelope);
+  assert.deepEqual(resolved.nativeAssetSlots, slots);
+  assert.deepEqual(resolved.nativeAssets, [metadata]);
+  const list = await browserJson<{ messages: Array<{ seq: number; nativeAssetSlots: NativeAssetSlot[]; nativeAssets: NativeAsset[] }> }>("/api/v1/messages", session, device.pairId);
+  assert.equal(list.messages.length, 1);
+  assert.equal(list.messages[0]!.seq, 1);
+  assert.deepEqual(list.messages[0]!.nativeAssets, [metadata]);
+  assert.deepEqual(list.messages[0]!.nativeAssetSlots, slots);
+  await assertResponseStatus(await get(`/api/v1/ios/assets/${slots[1]!.id}`), 409);
+  await assertResponseStatus(await post(message(2, [slots[0]!])), 409);
+  // A playback slot can resolve before its immutable original slot.
+  const source: NativeAssetSlot = { id: randomUUID(), kind: "audio", role: "original" };
+  const playback: NativeAssetSlot = { id: randomUUID(), kind: "audio", role: "playback", derivedFrom: source.id };
+  const audio = message(2, [source, playback]);
+  await assertResponseStatus(await post(audio), 202);
+  const playbackMetadata: NativeAsset = { ...playback, mimeType: "audio/wav", byteLength: 8 };
+  await assertResponseStatus(await upload(audio, playback.id, uploadBody(audio, playbackMetadata)), 201);
+  await assertResponseStatus(await get(`/api/v1/ios/assets/${source.id}`), 409);
+  // v7 and v8 share one ID reservation namespace, including simultaneous different devices.
+  const legacyId = randomUUID();
+  const legacy = (seq: number, assets: NativeAsset[], signer = device) => {
+    const base = message(seq, [], signer);
+    return { ...base, v: 7, nativeAssetSlots: undefined, nativeAssets: assets,
+      contentEnvelope: { ...base.contentEnvelope, aad: base.contentEnvelope.aad.replace(`|8|${signer.pairId}|`, "|7|") } };
+  };
+  await assertResponseStatus(await post(legacy(3, [metadata])), 409);
+  await assertResponseStatus(await post(legacy(3, [{ ...metadata, id: legacyId }])), 202);
+  await assertResponseStatus(await post(message(4, [{ ...slots[0]!, id: legacyId }])), 409);
+  const rivalSession = await createIosSession(), rival = await pairDevice(rivalSession);
+  const shared = { ...slots[0]!, id: randomUUID() };
+  const collisions = await Promise.all([post(message(4, [shared])), post(legacy(1, [{ ...metadata, id: shared.id }], rival), rival)]);
+  assert.deepEqual(collisions.map((response) => response.status).sort(), [202, 409]);
+  // Unknown slots reserve no bytes; each actual resolution checks the quota under the device lock.
+  for (let seq = 5; seq <= 8; seq++) {
+    const assets: NativeAsset[] = Array.from({ length: seq === 8 ? 7 : 8 }, () => ({ id: randomUUID(), kind: "file", role: "original", mimeType: "application/octet-stream", byteLength: 8 * 1024 * 1024 }));
+    await assertResponseStatus(await post(legacy(seq, assets)), 202);
+  }
+  const quotaSlots: NativeAssetSlot[] = Array.from({ length: 2 }, () => ({ id: randomUUID(), kind: "file", role: "original" }));
+  const quotaMessage = message(9, quotaSlots);
+  await assertResponseStatus(await post(quotaMessage), 202);
+  const races = await Promise.all(quotaSlots.map((slot) => {
+    const asset: NativeAsset = { ...slot, mimeType: "application/octet-stream", byteLength: 5 * 1024 * 1024 };
+    return upload(quotaMessage, slot.id, uploadBody(quotaMessage, asset));
+  }));
+  assert.deepEqual(races.map((response) => response.status).sort(), [201, 409]);
+  const [[total]] = await db.query<(mysql.RowDataPacket & { bytes: string })[]>("SELECT SUM(byte_length) AS bytes FROM native_assets JOIN messages ON messages.id = native_assets.message_id WHERE messages.device_id = ?", [device.deviceId]);
+  assert.ok(Number(total!.bytes) <= 256 * 1024 * 1024);
+  await db.execute("UPDATE native_asset_slots SET expires_at = ? WHERE id = ?", [Date.now() - 1, slots[1]!.id]);
+  await assertResponseStatus(await get(`/api/v1/ios/assets/${slots[1]!.id}`), 410);
+  const expiredMetadata: NativeAsset = { ...slots[1]!, mimeType: "application/pdf", byteLength: 2 };
+  await assertResponseStatus(await upload(first, slots[1]!.id, uploadBody(first, expiredMetadata)), 410);
+  return async () => {
+    assert.deepEqual(await (await get(contentPath)).json(), resolved);
+    assert.deepEqual(await (await get(`/api/v1/ios/assets/${metadata.id}`)).json(), { ...metadata, envelope: body.envelope });
+    await assertResponseStatus(await get(`/api/v1/ios/assets/${slots[1]!.id}`), 410);
+  };
+}
+
 async function applyMigrations(admin: Connection, database: string): Promise<void> {
   await admin.query(`USE \`${database}\``);
-  for (const name of ["001-baseline.sql", "002-multi-pair-browser-sessions.sql", "003-message-reply-capability.sql", "004-conversation-send-capability.sql", "005-relay-policy.sql", "006-contacts-snapshots.sql", "007-contact-send-replies.sql", "008-native-content.sql"])
+  for (const name of ["001-baseline.sql", "002-multi-pair-browser-sessions.sql", "003-message-reply-capability.sql", "004-conversation-send-capability.sql", "005-relay-policy.sql", "006-contacts-snapshots.sql", "007-contact-send-replies.sql", "008-native-content.sql", "009-native-asset-slots.sql"])
     await admin.query(await readFile(new URL(`../scripts/migrations/${name}`, import.meta.url), "utf8"));
 }
 
@@ -1168,7 +1519,7 @@ function signedHeaders(device: DeviceFixture, body: string, method: "GET" | "POS
 }
 
 interface ContactsSnapshotFixture {
-  v: 1 | 2;
+  v: 1 | 2 | 3;
   id: string;
   deviceId: string;
   wechatUserId: 0 | 999;
@@ -1186,7 +1537,7 @@ function contactsSnapshot(
   device: DeviceFixture,
   wechatUserId: 0 | 999,
   capturedAt: number,
-  v: 1 | 2 = 1,
+  v: 1 | 2 | 3 = 1,
 ): ContactsSnapshotFixture {
   const id = uuidV7();
   return {

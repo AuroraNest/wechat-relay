@@ -98,8 +98,12 @@ public final class RelayAPI: NSObject, @unchecked Sendable {
     }
 
     public func nativeContent(session relaySession: RelaySession, messageID: UUID) async throws -> RelayEncryptedEnvelope {
-        let response: RelayNativeContentResponse = try await request(path: "/api/v1/ios/messages/\(messageID.uuidString.lowercased())/content", session: relaySession)
+        let response = try await nativeManifest(session: relaySession, messageID: messageID)
         return response.contentEnvelope
+    }
+
+    public func nativeManifest(session relaySession: RelaySession, messageID: UUID) async throws -> RelayNativeContentResponse {
+        try await request(path: "/api/v1/ios/messages/\(messageID.uuidString.lowercased())/content", session: relaySession)
     }
 
     public func nativeAsset(session relaySession: RelaySession, id: UUID) async throws -> RelayNativeAsset {
@@ -137,7 +141,7 @@ public final class RelayAPI: NSObject, @unchecked Sendable {
             throw RelayError.invalidResponse
         }
         for snapshot in response.snapshots {
-            guard (snapshot.v == 1 || snapshot.v == 2), RelayValidation.isUUIDv7(snapshot.id), RelayValidation.isDeviceId(snapshot.deviceId),
+            guard (1...3).contains(snapshot.v), (snapshot.v != 3 || snapshot.wechatUserId == 0), RelayValidation.isUUIDv7(snapshot.id), RelayValidation.isDeviceId(snapshot.deviceId),
                   RelayValidation.isWechatUserId(snapshot.wechatUserId), snapshot.capturedAt > 0 else {
                 throw RelayError.invalidResponse
             }
@@ -184,7 +188,7 @@ public final class RelayAPI: NSObject, @unchecked Sendable {
     }
 
     private func validateReplyRequest(_ reply: RelayReplyRequest, pairId: String) throws {
-        guard (reply.v == 2 || reply.v == 3 || reply.v == 4), RelayValidation.isDeviceId(reply.deviceId), RelayValidation.isWechatUserId(reply.wechatUserId), reply.createdAt > 0, reply.replyEnvelope.alg == "A256GCM", reply.replyEnvelope.kid == "phase1-reply" else { throw RelayError.invalidValue("reply") }
+        guard (2...8).contains(reply.v), RelayValidation.isDeviceId(reply.deviceId), RelayValidation.isWechatUserId(reply.wechatUserId), reply.createdAt > 0, reply.replyEnvelope.alg == "A256GCM", reply.replyEnvelope.kid == ([6, 8].contains(reply.v) ? "phase2-reply-bootstrap" : "phase1-reply") else { throw RelayError.invalidValue("reply") }
         let id = reply.id.uuidString.lowercased()
         let expected: String
         switch reply.v {
@@ -198,6 +202,16 @@ public final class RelayAPI: NSObject, @unchecked Sendable {
             guard reply.targetMessageId == nil, let snapshotId = reply.targetContactSnapshotId,
                   RelayValidation.isUUIDv7(reply.id), RelayValidation.isUUIDv7(snapshotId) else { throw RelayError.invalidValue("reply target") }
             expected = "AWR1|I2A|4|CONTACT_SEND|\(pairId)|\(id)|\(reply.deviceId)|\(snapshotId.uuidString.lowercased())|\(reply.createdAt)|\(reply.wechatUserId)"
+        case 5, 6:
+            guard let target = reply.targetMessageId, reply.targetContactSnapshotId == nil, reply.wechatUserId == 0,
+                  RelayValidation.isUUIDv7(reply.id) else { throw RelayError.invalidValue("tablet reply target") }
+            let kind = reply.v == 5 ? "TABLET_SEND" : "REPLY_KEY_BOOTSTRAP"
+            expected = "AWR1|I2A|\(reply.v)|\(kind)|\(pairId)|\(id)|\(reply.deviceId)|\(target.uuidString.lowercased())|\(reply.createdAt)|0"
+        case 7, 8:
+            guard reply.targetMessageId == nil, let snapshotId = reply.targetContactSnapshotId, reply.wechatUserId == 0,
+                  RelayValidation.isUUIDv7(reply.id), RelayValidation.isUUIDv7(snapshotId) else { throw RelayError.invalidValue("tablet contact target") }
+            let kind = reply.v == 7 ? "TABLET_CONTACT_SEND" : "TABLET_CONTACT_REPLY_KEY_BOOTSTRAP"
+            expected = "AWR1|I2A|\(reply.v)|\(kind)|\(pairId)|\(id)|\(reply.deviceId)|\(snapshotId.uuidString.lowercased())|\(reply.createdAt)|0"
         default:
             throw RelayError.invalidValue("reply")
         }
@@ -364,5 +378,3 @@ private final class RelayResponseDelegate: NSObject, URLSessionDataDelegate, @un
         finish(.failure(CancellationError()))
     }
 }
-
-private struct RelayNativeContentResponse: Decodable { let contentEnvelope: RelayEncryptedEnvelope }

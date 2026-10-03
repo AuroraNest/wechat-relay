@@ -6,21 +6,41 @@ export const MAX_NATIVE_ASSET_BODY_BYTES = 12 * 1024 * 1024;
 const MAX_ASSET_BYTES = 8 * 1024 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-export interface NativeAsset {
+export interface NativeAssetSlot {
   id: string;
   kind: "image" | "sticker" | "audio" | "video" | "file";
-  mimeType: string;
-  byteLength: number;
   role: "original" | "playback";
   derivedFrom?: string;
 }
+export interface NativeAsset extends NativeAssetSlot {
+  mimeType: string;
+  byteLength: number;
+}
 
 export interface NativeMessageContext {
+  nativeVersion?: number;
+  v?: number;
+  pairId?: string;
   id: string;
   deviceId: string;
   seq: number;
   createdAt: number;
   wechatUserId: 0 | 999;
+}
+
+function version(context: NativeMessageContext): 6 | 7 | 8 {
+  if (context.v !== undefined && context.nativeVersion !== undefined && context.v !== context.nativeVersion)
+    throw new Error("INVALID_NATIVE_VERSION");
+  const value = context.nativeVersion ?? context.v ?? 6;
+  if (value !== 6 && value !== 7 && value !== 8) throw new Error("INVALID_NATIVE_VERSION");
+  return value;
+}
+
+function versionBinding(context: NativeMessageContext): string {
+  const v = version(context);
+  if (v !== 8) return String(v);
+  if (!context.pairId || !UUID.test(context.pairId)) throw new Error("INVALID_NATIVE_ENVELOPE");
+  return `8|${context.pairId}`;
 }
 
 function object(value: unknown, error: string): Record<string, unknown> {
@@ -48,7 +68,7 @@ function envelope(value: unknown, kid: string, aad: string, max: number, exact?:
 
 export function validateNativeContent(value: unknown, context: NativeMessageContext): PreviewEnvelope {
   if (!UUID.test(context.id)) throw new Error("INVALID_MESSAGE");
-  return envelope(value, "phase2-content", `AWR1|A2I_CONTENT|6|${context.id}|${context.deviceId}|${context.seq}|${context.createdAt}|${context.wechatUserId}`, 1024 * 1024 + 16);
+  return envelope(value, "phase2-content", `AWR1|A2I_CONTENT|${versionBinding(context)}|${context.id}|${context.deviceId}|${context.seq}|${context.createdAt}|${context.wechatUserId}`, 1024 * 1024 + 16);
 }
 
 export function validateNativePreview(value: unknown, context: NativeMessageContext): void {
@@ -56,21 +76,35 @@ export function validateNativePreview(value: unknown, context: NativeMessageCont
 }
 
 export function validateNativeAssets(value: unknown): NativeAsset[] {
+  return validateDeclarations(value, true) as NativeAsset[];
+}
+
+export function validateNativeAssetSlots(value: unknown): NativeAssetSlot[] {
+  return validateDeclarations(value, false);
+}
+
+function validateDeclaration(entry: unknown, resolved: boolean): NativeAssetSlot | NativeAsset {
+  const a = object(entry, "INVALID_NATIVE_ASSETS");
+  const allowed = resolved ? ["id", "kind", "mimeType", "byteLength", "role", "derivedFrom"] : ["id", "kind", "role", "derivedFrom"];
+  if (Object.keys(a).some((key) => !allowed.includes(key)) || typeof a.id !== "string" || !UUID.test(a.id) ||
+      typeof a.kind !== "string" || !["image", "sticker", "audio", "video", "file"].includes(a.kind) ||
+      (resolved && (typeof a.mimeType !== "string" || a.mimeType.length > 128 || !/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/.test(a.mimeType) ||
+      typeof a.byteLength !== "number" || !Number.isSafeInteger(a.byteLength) || a.byteLength < 1 || a.byteLength > MAX_ASSET_BYTES)) ||
+      (a.role !== "original" && a.role !== "playback") ||
+      (a.role === "original" && a.derivedFrom !== undefined) ||
+      (a.role === "playback" && (typeof a.derivedFrom !== "string" || !UUID.test(a.derivedFrom))))
+    throw new Error("INVALID_NATIVE_ASSETS");
+  return a as unknown as NativeAssetSlot | NativeAsset;
+}
+
+function validateDeclarations(value: unknown, resolved: boolean): NativeAssetSlot[] {
   if (!Array.isArray(value) || value.length > 8) throw new Error("INVALID_NATIVE_ASSETS");
   const ids = new Set<string>();
-  const assets = value.map((entry): NativeAsset => {
-    const a = object(entry, "INVALID_NATIVE_ASSETS");
-    const allowed = ["id", "kind", "mimeType", "byteLength", "role", "derivedFrom"];
-    if (Object.keys(a).some((key) => !allowed.includes(key)) || typeof a.id !== "string" || !UUID.test(a.id) || ids.has(a.id) ||
-        typeof a.kind !== "string" || !["image", "sticker", "audio", "video", "file"].includes(a.kind) ||
-        typeof a.mimeType !== "string" || a.mimeType.length > 128 || !/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/.test(a.mimeType) ||
-        typeof a.byteLength !== "number" || !Number.isSafeInteger(a.byteLength) || a.byteLength < 1 || a.byteLength > MAX_ASSET_BYTES ||
-        (a.role !== "original" && a.role !== "playback") ||
-        (a.role === "original" && a.derivedFrom !== undefined) ||
-        (a.role === "playback" && (typeof a.derivedFrom !== "string" || !UUID.test(a.derivedFrom))))
-      throw new Error("INVALID_NATIVE_ASSETS");
+  const assets = value.map((entry): NativeAssetSlot => {
+    const a = validateDeclaration(entry, resolved);
+    if (ids.has(a.id)) throw new Error("INVALID_NATIVE_ASSETS");
     ids.add(a.id);
-    return a as unknown as NativeAsset;
+    return a;
   });
   for (const asset of assets) {
     if (asset.role === "playback" && !assets.some((original) => original.id === asset.derivedFrom && original.role === "original" && original.kind === asset.kind))
@@ -79,9 +113,16 @@ export function validateNativeAssets(value: unknown): NativeAsset[] {
   return assets;
 }
 
+export function validateNativeAssetMetadata(value: unknown, slot: NativeAssetSlot): NativeAsset {
+  const asset = validateDeclaration(value, true) as NativeAsset;
+  if (asset.id !== slot.id || asset.kind !== slot.kind || asset.role !== slot.role || asset.derivedFrom !== slot.derivedFrom)
+    throw new Error("NATIVE_ASSET_CONFLICT");
+  return asset;
+}
+
 export function validateNativeAssetUpload(value: unknown, context: NativeMessageContext, asset: NativeAsset): PreviewEnvelope {
   const body = object(value, "INVALID_NATIVE_ENVELOPE");
-  if (Object.keys(body).join(",") !== "envelope") throw new Error("INVALID_NATIVE_ENVELOPE");
-  const aad = `AWR1|A2I_ASSET|6|${context.id}|${asset.id}|${context.deviceId}|${context.seq}|${context.createdAt}|${context.wechatUserId}|${asset.kind}|${asset.mimeType}|${asset.byteLength}|${asset.role}|${asset.derivedFrom ?? ""}`;
+  if (Object.keys(body).sort().join(",") !== (version(context) === 8 ? "envelope,metadata" : "envelope")) throw new Error("INVALID_NATIVE_ENVELOPE");
+  const aad = `AWR1|A2I_ASSET|${versionBinding(context)}|${context.id}|${asset.id}|${context.deviceId}|${context.seq}|${context.createdAt}|${context.wechatUserId}|${asset.kind}|${asset.mimeType}|${asset.byteLength}|${asset.role}|${asset.derivedFrom ?? ""}`;
   return envelope(body.envelope, "phase2-asset", aad, asset.byteLength + 16, asset.byteLength + 16);
 }

@@ -24,9 +24,8 @@ public enum RelayCrypto {
         guard plaintext.count <= 1_024 * 1_024 else { throw RelayError.invalidResponse }
         do {
             let payload = try JSONDecoder().decode(RelayContactsPayload.self, from: plaintext)
-            guard payload.v == 1, payload.contacts.count <= 10_000,
-                  Set(payload.contacts.map(\.name)).count == payload.contacts.count,
-                  (payload.contacts.allSatisfy { RelayValidation.isContactName($0.name) }) else {
+            guard RelayContactsPayload.isValid(v: payload.v, contacts: payload.contacts, accountFingerprint: payload.accountFingerprint),
+                  payload.v == (snapshot.v == 3 ? 3 : 1) else {
                 throw RelayError.invalidResponse
             }
             return payload
@@ -38,7 +37,7 @@ public enum RelayCrypto {
     }
 
     public static func makeReply(session: RelaySession, target: RelayMessage, body: String, now: Date = Date()) throws -> RelayReplyRequest {
-        guard target.replyCapable else { throw RelayError.invalidValue("reply target") }
+        guard target.replyCapable, !target.hasNativeContent else { throw RelayError.invalidValue("reply target") }
         let characters = Array(body)
         guard !characters.isEmpty, characters.count <= 1_000 else { throw RelayError.invalidValue("reply body") }
         let id = try UUIDv7.make(now: now)
@@ -74,6 +73,71 @@ public enum RelayCrypto {
         let plaintext = try JSONSerialization.data(withJSONObject: ["body": body, "conversationTitle": conversationTitle], options: [.sortedKeys])
         let envelope = try encrypt(plaintext, key: session.replyKey, kid: "phase1-reply", aad: aad)
         return RelayReplyRequest(v: 4, id: replyId, targetContactSnapshotId: snapshotId, deviceId: deviceId, wechatUserId: wechatUserId, createdAt: createdAt, replyEnvelope: envelope)
+    }
+
+    public static func makeTabletReply(session: RelaySession, target: RelayMessage, content: RelayNativeContent, body: String, now: Date = Date()) throws -> RelayReplyRequest {
+        guard canReplyToTablet(target: target, content: content),
+              !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, body.unicodeScalars.count <= 1_000,
+              let account = content.accountFingerprint else { throw RelayError.invalidValue("tablet reply") }
+        try content.validate(for: target)
+        let id = try UUIDv7.make(now: now)
+        let createdAt = Int64(now.timeIntervalSince1970 * 1_000)
+        let aad = tabletCommandAAD(version: 5, session: session, id: id, target: target, createdAt: createdAt)
+        let data = try JSONSerialization.data(withJSONObject: ["body": body, "conversationId": content.conversationId, "accountFingerprint": account], options: [.sortedKeys])
+        let envelope = try encrypt(data, key: session.replyKey, kid: "phase1-reply", aad: aad)
+        return RelayReplyRequest(v: 5, id: id, targetMessageId: target.id, deviceId: target.deviceId, wechatUserId: 0, createdAt: createdAt, replyEnvelope: envelope)
+    }
+
+    public static func canReplyToTablet(target: RelayMessage, content: RelayNativeContent?) -> Bool {
+        guard target.hasNativeContent, (target.nativeVersion == 7 || target.nativeVersion == 8), target.replyCapable,
+              target.wechatUserId == 0, let content, !content.conversationId.hasSuffix("@chatroom"),
+              content.accountFingerprint.map(RelayValidation.isAccountFingerprint) == true else { return false }
+        return (try? content.validate(for: target)) != nil
+    }
+
+    public static func makeTabletContactSend(session: RelaySession, snapshotId: UUID, deviceId: String, contact: RelayContact, accountFingerprint: String, body: String, now: Date = Date()) throws -> RelayReplyRequest {
+        guard RelayValidation.isUUIDv7(snapshotId), RelayValidation.isDeviceId(deviceId),
+              let conversationId = contact.conversationId, RelayValidation.isTabletConversationID(conversationId), !conversationId.hasSuffix("@chatroom"),
+              let alias = contact.alias, !alias.isEmpty, RelayValidation.isTabletAlias(alias), RelayValidation.isAccountFingerprint(accountFingerprint),
+              !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, body.unicodeScalars.count <= 1_000 else { throw RelayError.invalidValue("tablet contact send") }
+        let id = try UUIDv7.make(now: now)
+        let createdAt = Int64(now.timeIntervalSince1970 * 1_000)
+        let data = try JSONSerialization.data(withJSONObject: ["body": body, "conversationId": conversationId, "accountFingerprint": accountFingerprint], options: [.sortedKeys])
+        let envelope = try encrypt(data, key: session.replyKey, kid: "phase1-reply", aad: tabletContactCommandAAD(version: 7, session: session, id: id, deviceId: deviceId, snapshotId: snapshotId, createdAt: createdAt))
+        return RelayReplyRequest(v: 7, id: id, targetContactSnapshotId: snapshotId, deviceId: deviceId, wechatUserId: 0, createdAt: createdAt, replyEnvelope: envelope)
+    }
+
+    public static func makeTabletContactReplyBootstrap(session: RelaySession, snapshotId: UUID, deviceId: String, now: Date = Date()) throws -> RelayReplyRequest {
+        guard RelayValidation.isUUIDv7(snapshotId), RelayValidation.isDeviceId(deviceId), session.replyKey != session.messageKey else { throw RelayError.invalidValue("tablet contact bootstrap") }
+        let id = try UUIDv7.make(now: now)
+        let createdAt = Int64(now.timeIntervalSince1970 * 1_000)
+        let data = try JSONSerialization.data(withJSONObject: ["v": 1, "pairId": session.pairId, "deviceId": deviceId, "replyKey": base64url(session.replyKey)], options: [.sortedKeys])
+        let derived = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: session.messageKey), salt: Data(session.pairId.utf8), info: Data("AWR1|TABLET_REPLY_KEY_BOOTSTRAP|\(deviceId)".utf8), outputByteCount: 32)
+        let key = derived.withUnsafeBytes { Data($0) }
+        let envelope = try encrypt(data, key: key, kid: "phase2-reply-bootstrap", aad: tabletContactCommandAAD(version: 8, session: session, id: id, deviceId: deviceId, snapshotId: snapshotId, createdAt: createdAt))
+        return RelayReplyRequest(v: 8, id: id, targetContactSnapshotId: snapshotId, deviceId: deviceId, wechatUserId: 0, createdAt: createdAt, replyEnvelope: envelope)
+    }
+
+    private static func tabletContactCommandAAD(version: Int, session: RelaySession, id: UUID, deviceId: String, snapshotId: UUID, createdAt: Int64) -> String {
+        let kind = version == 7 ? "TABLET_CONTACT_SEND" : "TABLET_CONTACT_REPLY_KEY_BOOTSTRAP"
+        return "AWR1|I2A|\(version)|\(kind)|\(session.pairId)|\(id.uuidString.lowercased())|\(deviceId)|\(snapshotId.uuidString.lowercased())|\(createdAt)|0"
+    }
+
+    public static func makeTabletReplyBootstrap(session: RelaySession, target: RelayMessage, now: Date = Date()) throws -> RelayReplyRequest {
+        guard target.hasNativeContent, target.wechatUserId == 0, session.replyKey != session.messageKey else { throw RelayError.invalidValue("tablet bootstrap") }
+        let id = try UUIDv7.make(now: now)
+        let createdAt = Int64(now.timeIntervalSince1970 * 1_000)
+        let data = try JSONSerialization.data(withJSONObject: ["v": 1, "pairId": session.pairId, "deviceId": target.deviceId, "replyKey": base64url(session.replyKey)], options: [.sortedKeys])
+        let derived = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: session.messageKey),
+            salt: Data(session.pairId.utf8), info: Data("AWR1|TABLET_REPLY_KEY_BOOTSTRAP|\(target.deviceId)".utf8), outputByteCount: 32)
+        let key = derived.withUnsafeBytes { Data($0) }
+        let envelope = try encrypt(data, key: key, kid: "phase2-reply-bootstrap", aad: tabletCommandAAD(version: 6, session: session, id: id, target: target, createdAt: createdAt))
+        return RelayReplyRequest(v: 6, id: id, targetMessageId: target.id, deviceId: target.deviceId, wechatUserId: 0, createdAt: createdAt, replyEnvelope: envelope)
+    }
+
+    private static func tabletCommandAAD(version: Int, session: RelaySession, id: UUID, target: RelayMessage, createdAt: Int64) -> String {
+        let kind = version == 5 ? "TABLET_SEND" : "REPLY_KEY_BOOTSTRAP"
+        return "AWR1|I2A|\(version)|\(kind)|\(session.pairId)|\(id.uuidString.lowercased())|\(target.deviceId)|\(target.id.uuidString.lowercased())|\(createdAt)|0"
     }
 
     public static func makePairingCode(_ pairing: RelayPairing) throws -> String {
@@ -132,7 +196,7 @@ public enum RelayCrypto {
     }
 
     static func validateContactsEnvelope(_ snapshot: RelayContactSnapshot) throws {
-        guard (snapshot.v == 1 || snapshot.v == 2), RelayValidation.isUUIDv7(snapshot.id), RelayValidation.isDeviceId(snapshot.deviceId),
+        guard (1...3).contains(snapshot.v), (snapshot.v != 3 || snapshot.wechatUserId == 0), RelayValidation.isUUIDv7(snapshot.id), RelayValidation.isDeviceId(snapshot.deviceId),
               RelayValidation.isWechatUserId(snapshot.wechatUserId), snapshot.capturedAt > 0,
               snapshot.contactsEnvelope.alg == "A256GCM", snapshot.contactsEnvelope.kid == "phase1-contacts",
               let ciphertext = decodeBase64url(snapshot.contactsEnvelope.ct), ciphertext.count >= 17, ciphertext.count <= 1_024 * 1_024 + 16 else {

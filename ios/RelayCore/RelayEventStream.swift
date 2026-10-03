@@ -4,6 +4,7 @@ public enum RelayStreamEvent: Sendable, Equatable {
     case ready(Int)
     case message(Int)
     case reply(UUID)
+    case assetReady(UUID)
 }
 
 // Only bounded invalidation hints travel here; canonical data still comes from authenticated APIs.
@@ -33,9 +34,9 @@ struct RelayStreamParser {
                 guard data.utf8.allSatisfy({ (48...57).contains($0) }),
                       let sequence = Int(data), sequence <= 9_007_199_254_740_991 else { throw RelayError.invalidResponse }
                 return event == "ready" ? .ready(sequence) : .message(sequence)
-            case "reply":
+            case "reply", "asset-ready":
                 guard RelayValidation.isUUID(data), let id = UUID(uuidString: data) else { throw RelayError.invalidResponse }
-                return .reply(id)
+                return event == "reply" ? .reply(id) : .assetReady(id)
             default: return nil
             }
         }

@@ -39,10 +39,13 @@ import {
   NATIVE_ASSET_TTL_MS,
   NATIVE_PAIR_QUOTA_BYTES,
   validateNativeAssets,
+  validateNativeAssetSlots,
+  validateNativeAssetMetadata,
   validateNativeAssetUpload,
   validateNativeContent,
   validateNativePreview,
   type NativeAsset,
+  type NativeAssetSlot,
 } from "./native-content.js";
 import {
   DEFAULT_RELAY_POLICY,
@@ -130,7 +133,7 @@ interface MessageRecord {
   pairId: string;
 }
 interface AndroidMessage {
-  v: 1 | 2 | 3 | 4 | 5 | 6;
+  v: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
   id: string;
   deviceId: string;
   seq: number;
@@ -142,6 +145,7 @@ interface AndroidMessage {
   conversationSendCapable: boolean;
   contentEnvelope?: PreviewEnvelope;
   nativeAssets?: NativeAsset[];
+  nativeAssetSlots?: NativeAssetSlot[];
 }
 interface AndroidAsset {
   id: string;
@@ -154,13 +158,13 @@ interface AndroidAsset {
 interface CachedAsset extends AndroidAsset { pairId: string }
 interface ReplyEnvelope {
   alg: "A256GCM";
-  kid: "phase1-reply";
+  kid: "phase1-reply" | "phase2-reply-bootstrap";
   iv: string;
   aad: string;
   ct: string;
 }
 interface BrowserReply {
-  v: 1 | 2 | 3 | 4;
+  v: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
   id: string;
   deviceId: string;
   createdAt: number;
@@ -170,7 +174,7 @@ interface BrowserReply {
   targetContactSnapshotId?: string;
 }
 interface ClaimedReply {
-  v: 1 | 2 | 3 | 4;
+  v: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
   id: string;
   deviceId: string;
   createdAt: number;
@@ -188,7 +192,7 @@ interface ContactsEnvelope {
   ct: string;
 }
 interface ContactsSnapshot {
-  v: 1 | 2;
+  v: 1 | 2 | 3;
   id: string;
   deviceId: string;
   wechatUserId: 0 | 999;
@@ -389,6 +393,8 @@ async function route(
     return submitBrowserReply(request, response);
   if (request.method === "GET" && url.pathname.startsWith("/api/v1/replies/"))
     return getBrowserReply(request, response, decodeURIComponent(url.pathname.slice("/api/v1/replies/".length)));
+  if (request.method === "GET" && url.pathname === "/api/v1/android/replies/tablet")
+    return getAndroidReply(request, response, url, false, true);
   if (request.method === "GET" && url.pathname === "/api/v1/android/replies/v4")
     return getAndroidReply(request, response, url, true);
   if (request.method === "GET" && url.pathname === "/api/v1/android/replies")
@@ -479,9 +485,10 @@ async function route(
       reply_capable: string | number;
       conversation_send_capable: string | number;
       native_assets_json: string | null;
+      native_envelope_json: string | null;
     }>(
       pool,
-      "SELECT messages.id, messages.device_id, messages.wechat_user_id, messages.reply_capable, messages.conversation_send_capable, messages.seq, messages.created_at, messages.envelope_json, messages.assets_json, messages.received_at, native_contents.assets_json AS native_assets_json FROM messages JOIN devices ON devices.device_id = messages.device_id LEFT JOIN native_contents ON native_contents.message_id = messages.id WHERE devices.pair_id = ? AND messages.seq < ? ORDER BY messages.seq DESC, messages.wechat_user_id DESC LIMIT 21",
+      "SELECT messages.id, messages.device_id, messages.wechat_user_id, messages.reply_capable, messages.conversation_send_capable, messages.seq, messages.created_at, messages.envelope_json, messages.assets_json, messages.received_at, native_contents.assets_json AS native_assets_json, native_contents.envelope_json AS native_envelope_json FROM messages JOIN devices ON devices.device_id = messages.device_id LEFT JOIN native_contents ON native_contents.message_id = messages.id WHERE devices.pair_id = ? AND messages.seq < ? ORDER BY messages.seq DESC, messages.wechat_user_id DESC LIMIT 21",
       [pairId, beforeSeq ?? Number.MAX_SAFE_INTEGER],
     );
     const hasMore = messages.length > 20;
@@ -489,7 +496,7 @@ async function route(
     response.setHeader("Cache-Control", "no-store");
     return json(response, 200, {
       pairId,
-      messages: page.map((message) => ({
+      messages: await Promise.all(page.map(async (message) => ({
         messageId: message.id,
         deviceId: message.device_id,
         wechatUserId: dbInteger(message.wechat_user_id),
@@ -500,8 +507,8 @@ async function route(
         receivedAt: dbInteger(message.received_at),
         previewEnvelope: JSON.parse(message.envelope_json),
         assets: message.assets_json ? JSON.parse(message.assets_json).map(assetMetadata) : [],
-        ...(message.native_assets_json !== null ? { hasNativeContent: true, nativeAssets: JSON.parse(message.native_assets_json) } : {}),
-      })),
+        ...(message.native_assets_json !== null ? { hasNativeContent: true, ...await nativeManifest(message.id, message.native_envelope_json, message.native_assets_json) } : {}),
+      }))),
       nextCursor: hasMore ? String(dbInteger(page.at(-1)!.seq)) : null,
       hasMore,
     });
@@ -618,6 +625,8 @@ async function getIosStatus(
     serverTime: Date.now(),
     pushConfigured: apnsSender !== undefined,
     pushRegistered: current.subscription.deviceToken !== null,
+    tabletRepliesAvailable: true,
+    tabletContactSendAvailable: true,
   });
 }
 
@@ -700,7 +709,7 @@ async function submitBrowserReply(
   );
   if (existing) return replyIdempotentResponse(response, existing, reply, pairId, envelopeJson);
 
-  if (reply.v === 4)
+  if (reply.v === 4 || reply.v === 7 || reply.v === 8)
     await validateContactReplyTarget(reply, pairId);
   else
     await validateMessageReplyTarget(reply, pairId);
@@ -734,7 +743,7 @@ async function submitBrowserReply(
   }
   event(
     "REPLY_QUEUED",
-    reply.v === 4 ? { replyId: reply.id } : { replyId: reply.id, targetMessageId: reply.targetMessageId },
+    reply.targetContactSnapshotId ? { replyId: reply.id } : { replyId: reply.id, targetMessageId: reply.targetMessageId },
   );
   replyEvents.emit("queued", reply.deviceId);
   iosEvents.emit("reply", pairId, reply.id);
@@ -776,12 +785,24 @@ async function validateMessageReplyTarget(reply: BrowserReply, pairId: string): 
     wechat_user_id: string | number;
     reply_capable: string | number;
     conversation_send_capable: string | number;
+    native_envelope_json: string | null;
   }>(
     pool,
-    "SELECT messages.wechat_user_id, messages.reply_capable, messages.conversation_send_capable FROM messages JOIN devices ON devices.device_id = messages.device_id WHERE messages.id = ? AND messages.device_id = ? AND devices.pair_id = ?",
+    "SELECT messages.wechat_user_id, messages.reply_capable, messages.conversation_send_capable, native_contents.envelope_json AS native_envelope_json FROM messages JOIN devices ON devices.device_id = messages.device_id LEFT JOIN native_contents ON native_contents.message_id = messages.id WHERE messages.id = ? AND messages.device_id = ? AND devices.pair_id = ?",
     [reply.targetMessageId, reply.deviceId, pairId],
   );
   if (!target) throw new Error("TARGET_MESSAGE_NOT_FOUND");
+  if (dbInteger(target.wechat_user_id) !== reply.wechatUserId)
+    throw new Error("PROFILE_MISMATCH");
+  if (reply.v === 6) {
+    if (target.native_envelope_json === null) throw new Error("REPLY_UNSUPPORTED");
+    nativeVersion(target.native_envelope_json);
+    return;
+  }
+  if (reply.v === 5 && (target.native_envelope_json === null || ![7, 8].includes(nativeVersion(target.native_envelope_json))))
+    throw new Error("REPLY_UNSUPPORTED");
+  if (reply.v < 5 && target.native_envelope_json !== null)
+    throw new Error("REPLY_UNSUPPORTED");
   if (dbInteger(target.reply_capable) !== 1) throw new Error("REPLY_UNSUPPORTED");
   if (reply.v === 3 && dbInteger(target.conversation_send_capable) !== 1)
     throw new Error("CONVERSATION_SEND_UNSUPPORTED");
@@ -801,20 +822,21 @@ async function validateContactReplyTarget(reply: BrowserReply, pairId: string): 
     "SELECT contacts_snapshots.id, contacts_snapshots.device_id, contacts_snapshots.wechat_user_id, contacts_snapshots.captured_at, contacts_snapshots.envelope_json FROM contacts_snapshots JOIN devices ON devices.device_id = contacts_snapshots.device_id WHERE contacts_snapshots.id = ? AND contacts_snapshots.device_id = ? AND contacts_snapshots.wechat_user_id = ? AND devices.pair_id = ?",
     [reply.targetContactSnapshotId, reply.deviceId, reply.wechatUserId, pairId],
   );
-  if (!snapshot || !isV2ContactsEnvelope(snapshot))
+  if (!snapshot || !isContactsEnvelopeVersion(snapshot, reply.v === 4 ? 2 : 3))
     throw new Error("TARGET_CONTACT_SNAPSHOT_NOT_FOUND");
 }
 
-function isV2ContactsEnvelope(snapshot: {
+function isContactsEnvelopeVersion(snapshot: {
   id: string;
   device_id: string;
   wechat_user_id: string | number;
   captured_at: string | number;
   envelope_json: string;
-}): boolean {
+}, version: 2 | 3): boolean {
   try {
     const envelope = JSON.parse(snapshot.envelope_json) as ContactsEnvelope;
-    return envelope.aad === `AWR1|A2I_CONTACTS|2|${snapshot.id}|${snapshot.device_id}|${dbInteger(snapshot.captured_at)}|${dbInteger(snapshot.wechat_user_id)}`;
+    return (version !== 3 || dbInteger(snapshot.wechat_user_id) === 0) &&
+      envelope.aad === `AWR1|A2I_CONTACTS|${version}|${snapshot.id}|${snapshot.device_id}|${dbInteger(snapshot.captured_at)}|${dbInteger(snapshot.wechat_user_id)}`;
   } catch {
     return false;
   }
@@ -832,8 +854,8 @@ async function getBrowserReply(
     "SELECT id, target_message_id, contact_snapshot_id, device_id, wechat_user_id, created_at, status, status_at FROM replies WHERE id = ? AND pair_id = ?",
     [replyId, pairId],
   );
-  if (!reply) throw new Error("REPLY_NOT_FOUND");
   response.setHeader("Cache-Control", "no-store");
+  if (!reply) return json(response, 404, { error: "REPLY_NOT_FOUND" });
   json(response, 200, replyMetadata(reply));
 }
 
@@ -842,8 +864,9 @@ async function getAndroidReply(
   response: ServerResponse,
   url: URL,
   includeContactReplies: boolean,
+  tablet = false,
 ): Promise<void> {
-  const pathname = includeContactReplies
+  const pathname = tablet ? "/api/v1/android/replies/tablet" : includeContactReplies
     ? "/api/v1/android/replies/v4"
     : "/api/v1/android/replies";
   if (url.pathname !== pathname || url.search) throw new Error("INVALID_PATH");
@@ -859,11 +882,11 @@ async function getAndroidReply(
   const wake = waitForReply(signed.deviceId);
   try {
     if (response.destroyed) return;
-    let reply = await claimReply(signed.deviceId, includeContactReplies, signed.nonce);
+    let reply = await claimReply(signed.deviceId, includeContactReplies, signed.nonce, tablet);
     if (!reply) {
       await wake.wait;
       if (response.destroyed) return;
-      reply = await claimReply(signed.deviceId, includeContactReplies);
+      reply = await claimReply(signed.deviceId, includeContactReplies, undefined, tablet);
     }
     const relayPolicy = relayPolicyJson(await loadRelayPolicy(signed.pairId));
     if (!reply) return json(response, 200, { reply: null, relayPolicy });
@@ -894,12 +917,22 @@ async function acknowledgeAndroidReply(
   const now = Date.now();
   const pairId = await transaction(async (connection) => {
     await consumeAndroidNonce(connection, signed.deviceId, signed.nonce, now);
-    const reply = await dbOne<{ pair_id: string }>(
+    const reply = await dbOne<{ pair_id: string; status: string; envelope_json: string }>(
       connection,
-      "SELECT pair_id FROM replies WHERE id = ? AND device_id = ? FOR UPDATE",
+      "SELECT pair_id, status, envelope_json FROM replies WHERE id = ? AND device_id = ? FOR UPDATE",
       [replyId, signed.deviceId],
     );
     if (!reply) throw new Error("REPLY_NOT_FOUND");
+    const aad = (JSON.parse(reply.envelope_json) as ReplyEnvelope).aad;
+    const bootstrap = aad.startsWith("AWR1|I2A|6|REPLY_KEY_BOOTSTRAP|") || aad.startsWith("AWR1|I2A|8|TABLET_CONTACT_REPLY_KEY_BOOTSTRAP|");
+    const tablet = bootstrap || aad.startsWith("AWR1|I2A|5|TABLET_SEND|") || aad.startsWith("AWR1|I2A|7|TABLET_CONTACT_SEND|");
+    if ((status === "REPLY_KEY_INSTALLED" && !bootstrap) || (bootstrap && !["REPLY_KEY_INSTALLED", "INVALID_REPLY", "FAILED"].includes(status)) ||
+        (status === "SEND_UNCONFIRMED" && (!tablet || bootstrap))) throw new Error("INVALID_REPLY_STATUS");
+    // A redelivered tablet command retries its durable ACK, never its send click.
+    if (tablet && reply.status !== "DELIVERED_TO_ANDROID") {
+      if (reply.status === status) return reply.pair_id;
+      throw new Error("INVALID_REPLY_STATUS");
+    }
     const result = await dbRun(
       connection,
       "UPDATE replies SET status = ?, status_at = ? WHERE id = ? AND device_id = ?",
@@ -958,6 +991,7 @@ async function uploadAndroidMessage(
   )
     throw new Error("INVALID_SIGNATURE");
   const now = Date.now();
+  if (message.v === 8) validateNativeContent(message.contentEnvelope, { ...message, pairId: device.pair_id });
   const payload = buildAndroidPushPayload(message, device.pair_id);
   const bodyHash = createHash("sha256").update(bytes).digest();
   const stored = await transaction(async (connection) => {
@@ -974,7 +1008,7 @@ async function uploadAndroidMessage(
       [message.id],
     );
     const policy = await loadRelayPolicy(lockedDevice.pair_id, connection);
-    if (!relayActive(policy) && !(message.v === 6 && existing))
+    if (!relayActive(policy) && !((message.v === 6 || message.v === 7 || message.v === 8) && existing))
       return { idempotent: false, pairId: lockedDevice.pair_id, dropped: true };
     if (existing) {
       if (!timingSafeBufferEqual(existing.body_hash, bodyHash))
@@ -1014,22 +1048,23 @@ async function uploadAndroidMessage(
       "INSERT INTO push_outbox(message_id, payload, queued_at) VALUES (?, ?, ?)",
       [message.id, payload, now],
     );
-    if (message.v === 6) {
-      const assets = message.nativeAssets!;
+    if (message.v === 6 || message.v === 7 || message.v === 8) {
+      const assets = message.v === 8 ? [] : message.nativeAssets!;
+      const slots = message.v === 8 ? message.nativeAssetSlots! : assets;
       await cleanExpiredNativeAssets(connection, now);
-      const quota = await dbOne<{ reserved: string | number }>(
-        connection,
-        "SELECT COALESCE(SUM(native_assets.byte_length), 0) AS reserved FROM native_assets JOIN messages ON messages.id = native_assets.message_id WHERE messages.device_id = ? AND native_assets.expires_at > ?",
-        [message.deviceId, now],
-      );
-      if (dbInteger(quota?.reserved ?? 0) + assets.reduce((sum, asset) => sum + asset.byteLength, 0) > NATIVE_PAIR_QUOTA_BYTES)
-        throw new Error("NATIVE_QUOTA_EXCEEDED");
+      await enforceNativeQuota(connection, message.deviceId, assets.reduce((sum, asset) => sum + asset.byteLength, 0), now);
       await dbRun(connection, "INSERT INTO native_contents(message_id, envelope_json, assets_json) VALUES (?, ?, ?)",
-        [message.id, JSON.stringify(message.contentEnvelope), JSON.stringify(assets)]);
-      for (const asset of assets) {
+        [message.id, JSON.stringify(message.contentEnvelope), JSON.stringify(slots)]);
+      for (const [ordinal, slot] of slots.entries()) {
         try {
-          await dbRun(connection, "INSERT INTO native_assets(id, message_id, byte_length, metadata_json, expires_at) VALUES (?, ?, ?, ?, ?)",
-            [asset.id, message.id, asset.byteLength, JSON.stringify(asset), now + NATIVE_ASSET_TTL_MS]);
+          // Legacy declarations also reserve this PK so cross-version races cannot reuse IDs.
+          await dbRun(connection, "INSERT INTO native_asset_slots(id, message_id, ordinal, kind, role, derived_from, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [slot.id, message.id, ordinal, slot.kind, slot.role, slot.derivedFrom ?? null, now + NATIVE_ASSET_TTL_MS]);
+          if (message.v !== 8) {
+            const asset = assets[ordinal]!;
+            await dbRun(connection, "INSERT INTO native_assets(id, message_id, byte_length, metadata_json, expires_at) VALUES (?, ?, ?, ?, ?)",
+              [asset.id, message.id, asset.byteLength, JSON.stringify(asset), now + NATIVE_ASSET_TTL_MS]);
+          }
         } catch (error) {
           if (isUniqueConstraint(error)) throw new Error("NATIVE_ASSET_CONFLICT");
           throw error;
@@ -1123,6 +1158,13 @@ async function uploadAndroidContacts(
   json(response, idempotent ? 200 : 201, { id: snapshot.id, idempotent });
 }
 
+async function enforceNativeQuota(connection: PoolConnection, deviceId: string, additional: number, now: number): Promise<void> {
+  const quota = await dbOne<{ reserved: string | number }>(connection,
+    "SELECT COALESCE(SUM(native_assets.byte_length), 0) AS reserved FROM native_assets JOIN messages ON messages.id = native_assets.message_id WHERE messages.device_id = ? AND native_assets.expires_at > ?", [deviceId, now]);
+  if (dbInteger(quota?.reserved ?? 0) + additional > NATIVE_PAIR_QUOTA_BYTES)
+    throw new Error("NATIVE_QUOTA_EXCEEDED");
+}
+
 async function cleanExpiredNativeAssets(executor: DbExecutor = pool, now = Date.now()): Promise<void> {
   await dbRun(executor,
     "DELETE native_asset_payloads FROM native_asset_payloads JOIN native_assets ON native_assets.id = native_asset_payloads.asset_id WHERE native_assets.expires_at <= ?",
@@ -1144,28 +1186,52 @@ async function uploadNativeAsset(
     const now = Date.now();
     await consumeAndroidNonce(connection, signed.deviceId, signed.nonce, now);
     const asset = await dbOne<{
-      metadata_json: string;
+      metadata_json: string | null;
       expires_at: string | number;
+      legacy_expires_at: string | number | null;
+      kind: NativeAssetSlot["kind"];
+      role: NativeAssetSlot["role"];
+      derived_from: string | null;
       seq: string | number;
       created_at: string | number;
       wechat_user_id: 0 | 999;
+      native_envelope_json: string;
     }>(connection,
-      "SELECT native_assets.metadata_json, native_assets.expires_at, messages.seq, messages.created_at, messages.wechat_user_id FROM native_assets JOIN messages ON messages.id = native_assets.message_id WHERE native_assets.id = ? AND messages.id = ? AND messages.device_id = ?",
+      "SELECT native_assets.metadata_json, native_asset_slots.expires_at, native_assets.expires_at AS legacy_expires_at, native_asset_slots.kind, native_asset_slots.role, native_asset_slots.derived_from, messages.seq, messages.created_at, messages.wechat_user_id, native_contents.envelope_json AS native_envelope_json FROM native_asset_slots JOIN messages ON messages.id = native_asset_slots.message_id JOIN native_contents ON native_contents.message_id = messages.id LEFT JOIN native_assets ON native_assets.id = native_asset_slots.id WHERE native_asset_slots.id = ? AND messages.id = ? AND messages.device_id = ?",
       [assetId, messageId, signed.deviceId]);
     if (!asset) return { status: 404, body: { error: "NOT_FOUND" } };
-    if (dbInteger(asset.expires_at) <= now) return { status: 410, body: { error: "ASSET_EXPIRED" } };
-    const envelope = validateNativeAssetUpload(value, {
-      id: messageId, deviceId: signed.deviceId, seq: dbInteger(asset.seq),
-      createdAt: dbInteger(asset.created_at), wechatUserId: asset.wechat_user_id,
-    }, JSON.parse(asset.metadata_json) as NativeAsset);
-    const serialized = JSON.stringify(envelope);
-    if (Buffer.byteLength(serialized) > MAX_NATIVE_ASSET_BODY_BYTES) throw new Error("BODY_TOO_LARGE");
-    const hash = createHash("sha256").update(serialized).digest();
+    const v = nativeVersion(asset.native_envelope_json);
+    const expiresAt = dbInteger(v === 8 ? asset.expires_at : asset.legacy_expires_at!);
+    if (expiresAt <= now) return { status: 410, body: { error: "ASSET_EXPIRED" } };
     const existing = await dbOne<{ envelope_hash: Buffer }>(connection,
       "SELECT envelope_hash FROM native_asset_payloads WHERE asset_id = ?", [assetId]);
+    const requestHash = createHash("sha256").update(bytes).digest();
+    if (v === 8 && existing) {
+      if (!timingSafeBufferEqual(existing.envelope_hash, requestHash)) throw new Error("NATIVE_ASSET_CONFLICT");
+      return { status: 200, body: { id: assetId, idempotent: true } };
+    }
+    const slot: NativeAssetSlot = { id: assetId, kind: asset.kind, role: asset.role,
+      ...(asset.derived_from === null ? {} : { derivedFrom: asset.derived_from }) };
+    const metadata = v === 8
+      ? validateNativeAssetMetadata((value as { metadata?: unknown } | null)?.metadata, slot)
+      : JSON.parse(asset.metadata_json!) as NativeAsset;
+    const envelope = validateNativeAssetUpload(value, {
+      id: messageId, deviceId: signed.deviceId, pairId: signed.pairId, seq: dbInteger(asset.seq),
+      createdAt: dbInteger(asset.created_at), wechatUserId: asset.wechat_user_id, nativeVersion: v,
+    }, metadata);
+    const serialized = JSON.stringify(envelope);
+    if (Buffer.byteLength(serialized) > MAX_NATIVE_ASSET_BODY_BYTES) throw new Error("BODY_TOO_LARGE");
+    // v8 retries bind the exact persisted request, including its resolved metadata.
+    const hash = v === 8 ? requestHash : createHash("sha256").update(serialized).digest();
     if (existing) {
       if (!timingSafeBufferEqual(existing.envelope_hash, hash)) throw new Error("NATIVE_ASSET_CONFLICT");
       return { status: 200, body: { id: assetId, idempotent: true } };
+    }
+    if (v === 8) {
+      if (asset.metadata_json !== null) throw new Error("NATIVE_ASSET_CONFLICT");
+      await enforceNativeQuota(connection, signed.deviceId, metadata.byteLength, now);
+      await dbRun(connection, "INSERT INTO native_assets(id, message_id, byte_length, metadata_json, expires_at) VALUES (?, ?, ?, ?, ?)",
+        [assetId, messageId, metadata.byteLength, JSON.stringify(metadata), expiresAt]);
     }
     await dbRun(connection,
       "INSERT INTO native_asset_payloads(asset_id, envelope_json, envelope_hash) VALUES (?, ?, ?)",
@@ -1173,28 +1239,41 @@ async function uploadNativeAsset(
     return { status: 201, body: { id: assetId, idempotent: false } };
   });
   response.setHeader("Cache-Control", "no-store");
+  if (result.status === 201) iosEvents.emit("asset-ready", signed.pairId, assetId);
   json(response, result.status, result.body);
 }
 
 async function getNativeContent(request: IncomingMessage, response: ServerResponse, messageId: string): Promise<void> {
   const { pairId } = await authorizeBrowserPair(request, false);
-  const content = await dbOne<{ envelope_json: string }>(pool,
-    "SELECT native_contents.envelope_json FROM native_contents JOIN messages ON messages.id = native_contents.message_id JOIN devices ON devices.device_id = messages.device_id WHERE native_contents.message_id = ? AND devices.pair_id = ?",
+  const content = await dbOne<{ envelope_json: string; assets_json: string }>(pool,
+    "SELECT native_contents.envelope_json, native_contents.assets_json FROM native_contents JOIN messages ON messages.id = native_contents.message_id JOIN devices ON devices.device_id = messages.device_id WHERE native_contents.message_id = ? AND devices.pair_id = ?",
     [messageId, pairId]);
   response.setHeader("Cache-Control", "no-store");
   if (!content) return json(response, 404, { error: "NOT_FOUND" });
-  json(response, 200, { contentEnvelope: JSON.parse(content.envelope_json) });
+  json(response, 200, { contentEnvelope: JSON.parse(content.envelope_json),
+    ...(nativeVersion(content.envelope_json) === 8 ? await nativeManifest(messageId, content.envelope_json, content.assets_json) : {}) });
+}
+
+async function nativeManifest(messageId: string, envelopeJson: string | null, assetsJson: string): Promise<{
+  nativeVersion: 6 | 7 | 8; nativeAssets: NativeAsset[]; nativeAssetSlots?: NativeAssetSlot[];
+}> {
+  const v = nativeVersion(envelopeJson);
+  if (v !== 8) return { nativeVersion: v, nativeAssets: JSON.parse(assetsJson) as NativeAsset[] };
+  const resolved = await dbRows<{ metadata_json: string }>(pool,
+    "SELECT native_assets.metadata_json FROM native_asset_slots JOIN native_assets ON native_assets.id = native_asset_slots.id WHERE native_asset_slots.message_id = ? ORDER BY native_asset_slots.ordinal", [messageId]);
+  return { nativeVersion: v, nativeAssetSlots: JSON.parse(assetsJson) as NativeAssetSlot[],
+    nativeAssets: resolved.map((asset) => JSON.parse(asset.metadata_json) as NativeAsset) };
 }
 
 async function getNativeAsset(request: IncomingMessage, response: ServerResponse, assetId: string): Promise<void> {
   const { pairId } = await authorizeBrowserPair(request, false);
-  const asset = await dbOne<{ metadata_json: string; expires_at: string | number; envelope_json: string | null }>(pool,
-    "SELECT native_assets.metadata_json, native_assets.expires_at, native_asset_payloads.envelope_json FROM native_assets JOIN messages ON messages.id = native_assets.message_id JOIN devices ON devices.device_id = messages.device_id LEFT JOIN native_asset_payloads ON native_asset_payloads.asset_id = native_assets.id WHERE native_assets.id = ? AND devices.pair_id = ?",
+  const asset = await dbOne<{ metadata_json: string | null; expires_at: string | number; envelope_json: string | null }>(pool,
+    "SELECT native_assets.metadata_json, COALESCE(native_assets.expires_at, native_asset_slots.expires_at) AS expires_at, native_asset_payloads.envelope_json FROM native_asset_slots JOIN messages ON messages.id = native_asset_slots.message_id JOIN devices ON devices.device_id = messages.device_id LEFT JOIN native_assets ON native_assets.id = native_asset_slots.id LEFT JOIN native_asset_payloads ON native_asset_payloads.asset_id = native_assets.id WHERE native_asset_slots.id = ? AND devices.pair_id = ?",
     [assetId, pairId]);
   response.setHeader("Cache-Control", "no-store");
   if (!asset) return json(response, 404, { error: "NOT_FOUND" });
   if (dbInteger(asset.expires_at) <= Date.now()) return json(response, 410, { error: "ASSET_EXPIRED" });
-  if (!asset.envelope_json) return json(response, 409, { error: "ASSET_PENDING" });
+  if (!asset.envelope_json || !asset.metadata_json) return json(response, 409, { error: "ASSET_PENDING" });
   json(response, 200, { ...JSON.parse(asset.metadata_json), envelope: JSON.parse(asset.envelope_json) });
 }
 
@@ -1220,7 +1299,7 @@ async function getIosContacts(
   response.setHeader("Cache-Control", "no-store");
   json(response, 200, {
     snapshots: rows.map((row) => ({
-      v: (JSON.parse(row.envelope_json) as ContactsEnvelope).aad.startsWith("AWR1|A2I_CONTACTS|2|") ? 2 : 1,
+      v: (JSON.parse(row.envelope_json) as ContactsEnvelope).aad.startsWith("AWR1|A2I_CONTACTS|3|") ? 3 : (JSON.parse(row.envelope_json) as ContactsEnvelope).aad.startsWith("AWR1|A2I_CONTACTS|2|") ? 2 : 1,
       id: row.id,
       deviceId: row.device_id,
       wechatUserId: dbInteger(row.wechat_user_id),
@@ -1360,6 +1439,7 @@ async function streamIosEvents(
   let changeVersion = 0;
   let pendingMessage = false;
   const pendingReplies = new Set<string>();
+  const pendingAssets = new Set<string>();
   let notifyWaiter: (() => void) | undefined;
   const notify = (): void => {
     changeVersion++;
@@ -1387,8 +1467,20 @@ async function streamIosEvents(
     closed = true;
     notify();
   };
+  const onAssetReady = (storedPairId: string, assetId: string): void => {
+    if (storedPairId !== pairId) return;
+    if (pendingAssets.size >= maxPendingIosReplyHints) {
+      closed = true;
+      response.end();
+      notify();
+      return;
+    }
+    pendingAssets.add(assetId);
+    notify();
+  };
   messageEvents.on("stored", onMessage);
   iosEvents.on("reply", onReply);
+  iosEvents.on("asset-ready", onAssetReady);
   response.once("close", close);
 
   const waitForChange = (observedVersion: number, timeoutMs: number): Promise<boolean> => {
@@ -1438,11 +1530,18 @@ async function streamIosEvents(
         continue;
       }
       const observedVersion = changeVersion;
+      const assetId = pendingAssets.values().next().value as string | undefined;
+      if (assetId) {
+        pendingAssets.delete(assetId);
+        if (!await writeSse(response, "asset-ready", assetId)) return;
+        continue;
+      }
       await waitForChange(observedVersion, nextAuthorizationAt - Date.now());
     }
   } finally {
     messageEvents.off("stored", onMessage);
     iosEvents.off("reply", onReply);
+    iosEvents.off("asset-ready", onAssetReady);
     response.off("close", close);
     if (!response.destroyed && !response.writableEnded) response.end();
     if (opened) event("IOS_STREAM_CLOSED", {});
@@ -1451,7 +1550,7 @@ async function streamIosEvents(
 
 async function writeSse(
   response: ServerResponse,
-  eventName: "ready" | "message" | "reply" | undefined,
+  eventName: "ready" | "message" | "reply" | "asset-ready" | undefined,
   data: string,
 ): Promise<boolean> {
   if (response.destroyed || response.writableEnded) return false;
@@ -1482,7 +1581,7 @@ function validateAndroidMessage(value: unknown): AndroidMessage {
   if (!value || typeof value !== "object") throw new Error("INVALID_MESSAGE");
   const message = value as Partial<AndroidMessage>;
   if (
-    (message.v !== 1 && message.v !== 2 && message.v !== 3 && message.v !== 4 && message.v !== 5 && message.v !== 6) ||
+    (message.v !== 1 && message.v !== 2 && message.v !== 3 && message.v !== 4 && message.v !== 5 && message.v !== 6 && message.v !== 7 && message.v !== 8) ||
     !isUuid(message.id) ||
     !isDeviceId(message.deviceId) ||
     !Number.isSafeInteger(message.seq) ||
@@ -1491,15 +1590,15 @@ function validateAndroidMessage(value: unknown): AndroidMessage {
     Math.abs(Date.now() - message.createdAt!) > 172_800_000
   )
     throw new Error("INVALID_MESSAGE");
-  const profileVersion = message.v === 3 || message.v === 4 || message.v === 5 || message.v === 6;
+  const profileVersion = message.v === 3 || message.v === 4 || message.v === 5 || message.v === 6 || message.v === 7 || message.v === 8;
   const wechatUserId = profileVersion ? message.wechatUserId : 0;
   if (wechatUserId !== 0 && wechatUserId !== 999)
     throw new Error("INVALID_PROFILE");
-  const replyCapable = message.v === 4 || message.v === 5 || message.v === 6 ? message.replyCapable : false;
-  if ((message.v === 4 || message.v === 5 || message.v === 6) && (typeof replyCapable !== "boolean" || (message.v === 6 && replyCapable)))
+  const replyCapable = message.v === 4 || message.v === 5 || message.v === 6 || message.v === 7 || message.v === 8 ? message.replyCapable : false;
+  if ((message.v === 4 || message.v === 5 || message.v === 6 || message.v === 7 || message.v === 8) && (typeof replyCapable !== "boolean" || (message.v === 6 && replyCapable)))
     throw new Error("INVALID_REPLY_CAPABILITY");
-  const conversationSendCapable = message.v === 5 || message.v === 6 ? message.conversationSendCapable : false;
-  if ((message.v === 5 || message.v === 6) && (typeof conversationSendCapable !== "boolean" || (message.v === 6 && conversationSendCapable)))
+  const conversationSendCapable = message.v === 5 || message.v === 6 || message.v === 7 || message.v === 8 ? message.conversationSendCapable : false;
+  if ((message.v === 5 || message.v === 6 || message.v === 7 || message.v === 8) && (typeof conversationSendCapable !== "boolean" || ((message.v === 6 || message.v === 7 || message.v === 8) && conversationSendCapable)))
     throw new Error("INVALID_CONVERSATION_SEND_CAPABILITY");
   if (conversationSendCapable && !replyCapable)
     throw new Error("INVALID_CONVERSATION_SEND_CAPABILITY");
@@ -1522,12 +1621,18 @@ function validateAndroidMessage(value: unknown): AndroidMessage {
   if (message.v === 1 && message.assets !== undefined) throw new Error("INVALID_ASSETS");
   const assets = message.assets ?? [];
   if (!Array.isArray(assets) || assets.length > 2) throw new Error("INVALID_ASSETS");
-  if (message.v === 6) {
+  if (message.v === 6 || message.v === 7 || message.v === 8) {
     if (assets.length) throw new Error("INVALID_ASSETS");
     const context = message as AndroidMessage;
     validateNativePreview(message.previewEnvelope, context);
-    validateNativeContent(message.contentEnvelope, context);
-    validateNativeAssets(message.nativeAssets);
+    if (message.v === 8) {
+      if (message.nativeAssets !== undefined) throw new Error("INVALID_NATIVE_ASSETS");
+      validateNativeAssetSlots(message.nativeAssetSlots);
+    } else {
+      if (message.nativeAssetSlots !== undefined) throw new Error("INVALID_NATIVE_ASSETS");
+      validateNativeContent(message.contentEnvelope, context);
+      validateNativeAssets(message.nativeAssets);
+    }
   }
   const ids = new Set<string>();
   for (const asset of assets) {
@@ -1541,6 +1646,15 @@ function validateAndroidMessage(value: unknown): AndroidMessage {
     ids.add(candidate.id);
   }
   return { ...message, wechatUserId, replyCapable, conversationSendCapable } as AndroidMessage;
+}
+
+function nativeVersion(serialized: string | null): 6 | 7 | 8 {
+  const aad: unknown = serialized === null ? null : JSON.parse(serialized).aad;
+  if (typeof aad !== "string") throw new Error("INVALID_NATIVE_VERSION");
+  if (aad.startsWith("AWR1|A2I_CONTENT|6|")) return 6;
+  if (aad.startsWith("AWR1|A2I_CONTENT|7|")) return 7;
+  if (aad.startsWith("AWR1|A2I_CONTENT|8|")) return 8;
+  throw new Error("INVALID_NATIVE_VERSION");
 }
 function validateContactsSnapshot(value: unknown): ContactsSnapshot {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -1556,10 +1670,11 @@ function validateContactsSnapshot(value: unknown): ContactsSnapshot {
     keys[3] !== "id" ||
     keys[4] !== "v" ||
     keys[5] !== "wechatUserId" ||
-    (snapshot.v !== 1 && snapshot.v !== 2) ||
+    (snapshot.v !== 1 && snapshot.v !== 2 && snapshot.v !== 3) ||
     !isUuidV7(snapshot.id) ||
     !isDeviceId(snapshot.deviceId) ||
     (snapshot.wechatUserId !== 0 && snapshot.wechatUserId !== 999) ||
+    (snapshot.v === 3 && snapshot.wechatUserId !== 0) ||
     typeof capturedAt !== "number" ||
     !Number.isSafeInteger(capturedAt) ||
     capturedAt <= 0 ||
@@ -1594,7 +1709,7 @@ function validateBrowserReply(value: unknown, pairId: string): BrowserReply {
   if (!value || typeof value !== "object") throw new Error("INVALID_REPLY");
   const reply = value as Partial<BrowserReply>;
   if (
-    (reply.v !== 1 && reply.v !== 2 && reply.v !== 3 && reply.v !== 4) ||
+    (reply.v !== 1 && reply.v !== 2 && reply.v !== 3 && reply.v !== 4 && reply.v !== 5 && reply.v !== 6 && reply.v !== 7 && reply.v !== 8) ||
     !isUuid(reply.id) ||
     !isDeviceId(reply.deviceId) ||
     !Number.isSafeInteger(reply.createdAt) ||
@@ -1602,7 +1717,7 @@ function validateBrowserReply(value: unknown, pairId: string): BrowserReply {
   )
     throw new Error("INVALID_REPLY");
   if (
-    reply.v === 4
+    reply.v === 4 || reply.v === 7 || reply.v === 8
       ? reply.targetMessageId !== undefined || !isUuid(reply.targetContactSnapshotId)
       : !isUuid(reply.targetMessageId) || reply.targetContactSnapshotId !== undefined
   ) throw new Error("INVALID_REPLY");
@@ -1610,19 +1725,25 @@ function validateBrowserReply(value: unknown, pairId: string): BrowserReply {
   if (wechatUserId !== 0 && wechatUserId !== 999)
     throw new Error("INVALID_PROFILE");
   const envelope = reply.replyEnvelope;
+  if (reply.v >= 5 && wechatUserId !== 0)
+    throw new Error("INVALID_PROFILE");
   if (
     !envelope ||
     envelope.alg !== "A256GCM" ||
-    envelope.kid !== "phase1-reply" ||
+    envelope.kid !== (reply.v === 6 || reply.v === 8 ? "phase2-reply-bootstrap" : "phase1-reply") ||
     typeof envelope.aad !== "string"
   )
     throw new Error("INVALID_REPLY_ENVELOPE");
   decodeBase64url(envelope.iv, 24, "INVALID_REPLY_ENVELOPE", 12);
-  if (decodeBase64url(envelope.ct, 4096, "INVALID_REPLY_ENVELOPE").length < 17)
+  if (decodeBase64url(envelope.ct, reply.v >= 5 ? 8192 : 4096, "INVALID_REPLY_ENVELOPE").length < 17)
     throw new Error("INVALID_REPLY_ENVELOPE");
   if (
     envelope.aad !==
-    (reply.v === 4
+    (reply.v === 7 || reply.v === 8
+      ? `AWR1|I2A|${reply.v}|${reply.v === 7 ? "TABLET_CONTACT_SEND" : "TABLET_CONTACT_REPLY_KEY_BOOTSTRAP"}|${pairId}|${reply.id}|${reply.deviceId}|${reply.targetContactSnapshotId}|${reply.createdAt}|${wechatUserId}`
+      : reply.v === 5 || reply.v === 6
+      ? `AWR1|I2A|${reply.v}|${reply.v === 5 ? "TABLET_SEND" : "REPLY_KEY_BOOTSTRAP"}|${pairId}|${reply.id}|${reply.deviceId}|${reply.targetMessageId}|${reply.createdAt}|${wechatUserId}`
+      : reply.v === 4
       ? `AWR1|I2A|4|CONTACT_SEND|${pairId}|${reply.id}|${reply.deviceId}|${reply.targetContactSnapshotId}|${reply.createdAt}|${wechatUserId}`
       : reply.v === 3
       ? `AWR1|I2A|3|CONVERSATION_SEND|${pairId}|${reply.id}|${reply.deviceId}|${reply.targetMessageId}|${reply.createdAt}|${wechatUserId}`
@@ -1633,6 +1754,8 @@ function validateBrowserReply(value: unknown, pairId: string): BrowserReply {
 }
 
 const replyStatuses = new Set([
+  "REPLY_KEY_INSTALLED",
+  "SEND_UNCONFIRMED",
   "SENT_TO_WECHAT",
   "NOTIFICATION_NOT_ACTIVE",
   "WECHAT_ACTION_CHANGED",
@@ -1737,6 +1860,7 @@ async function claimReply(
   deviceId: string,
   includeContactReplies: boolean,
   nonce?: string,
+  tablet = false,
 ): Promise<ClaimedReply | undefined> {
   const now = Date.now();
   return transaction(async (connection) => {
@@ -1751,25 +1875,31 @@ async function claimReply(
       created_at: string | number;
       envelope_json: string;
       wechat_user_id: string | number;
+      status: string;
     }>(
       connection,
-      `SELECT id, pair_id, target_message_id, contact_snapshot_id, device_id, wechat_user_id, created_at, envelope_json FROM replies WHERE device_id = ? AND status = 'QUEUED'${includeContactReplies ? "" : " AND contact_snapshot_id IS NULL"} ORDER BY queued_at ASC LIMIT 1 FOR UPDATE`,
+      `SELECT id, pair_id, target_message_id, contact_snapshot_id, device_id, wechat_user_id, created_at, envelope_json, status FROM replies WHERE device_id = ? AND ${tablet ? "status IN ('QUEUED', 'DELIVERED_TO_ANDROID')" : "status = 'QUEUED'"} AND JSON_UNQUOTE(JSON_EXTRACT(envelope_json, '$.aad')) ${tablet ? "" : "NOT "}REGEXP '^AWR1[|]I2A[|][5-8][|]'${includeContactReplies || tablet ? "" : " AND contact_snapshot_id IS NULL"} ORDER BY queued_at ASC LIMIT 1 FOR UPDATE`,
       [deviceId],
     );
     if (!reply) return undefined;
-    const result = await dbRun(
-      connection,
-      "UPDATE replies SET status = 'DELIVERED_TO_ANDROID', status_at = ? WHERE id = ? AND status = 'QUEUED'",
-      [now, reply.id],
-    );
-    if (result.affectedRows !== 1) throw new Error("REPLY_CLAIM_CONFLICT");
+    if (reply.status === "QUEUED") {
+      const result = await dbRun(connection,
+        "UPDATE replies SET status = 'DELIVERED_TO_ANDROID', status_at = ? WHERE id = ? AND status = 'QUEUED'",
+        [now, reply.id]);
+      if (result.affectedRows !== 1) throw new Error("REPLY_CLAIM_CONFLICT");
+    }
     const replyEnvelope = JSON.parse(reply.envelope_json) as ReplyEnvelope;
     const isContactSend = reply.contact_snapshot_id !== null;
     const isConversationSend = replyEnvelope.aad.startsWith("AWR1|I2A|3|CONVERSATION_SEND|");
-    if (isContactSend && !replyEnvelope.aad.startsWith("AWR1|I2A|4|CONTACT_SEND|"))
+    const isTabletSend = replyEnvelope.aad.startsWith("AWR1|I2A|5|TABLET_SEND|");
+    const isBootstrap = replyEnvelope.aad.startsWith("AWR1|I2A|6|REPLY_KEY_BOOTSTRAP|");
+    const isTabletContactSend = replyEnvelope.aad.startsWith("AWR1|I2A|7|TABLET_CONTACT_SEND|");
+    const isContactBootstrap = replyEnvelope.aad.startsWith("AWR1|I2A|8|TABLET_CONTACT_REPLY_KEY_BOOTSTRAP|");
+    if (tablet !== (isTabletSend || isBootstrap || isTabletContactSend || isContactBootstrap)) throw new Error("INVALID_STORED_REPLY");
+    if (isContactSend !== (replyEnvelope.aad.startsWith("AWR1|I2A|4|CONTACT_SEND|") || isTabletContactSend || isContactBootstrap))
       throw new Error("INVALID_STORED_REPLY");
     return {
-      v: isContactSend ? 4 : isConversationSend ? 3 : replyEnvelope.aad.split("|").length === 7 ? 2 : 1,
+      v: isContactBootstrap ? 8 : isTabletContactSend ? 7 : isBootstrap ? 6 : isTabletSend ? 5 : isContactSend ? 4 : isConversationSend ? 3 : replyEnvelope.aad.split("|").length === 7 ? 2 : 1,
       id: reply.id,
       deviceId: reply.device_id,
       createdAt: dbInteger(reply.created_at),
@@ -1778,7 +1908,7 @@ async function claimReply(
       ...(isContactSend
         ? { pairId: reply.pair_id, targetContactSnapshotId: reply.contact_snapshot_id! }
         : { targetMessageId: reply.target_message_id! }),
-      ...(isConversationSend ? { pairId: reply.pair_id } : {}),
+      ...(isConversationSend || tablet ? { pairId: reply.pair_id } : {}),
     };
   });
 }

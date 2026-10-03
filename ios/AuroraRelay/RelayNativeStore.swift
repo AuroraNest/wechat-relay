@@ -1,6 +1,5 @@
 import Foundation
 import RelayCore
-import UniformTypeIdentifiers
 
 @MainActor
 final class RelayNativeStore {
@@ -40,7 +39,7 @@ final class RelayNativeStore {
         guard run == generation else { throw CancellationError() }
         let reference = content.attachments.first { $0.assetId == metadata.id }
         let plaintext: Data
-        do { plaintext = try RelayCrypto.decryptNativeAsset(asset, for: message, messageKey: session.messageKey, sha256: reference?.sha256) }
+        do { plaintext = try RelayCrypto.decryptNativeAsset(asset, for: message, messageKey: session.messageKey, sha256: reference?.sha256, pairID: session.pairId) }
         catch { try? FileManager.default.removeItem(at: cached); throw error }
         if demo == nil, !FileManager.default.fileExists(atPath: cached.path) {
             let encoded = try JSONEncoder().encode(asset)
@@ -49,7 +48,7 @@ final class RelayNativeStore {
         }
         let outputDirectory = temporaryRoot.appendingPathComponent(session.pairId, isDirectory: true).appendingPathComponent(message.id.uuidString.lowercased(), isDirectory: true).appendingPathComponent(metadata.id.uuidString.lowercased(), isDirectory: true)
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-        let filename = Self.filename(reference?.name, metadata: metadata)
+        let filename = metadata.shareFilename(reference?.name)
         let output = outputDirectory.appendingPathComponent(filename)
         try plaintext.write(to: output, options: [.atomic, .completeFileProtection])
         return output
@@ -86,11 +85,4 @@ final class RelayNativeStore {
         }
     }
 
-    private static func filename(_ name: String?, metadata: RelayNativeAssetMetadata) -> String {
-        let basename = (name ?? "").replacingOccurrences(of: "\\", with: "/").split(separator: "/").last.map(String.init) ?? ""
-        let clean = String(String.UnicodeScalarView(basename.unicodeScalars.filter { $0.value >= 32 && $0.value != 127 && $0 != ":" })).trimmingCharacters(in: .whitespacesAndNewlines)
-        if !clean.isEmpty, clean != ".", clean != "..", clean.utf8.count <= 240 { return clean }
-        let suffix = UTType(mimeType: metadata.mimeType.lowercased())?.preferredFilenameExtension ?? "bin"
-        return "attachment-\(metadata.id.uuidString.lowercased()).\(suffix)"
-    }
 }

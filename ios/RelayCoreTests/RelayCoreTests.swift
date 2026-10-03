@@ -195,6 +195,32 @@ struct RelayCoreTests {
         }
     }
 
+    @Test func validatesTabletContactSendAndBootstrapTargets() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ReplyURLProtocol.self]
+        ReplyURLProtocol.reset()
+        let origin = URL(string: "https://relay.example.com")!
+        let api = try RelayAPI(origin: origin, configuration: configuration)
+        let session = try RelaySession(origin: origin, ackToken: "ack", pairId: messageID.uuidString.lowercased(), messageKey: key, replyKey: Data(repeating: 9, count: 32))
+        let contact = try RelayContact(name: "Same name", conversationId: "wxid_fixture", alias: "unique_alias")
+        let send = try RelayCrypto.makeTabletContactSend(session: session, snapshotId: messageID, deviceId: deviceID, contact: contact, accountFingerprint: String(repeating: "a", count: 64), body: "fixture")
+        let bootstrap = try RelayCrypto.makeTabletContactReplyBootstrap(session: session, snapshotId: messageID, deviceId: deviceID)
+        for request in [send, bootstrap] {
+            _ = try await api.submitReply(session: session, request: request)
+            let body = try #require(ReplyURLProtocol.capturedBody())
+            let object = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            #expect(object["targetMessageId"] == nil)
+            #expect(object["targetContactSnapshotId"] as? String == messageID.uuidString.lowercased())
+            let wrongTarget = RelayReplyRequest(v: request.v, id: request.id, targetMessageId: messageID, targetContactSnapshotId: messageID, deviceId: deviceID, wechatUserId: 0, createdAt: request.createdAt, replyEnvelope: request.replyEnvelope)
+            await #expect(throws: RelayError.invalidValue("tablet contact target")) { _ = try await api.submitReply(session: session, request: wrongTarget) }
+            let wrongProfile = RelayReplyRequest(v: request.v, id: request.id, targetContactSnapshotId: messageID, deviceId: deviceID, wechatUserId: 999, createdAt: request.createdAt, replyEnvelope: request.replyEnvelope)
+            await #expect(throws: RelayError.invalidValue("tablet contact target")) { _ = try await api.submitReply(session: session, request: wrongProfile) }
+            let changedAAD = RelayEncryptedEnvelope(kid: request.replyEnvelope.kid, iv: request.replyEnvelope.iv, aad: request.replyEnvelope.aad + "x", ct: request.replyEnvelope.ct)
+            let wrongAAD = RelayReplyRequest(v: request.v, id: request.id, targetContactSnapshotId: messageID, deviceId: deviceID, wechatUserId: 0, createdAt: request.createdAt, replyEnvelope: changedAAD)
+            await #expect(throws: RelayError.invalidValue("reply AAD")) { _ = try await api.submitReply(session: session, request: wrongAAD) }
+        }
+    }
+
     @Test func rejectsOversizedResponseBeforeBodyCollection() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ReplyURLProtocol.self]
@@ -226,12 +252,12 @@ struct RelayCoreTests {
     @Test func parsesBoundedStreamHintsAcrossLineEndings() throws {
         var parser = RelayStreamParser()
         var events: [RelayStreamEvent] = []
-        let source = ": keepalive\r\n\r\nevent: ready\r\ndata: 0\r\n\r\ndata: 7\n\nevent: reply\rdata: \(messageID.uuidString.lowercased())\r\revent: future\ndata: ignored\n\n"
+        let source = ": keepalive\r\n\r\nevent: ready\r\ndata: 0\r\n\r\ndata: 7\n\nevent: reply\rdata: \(messageID.uuidString.lowercased())\r\revent: asset-ready\ndata: \(messageID.uuidString.lowercased())\n\nevent: future\ndata: ignored\n\n"
         for byte in source.utf8 {
             if let event = try parser.append(byte) { events.append(event) }
         }
-        #expect(events == [.ready(0), .message(7), .reply(messageID)])
-        for invalid in ["data: -1\n\n", "data: 9007199254740992\n\n", "event: reply\ndata: invalid\n\n"] {
+        #expect(events == [.ready(0), .message(7), .reply(messageID), .assetReady(messageID)])
+        for invalid in ["data: -1\n\n", "data: 9007199254740992\n\n", "event: reply\ndata: invalid\n\n", "event: asset-ready\ndata: invalid\n\n"] {
             #expect(throws: RelayError.invalidResponse) {
                 var parser = RelayStreamParser()
                 for byte in invalid.utf8 { _ = try parser.append(byte) }

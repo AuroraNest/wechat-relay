@@ -53,7 +53,7 @@ struct InboxView: View {
             }
         }
         .navigationTitle("消息")
-        .toolbar { ToolbarItem(placement: .topBarTrailing) { Text(model.sourceLabel).font(.subheadline).foregroundStyle(.secondary) } }
+        .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $search, prompt: "搜索会话")
         .refreshable { await model.refresh() }
         .navigationDestination(for: String.self) { id in ConversationView(conversationID: id) }
@@ -195,6 +195,7 @@ struct FriendAvatarView: View {
 
 struct ConversationView: View {
     @EnvironmentObject private var model: RelayAppModel
+    @Environment(\.dismiss) private var dismiss
     let conversationID: String
     @State private var draft = ""
     @State private var sending = false
@@ -202,9 +203,13 @@ struct ConversationView: View {
     @FocusState private var inputFocused: Bool
     private var resolvedID: String { model.resolvedConversationID(conversationID) }
     private var messages: [InboxItem] { model.items.filter { $0.conversationID == resolvedID } }
-    private var target: InboxItem? { messages.last(where: { $0.message.replyCapable }) }
+    private var target: InboxItem? { messages.last(where: { model.canSend(to: $0) }) }
     private var friend: RelayFriend? { model.friends.first { $0.id == resolvedID } }
     private var canSend: Bool { target != nil || friend.map { model.canSend(to: $0) } == true }
+    private var sendUnavailableReason: String? {
+        if let friend { return model.sendUnavailableReason(to: friend) }
+        return messages.last.flatMap { model.sendUnavailableReason(to: $0) }
+    }
     private var replies: [OutgoingMessage] { model.outgoing.filter { $0.conversationID == resolvedID } }
 
     var body: some View {
@@ -220,14 +225,18 @@ struct ConversationView: View {
                                 else { AvatarView(item: item).scaleEffect(0.75).frame(width: 40, height: 40) }
                                 VStack(alignment: .leading, spacing: 7) {
                                     Text(Date(timeIntervalSince1970: Double(item.message.createdAt) / 1_000), format: .dateTime.month().day().hour().minute()).font(.caption2).foregroundStyle(.secondary)
+                                    if item.nativeContent?.isOutgoing != true {
+                                        let sender = item.nativeContent?.senderName ?? item.preview.sender
+                                        if !sender.isEmpty && !sender.hasPrefix("wxid_") { Text(verbatim: sender).font(.caption).foregroundStyle(.secondary) }
+                                    }
                                     VStack(alignment: .leading, spacing: 10) {
                                         if item.message.hasNativeContent { NativeContentView(item: item) }
-                                        else { Text(item.preview.body).textSelection(.enabled).font(.body).lineSpacing(4) }
+                                        else { Text(verbatim: item.preview.body).textSelection(.enabled).font(.body).lineSpacing(4).fixedSize(horizontal: false, vertical: true) }
                                         ForEach(item.message.assets.filter { $0.kind != .avatar }) { asset in
                                             MessageImageView(metadata: asset, item: item)
                                         }
-                                    }.padding(14).background(item.nativeContent?.isOutgoing == true ? Color.relayGreen.opacity(0.13) : Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
-                                }
+                                    }.padding(12).background(item.nativeContent?.isOutgoing == true ? Color.relayGreen.opacity(0.13) : Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
+                                }.frame(maxWidth: .infinity, alignment: item.nativeContent?.isOutgoing == true ? .trailing : .leading)
                                 if item.nativeContent?.isOutgoing != true { Spacer(minLength: 30) }
                             }.id(entry.id)
                         } else if let reply = entry.outgoing {
@@ -247,8 +256,9 @@ struct ConversationView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .scrollDismissesKeyboard(.interactively)
-            .onAppear { proxy.scrollTo("bottom", anchor: .bottom); model.markRead(conversationID) }
-            .onChange(of: timeline.count) { _, _ in
+            .defaultScrollAnchor(.bottom)
+            .onAppear { model.markRead(conversationID) }
+            .onChange(of: timeline.last?.id) { _, _ in
                 withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
                 model.markRead(conversationID)
             }
@@ -256,15 +266,19 @@ struct ConversationView: View {
         }
         .navigationTitle(messages.last?.conversationName ?? friend?.name ?? model.conversations.first(where: { $0.id == resolvedID })?.friend.name ?? "会话").navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
+        .task(id: conversationID) {
+            await model.refreshContacts()
+            await model.refresh()
+        }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 8) {
                 if let error { Text(error).font(.caption).foregroundStyle(.red) }
                 if let problem = model.problem { Text(problem).font(.caption).foregroundStyle(.orange).lineLimit(3) }
                 HStack(alignment: .bottom, spacing: 10) {
-                    TextField(canSend ? "输入回复" : "暂时无法发送", text: $draft, axis: .vertical)
+                    TextField("输入回复", text: $draft, axis: .vertical)
                         .lineLimit(1...5).focused($inputFocused).padding(.horizontal, 15).padding(.vertical, 11)
                         .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 22))
-                        .disabled(!canSend)
+                        .accessibilityIdentifier("message-composer")
                     Button {
                         guard canSend else { return }
                         sending = true; error = nil
@@ -281,14 +295,18 @@ struct ConversationView: View {
                         .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.count > 1_000 || sending)
                         .opacity(!canSend || draft.isEmpty ? 0.4 : 1).accessibilityLabel("发送回复")
                 }
-                if messages.contains(where: { $0.message.hasNativeContent }) {
-                    Text("原始消息目前仅支持查看.").font(.caption).foregroundStyle(.secondary)
+                if !canSend, let sendUnavailableReason {
+                    Text(sendUnavailableReason).font(.caption).foregroundStyle(.secondary)
                 }
-                if !canSend && friend != nil {
-                    Text("此来源尚未提供主动发送能力. 请更新来源端并重新同步好友.").font(.caption).foregroundStyle(.secondary)
+                if !canSend {
+                    if friend == nil && messages.isEmpty {
+                        Text("好友信息已更新, 请重新选择好友.").font(.caption).foregroundStyle(.secondary)
+                        Button("选择好友") { dismiss(); model.conversationPath = []; model.selectedTab = 1 }
+                    } else {
+                        Button("刷新发送状态") { Task { await model.refreshContacts(); await model.refresh() } }
+                    }
                 }
                 if draft.count > 1_000 { Text("回复最多 1000 字").font(.caption).foregroundStyle(.red) }
-                Text("已发往微信表示来源端已执行发送, 不代表对方已读.").font(.caption2).foregroundStyle(.secondary)
             }.padding(.horizontal, 16).padding(.vertical, 10).background(.bar)
         }
     }

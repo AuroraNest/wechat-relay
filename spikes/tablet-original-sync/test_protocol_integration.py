@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import collector as c
+import reply_executor as replies
 
 
 ORIGIN = os.environ.get('AWR_INTEGRATION_ORIGIN', '').rstrip('/')
@@ -64,6 +65,200 @@ class ProtocolIntegrationTests(unittest.TestCase):
     def decrypt(self, config, envelope):
         return AESGCM(c.decoded(config['kA2I'])).decrypt(
             c.decoded(envelope['iv']), c.decoded(envelope['ct']), envelope['aad'].encode())
+
+    def test_contacts_without_new_messages_use_existing_encrypted_snapshot_api(self):
+        session, config = self.paired_device()
+        foreign_session, foreign = self.paired_device()
+        batch = {'accountFingerprint': 'a' * 64, 'messages': [], 'contactSnapshot': {
+            'state': 'ready', 'contacts': [
+                {'name': 'Private fixture B', 'conversationId': 'fixture_b', 'alias': 'alias_b'},
+                {'name': 'Private fixture A', 'conversationId': 'fixture_a', 'alias': 'alias_a'}]}}
+        with tempfile.TemporaryDirectory(prefix='awr-contacts-integration-') as directory:
+            db = c.open_store(Path(directory))
+            self.addCleanup(db.close)
+            c.ingest(db, config, batch)
+            queued = json.loads(c.setting(db, 'contacts_state'))['pending']
+            body = c.json_bytes(queued)
+            self.assertNotIn(b'Private fixture', body)
+            self.assertEqual(db.execute('SELECT count(*) FROM messages').fetchone()[0], 0)
+            c.upload_contacts(db, config)
+            self.assertNotIn('pending', json.loads(c.setting(db, 'contacts_state')))
+            snapshots = self.api('GET', '/api/v1/ios/contacts', session, config['pairId'])['snapshots']
+            self.assertEqual(len(snapshots), 1)
+            self.assertEqual(snapshots[0]['v'], 3)
+            self.assertEqual(snapshots[0]['id'], queued['id'])
+            self.assertEqual(json.loads(self.decrypt(config, snapshots[0]['contactsEnvelope'])), {
+                'v': 3, 'accountFingerprint': 'a' * 64, 'contacts': [
+                    {'name': 'Private fixture A', 'conversationId': 'fixture_a', 'alias': 'alias_a'},
+                    {'name': 'Private fixture B', 'conversationId': 'fixture_b', 'alias': 'alias_b'}]})
+            self.assertTrue(c.request(config, '/api/v1/android/contacts', body)['idempotent'])
+            c.ingest(db, config, batch)
+            self.assertNotIn('pending', json.loads(c.setting(db, 'contacts_state')))
+            self.assertEqual(self.api('GET', '/api/v1/ios/contacts', foreign_session, foreign['pairId'])['snapshots'], [])
+            batch['contactSnapshot']['contacts'] = []
+            c.ingest(db, config, batch)
+            c.upload_contacts(db, config)
+            snapshots = self.api('GET', '/api/v1/ios/contacts', session, config['pairId'])['snapshots']
+            self.assertEqual(len(snapshots), 1)
+            self.assertEqual(json.loads(self.decrypt(config, snapshots[0]['contactsEnvelope']))['contacts'], [])
+
+    def test_contact_bootstrap_and_send_cross_language_without_history(self):
+        session, config = self.paired_device()
+        reply_key = bytes(range(32))
+        # Source and UI are synthetic; only the encrypted Node transport is live.
+        source = {'accountFingerprint': 'c' * 64, 'sourceMaxId': 0, 'messages': [],
+                  'contactSnapshot': {'state': 'ready', 'contacts': [
+                      {'name': 'Same name', 'conversationId': 'fixture_a', 'alias': 'alias_a'},
+                      {'name': 'Same name', 'conversationId': 'fixture_b', 'alias': 'alias_b'}]}}
+        executions = []
+        outgoing = []
+        with tempfile.TemporaryDirectory(prefix='awr-contact-replies-integration-') as directory:
+            state = Path(directory)
+            db = c.open_store(state)
+            self.addCleanup(db.close)
+            c.ingest(db, config, source)
+            snapshot_id = json.loads(c.setting(db, 'contacts_state'))['snapshotId']
+            c.upload_contacts(db, config)
+            def enqueue(version, plaintext):
+                command = {'v': version, 'id': c.uuid7(), 'pairId': config['pairId'], 'deviceId': config['deviceId'],
+                           'targetContactSnapshotId': snapshot_id, 'createdAt': c.now_ms(), 'wechatUserId': 0}
+                key = replies.bootstrap_key(config, c.decoded) if version == 8 else reply_key
+                command['replyEnvelope'] = c.seal(c.json_bytes(plaintext), key,
+                    'phase2-reply-bootstrap' if version == 8 else 'phase1-reply', replies.command_aad(command, config))
+                result = self.api('POST', '/api/v1/replies', session, config['pairId'],
+                                  {key: value for key, value in command.items() if key != 'pairId'}, expected=201)
+                self.assertEqual(result['replyId'], command['id'])
+                return command
+            def read(command, after, ids=None, include_media=True, defer_media=False):
+                self.assertFalse(include_media)
+                if defer_media:
+                    return source
+                return {**source, 'sourceMaxId': 1 if outgoing else 0,
+                        'messages': outgoing if ids == [1] or after < 1 else []}
+            def execute(executor, command):
+                executions.append(command)
+                clicked_at = c.now_ms()
+                outgoing.append({'msgId': 1, 'msgSvrId': '101', 'isSend': 1, 'createTime': clicked_at,
+                                 'talker': command['conversationId'], 'content': command['body']})
+                return {'status': 'UI_ACCEPTED', 'clicked': True, 'sourceMaxId': 0, 'clickedAt': clicked_at}
+            def consume():
+                replies.poll(db, config, state / 'device.json', ['synthetic-reader'], Path('/synthetic-ui'),
+                             c.request, read, c.save_config, c.decoded, c.encoded, c.json_bytes,
+                             execute=execute, sleep=lambda seconds: None)
+            bootstrap = enqueue(8, {'v': 1, 'pairId': config['pairId'], 'deviceId': config['deviceId'],
+                                    'replyKey': c.encoded(reply_key)})
+            consume()
+            self.assertEqual(c.decoded(config['kI2A']), reply_key)
+            self.assertFalse(executions)
+            self.assertEqual(self.api('GET', '/api/v1/replies/' + bootstrap['id'], session, config['pairId'])['status'], 'REPLY_KEY_INSTALLED')
+            send = enqueue(7, {'body': 'Synthetic contact send 👋', 'conversationId': 'fixture_a',
+                               'accountFingerprint': source['accountFingerprint']})
+            consume()
+            self.assertEqual(self.api('GET', '/api/v1/replies/' + send['id'], session, config['pairId'])['status'], 'SENT_TO_WECHAT')
+            self.assertEqual(len(executions), 1)
+            self.assertEqual(executions[0]['sourceContactSnapshotId'], snapshot_id)
+            self.assertNotIn('sourceMessageId', executions[0])
+            self.assertEqual(db.execute('SELECT count(*) FROM messages').fetchone()[0], 0)
+
+    def test_unknown_record_slots_arrive_before_independent_originals(self):
+        from xml.sax.saxutils import escape
+        session, config = self.paired_device()
+        foreign_session, foreign = self.paired_device()
+        record = '<recordinfo><dataitem datatype="1"><datadesc>text before media</datadesc></dataitem><dataitem datatype="2" dataid="photo"/><dataitem datatype="37" dataid="emoji"/></recordinfo>'
+        media = [{'kind': kind, 'mimeType': 'application/octet-stream', 'byteLength': 0,
+                  'state': 'pending', 'recordItemIndex': index}
+                 for index, kind in enumerate(('image', 'sticker'), 1)]
+        batch = {'accountFingerprint': 'a' * 64, 'messages': [{
+            'msgId': 1, 'msgSvrId': '123456789012345689', 'type': 49, 'createTime': c.now_ms(),
+            'isSend': 0, 'talker': 'private-fixture-room@chatroom',
+            'content': '<msg><appmsg><type>19</type><recorditem>' + escape(record) + '</recorditem></appmsg></msg>',
+            'media': media}]}
+        with tempfile.TemporaryDirectory(prefix='awr-v8-integration-') as directory:
+            db = c.open_store(Path(directory))
+            self.addCleanup(db.close)
+            c.ingest(db, config, batch)
+            original = db.execute('SELECT body FROM messages').fetchone()[0]
+            message = json.loads(original)
+            c.upload(db, config)
+            content_path = f"/api/v1/ios/messages/{message['id']}/content"
+            content = self.api('GET', content_path, session, config['pairId'])
+            self.assertEqual(json.loads(self.decrypt(config, content['contentEnvelope']))['records'][0]['text'], 'text before media')
+            self.assertEqual(content['nativeAssetSlots'], message['nativeAssetSlots'])
+            self.assertEqual(content['nativeAssets'], [])
+            first, second = message['nativeAssetSlots']
+            for slot in (first, second):
+                self.api('GET', '/api/v1/ios/assets/' + slot['id'], session, config['pairId'], expected=409)
+            data = b'GIF89a-integration-exact-record-original'
+            media[1].update(state='ready', mimeType='image/gif', byteLength=len(data),
+                            dataBase64=base64.b64encode(data).decode(), sha256=hashlib.sha256(data).hexdigest())
+            c.ingest(db, config, batch)
+            c.upload(db, config)
+            after = self.api('GET', content_path, session, config['pairId'])
+            self.assertEqual(after['contentEnvelope'], content['contentEnvelope'])
+            self.assertEqual(after['nativeAssetSlots'], content['nativeAssetSlots'])
+            self.assertEqual([asset['id'] for asset in after['nativeAssets']], [second['id']])
+            self.api('GET', '/api/v1/ios/assets/' + first['id'], session, config['pairId'], expected=409)
+            resolved = self.api('GET', '/api/v1/ios/assets/' + second['id'], session, config['pairId'])
+            self.assertEqual(self.decrypt(config, resolved['envelope']), data)
+            self.assertIn('|8|' + config['pairId'] + '|', resolved['envelope']['aad'])
+            self.api('GET', content_path, foreign_session, foreign['pairId'], expected=404)
+            self.api('GET', '/api/v1/ios/assets/' + second['id'], foreign_session, foreign['pairId'], expected=404)
+            body = db.execute('SELECT body FROM assets WHERE id=?', (second['id'],)).fetchone()[0]
+            upload_path = f"/api/v1/android/messages/{message['id']}/assets/{second['id']}"
+            self.assertTrue(c.request(config, upload_path, body)['idempotent'])
+            changed = json.loads(body)
+            changed['metadata']['mimeType'] = 'image/png'
+            changed['envelope'] = c.seal(data, c.decoded(config['kA2I']), 'phase2-asset',
+                                         c.asset_aad(message, changed['metadata'], config['pairId']))
+            with self.assertRaisesRegex(c.CollectorError, '^http_409$'):
+                c.request(config, upload_path, c.json_bytes(changed))
+            with self.assertRaisesRegex(c.CollectorError, '^http_404$'):
+                c.request(foreign, upload_path, body)
+            self.assertEqual(db.execute('SELECT body FROM messages').fetchone()[0], original)
+            self.assertEqual(db.execute('SELECT count(*) FROM messages').fetchone()[0], 1)
+
+    def test_hd_preview_arrives_before_original_in_the_same_message(self):
+        session, config = self.paired_device()
+        full, preview = b'\xff\xd8\xff-full-HD-fixture', b'\xff\xd8\xff-preview'
+        row = {'msgId': 1, 'msgSvrId': '123456789012345688', 'type': 3, 'createTime': c.now_ms(),
+               'isSend': 0, 'talker': 'fixture@chatroom', 'mediaDeferred': True,
+               'content': '<msg><img hdlength="' + str(len(full)) + '" md5="' + hashlib.md5(full).hexdigest() + '" /></msg>'}
+        batch = {'accountFingerprint': 'a' * 64, 'messages': [row]}
+        with tempfile.TemporaryDirectory(prefix='awr-preview-integration-') as directory:
+            db = c.open_store(Path(directory))
+            self.addCleanup(db.close)
+            c.ingest(db, config, batch)
+            c.upload(db, config)
+            message = json.loads(db.execute('SELECT body FROM messages').fetchone()[0])
+            original, derived = message['nativeAssetSlots']
+            path = '/api/v1/ios/messages/' + message['id'] + '/content'
+            before = self.api('GET', path, session, config['pairId'])
+            self.assertEqual(before['nativeAssets'], [])
+            row.pop('mediaDeferred')
+            row['media'] = [{'kind': 'image', 'state': 'pending', 'mimeType': 'application/octet-stream', 'byteLength': len(full)}]
+            row['imagePreview'] = {'kind': 'image', 'state': 'ready', 'mimeType': 'image/jpeg', 'byteLength': len(preview),
+                                   'dataBase64': base64.b64encode(preview).decode(), 'sha256': hashlib.sha256(preview).hexdigest()}
+            c.ingest(db, config, batch)
+            c.upload(db, config)
+            first = self.api('GET', path, session, config['pairId'])
+            self.assertEqual([asset['id'] for asset in first['nativeAssets']], [derived['id']])
+            self.api('GET', '/api/v1/ios/assets/' + original['id'], session, config['pairId'], expected=409)
+            asset = self.api('GET', '/api/v1/ios/assets/' + derived['id'], session, config['pairId'])
+            self.assertEqual(self.decrypt(config, asset['envelope']), preview)
+            self.assertEqual(asset['role'], 'playback')
+            row['media'][0].update(state='ready', mimeType='image/jpeg', dataBase64=base64.b64encode(full).decode(),
+                                   sha256=hashlib.sha256(full).hexdigest())
+            row.pop('imagePreview')
+            c.ingest(db, config, batch)
+            c.upload(db, config)
+            after = self.api('GET', path, session, config['pairId'])
+            self.assertEqual(len(after['nativeAssets']), 2)
+            self.assertEqual(after['contentEnvelope'], before['contentEnvelope'])
+            self.assertEqual(after['nativeAssetSlots'], before['nativeAssetSlots'])
+            original_asset = self.api('GET', '/api/v1/ios/assets/' + original['id'], session, config['pairId'])
+            self.assertEqual(self.decrypt(config, original_asset['envelope']), full)
+            listing = self.api('GET', '/api/v1/messages', session, config['pairId'])
+            self.assertEqual(len(listing['messages']), 1)
 
     def test_python_collector_to_mysql_and_authenticated_native_download(self):
         session, config = self.paired_device()

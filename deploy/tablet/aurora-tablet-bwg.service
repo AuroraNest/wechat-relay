@@ -1,0 +1,20 @@
+[Unit]
+Description=Aurora Relay HTTPS transport through BWG
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+UMask=0077
+RuntimeDirectory=aurora-tablet-bwg
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=8 -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o StreamLocalBindUnlink=yes -o StreamLocalBindMask=0177 -L %t/aurora-tablet-bwg/relay.sock:relay.auroramaple.com:443 bwg
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+NoNewPrivileges=true
+LimitCORE=0
+
+[Install]
+WantedBy=default.target

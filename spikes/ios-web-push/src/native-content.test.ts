@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
-import { validateNativeAssetUpload, validateNativeAssets, validateNativeContent, validateNativePreview, type NativeAsset } from "./native-content.js";
+import { validateNativeAssetUpload, validateNativeAssets, validateNativeAssetSlots, validateNativeAssetMetadata, validateNativeContent, validateNativePreview, type NativeAsset } from "./native-content.js";
 
 const context = { id: randomUUID(), deviceId: "native-device-0001", seq: 1, createdAt: 1788148800000, wechatUserId: 999 as const };
 const contentAAD = `AWR1|A2I_CONTENT|6|${context.id}|${context.deviceId}|${context.seq}|${context.createdAt}|999`;
@@ -24,6 +24,41 @@ test("native preview preserves existing AAD with a 600-byte plaintext ceiling", 
   const value = sealed("phase1", `AWR1|A2I|${context.id}|${context.deviceId}|1|${context.createdAt}|999`, 616);
   validateNativePreview(value, context);
   assert.throws(() => validateNativePreview({ ...value, ct: Buffer.alloc(617).toString("base64url") }, context), /INVALID_NATIVE_ENVELOPE/);
+});
+
+test("native v7 content and assets cannot be replayed as v6", () => {
+  const context7 = { ...context, nativeVersion: 7 };
+  const content = sealed("phase2-content", contentAAD.replace("|6|", "|7|"));
+  assert.deepEqual(validateNativeContent(content, context7), content);
+  assert.throws(() => validateNativeContent(content, context), /INVALID_NATIVE_ENVELOPE/);
+  assert.throws(() => validateNativeContent(content, { ...context, nativeVersion: 8, pairId: randomUUID() }), /INVALID_NATIVE_ENVELOPE/);
+  assert.throws(() => validateNativeContent(content, { ...context, v: 7, nativeVersion: 6 }), /INVALID_NATIVE_VERSION/);
+  const aad = `AWR1|A2I_ASSET|7|${context.id}|${original.id}|${context.deviceId}|1|${context.createdAt}|999|audio|audio/silk|1024|original|`;
+  const asset = { envelope: sealed("phase2-asset", aad, 1040) };
+  validateNativeAssetUpload(asset, context7, original);
+  assert.throws(() => validateNativeAssetUpload(asset, context, original), /INVALID_NATIVE_ENVELOPE/);
+});
+
+test("v8 slots preserve unknown metadata and authenticate pair, version and resolution", () => {
+  const slot = { id: original.id, kind: original.kind, role: original.role };
+  const derived = { id: playback.id, kind: playback.kind, role: playback.role, derivedFrom: original.id };
+  assert.deepEqual(validateNativeAssetSlots([slot, derived]), [slot, derived]);
+  for (const value of [[original], [slot, slot], [derived], [{ ...slot, mimeType: "audio/silk" }], [{ ...slot, byteLength: 0 }]])
+    assert.throws(() => validateNativeAssetSlots(value), /INVALID_NATIVE_ASSETS/);
+  assert.deepEqual(validateNativeAssetMetadata(playback, derived), playback);
+  assert.throws(() => validateNativeAssetMetadata({ ...original, kind: "file" }, slot), /NATIVE_ASSET_CONFLICT/);
+  assert.throws(() => validateNativeAssetMetadata({ ...original, byteLength: 0 }, slot), /INVALID_NATIVE_ASSETS/);
+  const context8 = { ...context, nativeVersion: 8, pairId: randomUUID() };
+  const content = sealed("phase2-content", contentAAD.replace("|6|", `|8|${context8.pairId}|`));
+  validateNativeContent(content, context8);
+  for (const wrong of [{ ...context8, pairId: randomUUID() }, { ...context8, nativeVersion: 7 }, { ...context, nativeVersion: 8 }])
+    assert.throws(() => validateNativeContent(content, wrong), /INVALID_NATIVE_ENVELOPE/);
+  const aad = `AWR1|A2I_ASSET|8|${context8.pairId}|${context.id}|${playback.id}|${context.deviceId}|1|${context.createdAt}|999|audio|audio/wav|2048|playback|${original.id}`;
+  const upload = { metadata: playback, envelope: sealed("phase2-asset", aad, playback.byteLength + 16) };
+  validateNativeAssetUpload(upload, context8, playback);
+  assert.throws(() => validateNativeAssetUpload(upload, { ...context8, pairId: randomUUID() }, playback), /INVALID_NATIVE_ENVELOPE/);
+  assert.throws(() => validateNativeAssetUpload({ envelope: upload.envelope }, context8, playback), /INVALID_NATIVE_ENVELOPE/);
+  assert.throws(() => validateNativeAssetUpload(upload, { ...context8, nativeVersion: 7 }, playback), /INVALID_NATIVE_ENVELOPE/);
 });
 
 test("native declarations require measurable bounded originals and separate playback provenance", () => {

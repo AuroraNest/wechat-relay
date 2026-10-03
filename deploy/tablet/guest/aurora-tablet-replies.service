@@ -1,0 +1,23 @@
+[Unit]
+Description=Aurora tablet guest encrypted reply consumer
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/home/probe/.local/share/aurora-tablet-relay/device.json
+
+[Service]
+Type=simple
+User=probe
+WorkingDirectory=/home/probe/tablet-original-sync
+UMask=0077
+ExecStart=/usr/bin/python3 /home/probe/tablet-original-sync/collector.py --state-dir /home/probe/.local/share/aurora-tablet-relay replies --reply-executor /home/probe/tablet-original-sync/execute-reply.sh --reader-command /usr/bin/python3 /home/probe/tablet-original-sync/source_reader.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+MemoryMax=512M
+CPUQuota=100%
+# The source reader needs the existing sudo unshare/docker permissions.
+NoNewPrivileges=false
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

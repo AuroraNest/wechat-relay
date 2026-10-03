@@ -24,7 +24,13 @@ final class RelayAppModel: ObservableObject {
         let demo = false
         #endif
         selectedSource = demo ? .tablet : .restored(UserDefaults.standard.string(forKey: "relay-source"))
+        #if DEBUG
+        if TabletInputRegression.enabled { selectedSource = .tablet }
+        #endif
         connections = Dictionary(uniqueKeysWithValues: RelaySource.allCases.map { ($0, RelayConnectionModel(source: $0, demo: demo)) })
+        #if DEBUG
+        if TabletInputRegression.enabled { conversationPath = [TabletInputRegression.conversationID] }
+        #endif
         for connection in connections.values {
             connection.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &observations)
         }
@@ -139,6 +145,9 @@ final class RelayAppModel: ObservableObject {
         schedulePushUpdate()
     }
     func canSend(to friend: RelayFriend) -> Bool { connections[friend.source]?.canSend(to: friend) == true }
+    func canSend(to item: InboxItem) -> Bool { connections[item.source]?.canSend(to: item) == true }
+    func sendUnavailableReason(to friend: RelayFriend) -> String? { connections[friend.source]?.sendUnavailableReason(to: friend) }
+    func sendUnavailableReason(to item: InboxItem) -> String? { connections[item.source]?.sendUnavailableReason(to: item) }
     func avatarItem(for friend: RelayFriend) -> InboxItem? { connections[friend.source]?.avatarItem(for: friend) }
     func markRead(_ conversationID: String) { let id = resolvedConversationID(conversationID); connection(for: id)?.markRead(id) }
     func send(_ body: String, to item: InboxItem) async throws {
@@ -155,12 +164,12 @@ final class RelayAppModel: ObservableObject {
         return try await connection.image(for: metadata, in: item.message)
     }
     func resolvedConversationID(_ id: String) -> String { items.first(where: { $0.pendingConversationID == id })?.conversationID ?? id }
-    func loadNativeContent(for item: InboxItem) async throws -> RelayNativeContent {
+    func loadNativeContent(for item: InboxItem, refreshManifest: Bool = false) async throws -> RelayNativeContent {
         guard let connection = connections[item.source], connection.session?.pairId == item.pairID else { throw RelayError.invalidValue("content source") }
-        return try await connection.loadNativeContent(for: item)
+        return try await connection.loadNativeContent(for: item, refreshManifest: refreshManifest)
     }
     func nativeContentProblem(for item: InboxItem) -> String? { connections[item.source]?.nativeContentProblems[item.id] }
-    func nativeLastSync(for item: InboxItem) -> Date? { connections[item.source]?.lastSync }
+    func nativeAssetRevision(_ id: UUID, for item: InboxItem) -> Int { connections[item.source]?.nativeAssetRevisions[id] ?? 0 }
     func nativeAssetURL(_ metadata: RelayNativeAssetMetadata, in item: InboxItem) async throws -> URL {
         guard let connection = connections[item.source], connection.session?.pairId == item.pairID else { throw RelayError.invalidValue("asset source") }
         return try await connection.nativeAssetURL(metadata, in: item)

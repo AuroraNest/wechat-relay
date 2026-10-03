@@ -140,21 +140,66 @@ final class AuroraRelayUITests: XCTestCase {
         app.staticTexts["原始内容演示"].firstMatch.tap()
         let full = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "完整正文结束")).firstMatch
         XCTAssertTrue(full.waitForExistence(timeout: 3))
-        XCTAssertTrue(app.staticTexts["原始消息目前仅支持查看."].exists)
-        let download = app.buttons["下载附件"].firstMatch
-        for _ in 0..<5 where !download.isHittable { app.swipeUp() }
-        XCTAssertTrue(download.waitForExistence(timeout: 3))
-        download.tap()
-        XCTAssertTrue(app.buttons["保存或分享原件"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.buttons["预览文件"].exists)
-        let raw = app.buttons["查看原始 XML"].firstMatch
-        for _ in 0..<5 where !raw.isHittable { app.swipeDown() }
-        raw.tap()
+        XCTAssertFalse(app.staticTexts["完整文本"].exists)
+        XCTAssertFalse(app.buttons["查看原始 XML"].exists)
+        XCTAssertFalse(app.staticTexts["原始消息目前仅支持查看."].exists)
+        let record = app.buttons["native-record-summary"]
+        for _ in 0..<5 where !record.isHittable { app.swipeUp() }
+        XCTAssertTrue(record.waitForExistence(timeout: 3))
+        XCTAssertFalse(app.staticTexts["嵌套记录完整文本"].exists)
+        record.tap()
+        XCTAssertTrue(app.staticTexts["嵌套记录完整文本"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["嵌套记录发送者"].exists)
+        attachScreenshot("聊天记录独立气泡")
+        app.buttons["完成"].tap()
+        record.press(forDuration: 1)
+        XCTAssertTrue(app.buttons["详细信息"].waitForExistence(timeout: 3))
+        app.buttons["详细信息"].tap()
+        XCTAssertTrue(app.staticTexts["<msg><script>仅作为原始文本显示</script></msg>"].waitForExistence(timeout: 3))
+        app.buttons["完成"].tap()
+        let file = app.buttons["native-file-card"].firstMatch
+        XCTAssertTrue(file.waitForExistence(timeout: 3))
+        XCTAssertEqual(app.staticTexts.matching(identifier: "original-demo.txt").count, 1)
+        attachScreenshot("附件单一卡片")
+        file.tap()
+        XCTAssertTrue(app.buttons["保存或分享"].waitForExistence(timeout: 5))
+        app.buttons["完成"].tap()
+        XCTAssertTrue(app.buttons["保存或分享"].waitForNonExistence(timeout: 3))
+        file.press(forDuration: 1)
+        attachScreenshot("附件长按菜单")
+        XCTAssertTrue(app.buttons["详细信息"].waitForExistence(timeout: 3))
+        app.buttons["详细信息"].tap()
         XCTAssertTrue(app.staticTexts["<msg><script>仅作为原始文本显示</script></msg>"].waitForExistence(timeout: 3))
         app.buttons["完成"].tap()
         selectSource("混合")
         XCTAssertEqual(app.staticTexts.matching(identifier: "原始内容演示").count, 2)
         attachScreenshot("完整原始内容与来源隔离")
+    }
+
+    func testNativeOriginalImageTapOpensFullScreen() {
+        checkNativeImageFullScreen(previewOnly: false)
+    }
+
+    func testNativePreviewImageTapOpensFullScreen() {
+        checkNativeImageFullScreen(previewOnly: true)
+    }
+
+    private func checkNativeImageFullScreen(previewOnly: Bool) {
+        app.terminate()
+        app.launchArguments = ["--demo", "--demo-native-image"] + (previewOnly ? ["--preview-only"] : [])
+        app.launch()
+        let conversation = app.staticTexts["图片查看演示"].firstMatch
+        XCTAssertTrue(conversation.waitForExistence(timeout: 5))
+        conversation.tap()
+        let image = app.buttons[previewOnly ? "查看预览图片" : "查看图片"]
+        XCTAssertTrue(image.waitForExistence(timeout: 5))
+        image.tap()
+        XCTAssertTrue(app.navigationBars[previewOnly ? "普通清晰度预览" : "图片"].waitForExistence(timeout: 5))
+        let done = app.buttons["完成"].firstMatch
+        XCTAssertTrue(done.exists)
+        attachScreenshot(previewOnly ? "预览图片全屏" : "原图全屏")
+        done.tap()
+        XCTAssertTrue(image.waitForExistence(timeout: 3))
     }
 
     private func selectSource(_ label: String) {

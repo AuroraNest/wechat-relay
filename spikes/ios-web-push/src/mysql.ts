@@ -24,7 +24,7 @@ export const pool: Pool = mysql.createPool({
   bigNumberStrings: true,
 });
 
-const requiredSchemaVersion = 8;
+const requiredSchemaVersion = 9;
 const requiredColumns: Record<string, readonly string[]> = {
   schema_migrations: ["version", "name", "applied_at"],
   pairings: ["pair_id", "secret_hash", "expires_at", "consumed_at"],
@@ -37,6 +37,7 @@ const requiredColumns: Record<string, readonly string[]> = {
   relay_policies: ["pair_id", "enabled", "schedule_enabled", "weekdays_mask", "start_minutes", "end_minutes", "updated_at"],
   contacts_snapshots: ["id", "device_id", "wechat_user_id", "captured_at", "body_hash", "envelope_json", "received_at"],
   native_contents: ["message_id", "envelope_json", "assets_json"],
+  native_asset_slots: ["id", "message_id", "ordinal", "kind", "role", "derived_from", "expires_at"],
   native_assets: ["id", "message_id", "byte_length", "metadata_json", "expires_at"],
   native_asset_payloads: ["asset_id", "envelope_json", "envelope_hash"],
 };

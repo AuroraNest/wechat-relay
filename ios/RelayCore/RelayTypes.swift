@@ -75,26 +75,41 @@ public struct RelayPreview: Codable, Sendable, Equatable {
 
 public struct RelayContact: Codable, Sendable, Equatable, Identifiable {
     public let name: String
+    public let conversationId: String?
+    public let alias: String?
 
-    public var id: String { name }
+    public var id: String { conversationId ?? name }
 
-    public init(name: String) throws {
-        guard RelayValidation.isContactName(name) else { throw RelayError.invalidValue("contact name") }
+    public init(name: String, conversationId: String? = nil, alias: String? = nil) throws {
+        guard RelayValidation.isContactName(name),
+              conversationId.map(RelayValidation.isTabletConversationID) ?? true,
+              alias.map(RelayValidation.isTabletAlias) ?? true else { throw RelayError.invalidValue("contact name") }
         self.name = name
+        self.conversationId = conversationId
+        self.alias = alias
     }
 }
 
 public struct RelayContactsPayload: Codable, Sendable, Equatable {
     public let v: Int
     public let contacts: [RelayContact]
+    public let accountFingerprint: String?
 
-    public init(v: Int, contacts: [RelayContact]) throws {
-        guard v == 1, contacts.count <= 10_000,
-              Set(contacts.map(\.name)).count == contacts.count else {
+    public init(v: Int, contacts: [RelayContact], accountFingerprint: String? = nil) throws {
+        guard Self.isValid(v: v, contacts: contacts, accountFingerprint: accountFingerprint) else {
             throw RelayError.invalidValue("contacts payload")
         }
         self.v = v
         self.contacts = contacts
+        self.accountFingerprint = accountFingerprint
+    }
+
+    static func isValid(v: Int, contacts: [RelayContact], accountFingerprint: String?) -> Bool {
+        guard contacts.count <= 10_000, contacts.allSatisfy({ RelayValidation.isContactName($0.name) }) else { return false }
+        if v == 1 { return accountFingerprint == nil && contacts.allSatisfy { $0.conversationId == nil && $0.alias == nil } && Set(contacts.map(\.name)).count == contacts.count }
+        return v == 3 && accountFingerprint.map(RelayValidation.isAccountFingerprint) == true &&
+            contacts.allSatisfy { $0.conversationId.map(RelayValidation.isTabletConversationID) == true && $0.alias.map(RelayValidation.isTabletAlias) == true } &&
+            Set(contacts.map(\.conversationId)).count == contacts.count
     }
 }
 
@@ -107,7 +122,7 @@ public struct RelayContactSnapshot: Codable, Sendable, Equatable, Identifiable {
     public let contactsEnvelope: RelayEncryptedEnvelope
 
     public init(v: Int, id: UUID, deviceId: String, wechatUserId: Int, capturedAt: Int64, contactsEnvelope: RelayEncryptedEnvelope) throws {
-        guard (v == 1 || v == 2), RelayValidation.isUUIDv7(id), RelayValidation.isDeviceId(deviceId), RelayValidation.isWechatUserId(wechatUserId), capturedAt > 0 else {
+        guard (1...3).contains(v), (v != 3 || wechatUserId == 0), RelayValidation.isUUIDv7(id), RelayValidation.isDeviceId(deviceId), RelayValidation.isWechatUserId(wechatUserId), capturedAt > 0 else {
             throw RelayError.invalidValue("contact snapshot")
         }
         self.v = v
@@ -161,22 +176,28 @@ public struct RelayMessage: Codable, Identifiable, Sendable, Equatable {
     public let assets: [RelayAssetMetadata]
     public let receivedAt: Int64
     public let hasNativeContent: Bool
+    public let nativeVersion: Int
     public let nativeAssets: [RelayNativeAssetMetadata]
+    public let nativeAssetSlots: [RelayNativeAssetSlot]
 
     public var id: UUID { messageId }
 
-    public init(messageId: UUID, deviceId: String, seq: Int, createdAt: Int64, wechatUserId: Int, replyCapable: Bool, conversationSendCapable: Bool, previewEnvelope: RelayEncryptedEnvelope, assets: [RelayAssetMetadata], receivedAt: Int64, hasNativeContent: Bool = false, nativeAssets: [RelayNativeAssetMetadata] = []) throws {
+    public init(messageId: UUID, deviceId: String, seq: Int, createdAt: Int64, wechatUserId: Int, replyCapable: Bool, conversationSendCapable: Bool, previewEnvelope: RelayEncryptedEnvelope, assets: [RelayAssetMetadata], receivedAt: Int64, hasNativeContent: Bool = false, nativeAssets: [RelayNativeAssetMetadata] = [], nativeVersion: Int = 6, nativeAssetSlots: [RelayNativeAssetSlot] = []) throws {
         guard RelayValidation.isDeviceId(deviceId), seq > 0, createdAt > 0, receivedAt > 0,
               RelayValidation.isWechatUserId(wechatUserId), !(conversationSendCapable && !replyCapable), assets.count <= 2,
               Set(assets.map(\.id)).count == assets.count else {
             throw RelayError.invalidValue("message")
         }
-        try RelayNativeAssetMetadata.validate(nativeAssets)
-        guard hasNativeContent ? (!replyCapable && !conversationSendCapable && assets.isEmpty) : nativeAssets.isEmpty else {
+        if nativeVersion == 8 { try RelayNativeAssetSlot.validate(nativeAssetSlots, assets: nativeAssets) }
+        else { try RelayNativeAssetMetadata.validate(nativeAssets) }
+        guard (6...8).contains(nativeVersion), nativeVersion == 8 || nativeAssetSlots.isEmpty,
+              hasNativeContent ? ((nativeVersion >= 7 || !replyCapable) && !conversationSendCapable && assets.isEmpty) : nativeAssets.isEmpty && nativeAssetSlots.isEmpty else {
             throw RelayError.invalidValue("native message")
         }
         self.hasNativeContent = hasNativeContent
+        self.nativeVersion = nativeVersion
         self.nativeAssets = nativeAssets
+        self.nativeAssetSlots = nativeAssetSlots
         self.messageId = messageId
         self.deviceId = deviceId
         self.seq = seq
@@ -188,11 +209,27 @@ public struct RelayMessage: Codable, Identifiable, Sendable, Equatable {
         self.assets = assets
         self.receivedAt = receivedAt
     }
-    private enum CodingKeys: String, CodingKey { case messageId, deviceId, seq, createdAt, wechatUserId, replyCapable, conversationSendCapable, previewEnvelope, assets, receivedAt, hasNativeContent, nativeAssets }
+    private enum CodingKeys: String, CodingKey { case messageId, deviceId, seq, createdAt, wechatUserId, replyCapable, conversationSendCapable, previewEnvelope, assets, receivedAt, hasNativeContent, nativeAssets, nativeVersion, nativeAssetSlots }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(messageId: values.decode(UUID.self, forKey: .messageId), deviceId: values.decode(String.self, forKey: .deviceId), seq: values.decode(Int.self, forKey: .seq), createdAt: values.decode(Int64.self, forKey: .createdAt), wechatUserId: values.decode(Int.self, forKey: .wechatUserId), replyCapable: values.decode(Bool.self, forKey: .replyCapable), conversationSendCapable: values.decode(Bool.self, forKey: .conversationSendCapable), previewEnvelope: values.decode(RelayEncryptedEnvelope.self, forKey: .previewEnvelope), assets: values.decode([RelayAssetMetadata].self, forKey: .assets), receivedAt: values.decode(Int64.self, forKey: .receivedAt), hasNativeContent: values.decodeIfPresent(Bool.self, forKey: .hasNativeContent) ?? false, nativeAssets: values.decodeIfPresent([RelayNativeAssetMetadata].self, forKey: .nativeAssets) ?? [])
+        if try values.decodeIfPresent(Int.self, forKey: .nativeVersion) == 8,
+           try values.decodeIfPresent([RelayNativeAssetSlot].self, forKey: .nativeAssetSlots) == nil { throw RelayError.invalidResponse }
+        try self.init(messageId: values.decode(UUID.self, forKey: .messageId), deviceId: values.decode(String.self, forKey: .deviceId), seq: values.decode(Int.self, forKey: .seq), createdAt: values.decode(Int64.self, forKey: .createdAt), wechatUserId: values.decode(Int.self, forKey: .wechatUserId), replyCapable: values.decode(Bool.self, forKey: .replyCapable), conversationSendCapable: values.decode(Bool.self, forKey: .conversationSendCapable), previewEnvelope: values.decode(RelayEncryptedEnvelope.self, forKey: .previewEnvelope), assets: values.decode([RelayAssetMetadata].self, forKey: .assets), receivedAt: values.decode(Int64.self, forKey: .receivedAt), hasNativeContent: values.decodeIfPresent(Bool.self, forKey: .hasNativeContent) ?? false, nativeAssets: values.decodeIfPresent([RelayNativeAssetMetadata].self, forKey: .nativeAssets) ?? [], nativeVersion: values.decodeIfPresent(Int.self, forKey: .nativeVersion) ?? 6, nativeAssetSlots: values.decodeIfPresent([RelayNativeAssetSlot].self, forKey: .nativeAssetSlots) ?? [])
+    }
+
+    public var hasUnresolvedNativeSlots: Bool { nativeVersion == 8 && nativeAssetSlots.contains { slot in !nativeAssets.contains { $0.id == slot.id } } }
+
+    public func mergingNativeManifest(slots: [RelayNativeAssetSlot], assets resolved: [RelayNativeAssetMetadata]) throws -> Self {
+        guard nativeVersion == 8, slots == nativeAssetSlots else { throw RelayError.invalidResponse }
+        try RelayNativeAssetSlot.validate(slots, assets: resolved)
+        var merged = nativeAssets
+        for asset in resolved {
+            if let existing = merged.first(where: { $0.id == asset.id }) {
+                guard existing == asset else { throw RelayError.invalidResponse }
+            } else { merged.append(asset) }
+        }
+        return try Self(messageId: id, deviceId: deviceId, seq: seq, createdAt: createdAt, wechatUserId: wechatUserId, replyCapable: replyCapable, conversationSendCapable: conversationSendCapable, previewEnvelope: previewEnvelope, assets: assets, receivedAt: receivedAt, hasNativeContent: hasNativeContent, nativeAssets: merged, nativeVersion: nativeVersion, nativeAssetSlots: slots)
     }
 }
 
@@ -260,6 +297,8 @@ public enum RelayReplyStatus: String, Codable, Sendable, Equatable {
     case queued = "QUEUED"
     case deliveredToAndroid = "DELIVERED_TO_ANDROID"
     case sentToWechat = "SENT_TO_WECHAT"
+    case replyKeyInstalled = "REPLY_KEY_INSTALLED"
+    case sendUnconfirmed = "SEND_UNCONFIRMED"
     case notificationNotActive = "NOTIFICATION_NOT_ACTIVE"
     case wechatActionChanged = "WECHAT_ACTION_CHANGED"
     case remoteInputUnsupported = "REMOTE_INPUT_UNSUPPORTED"
@@ -309,14 +348,28 @@ public struct RelayDeviceStatus: Codable, Sendable, Equatable {
     public let serverTime: Int64
     public let pushConfigured: Bool
     public let pushRegistered: Bool
+    public let tabletRepliesAvailable: Bool
+    public let tabletContactSendAvailable: Bool
 
-    public init(paired: Bool, deviceId: String?, lastSeenAt: Int64?, serverTime: Int64, pushConfigured: Bool, pushRegistered: Bool) {
+    public init(paired: Bool, deviceId: String?, lastSeenAt: Int64?, serverTime: Int64, pushConfigured: Bool, pushRegistered: Bool, tabletRepliesAvailable: Bool = false, tabletContactSendAvailable: Bool = false) {
         self.paired = paired
         self.deviceId = deviceId
         self.lastSeenAt = lastSeenAt
         self.serverTime = serverTime
         self.pushConfigured = pushConfigured
         self.pushRegistered = pushRegistered
+        self.tabletRepliesAvailable = tabletRepliesAvailable
+        self.tabletContactSendAvailable = tabletContactSendAvailable
+    }
+
+    private enum CodingKeys: String, CodingKey { case paired, deviceId, lastSeenAt, serverTime, pushConfigured, pushRegistered, tabletRepliesAvailable, tabletContactSendAvailable }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(paired: try values.decode(Bool.self, forKey: .paired), deviceId: try values.decodeIfPresent(String.self, forKey: .deviceId),
+            lastSeenAt: try values.decodeIfPresent(Int64.self, forKey: .lastSeenAt), serverTime: try values.decode(Int64.self, forKey: .serverTime),
+            pushConfigured: try values.decode(Bool.self, forKey: .pushConfigured), pushRegistered: try values.decode(Bool.self, forKey: .pushRegistered),
+            tabletRepliesAvailable: try values.decodeIfPresent(Bool.self, forKey: .tabletRepliesAvailable) ?? false,
+            tabletContactSendAvailable: try values.decodeIfPresent(Bool.self, forKey: .tabletContactSendAvailable) ?? false)
     }
 }
 
@@ -374,6 +427,15 @@ enum RelayValidation {
     }
     static func isContactName(_ value: String) -> Bool {
         !value.isEmpty && value == value.trimmingCharacters(in: .whitespacesAndNewlines) && value.lengthOfBytes(using: .utf8) <= 512
+    }
+    static func isAccountFingerprint(_ value: String) -> Bool { value.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil }
+    static func isTabletConversationID(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 1_024 && value == value.trimmingCharacters(in: .whitespacesAndNewlines) &&
+            value.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+    }
+    static func isTabletAlias(_ value: String) -> Bool {
+        value.utf8.count <= 512 && value == value.trimmingCharacters(in: .whitespacesAndNewlines) &&
+            value.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
     }
     static func isImageMIMEType(_ value: String) -> Bool { ["image/jpeg", "image/png", "image/webp"].contains(value.lowercased()) }
     static func isValidAssetSize(width: Int, height: Int) -> Bool { width >= 1 && height >= 1 && width <= 16_384 && height <= 16_384 && width <= 64_000_000 / height }

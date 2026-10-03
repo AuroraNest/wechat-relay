@@ -17,7 +17,7 @@ struct RelayNativeContentTests {
     }
 
     private func content(attachments: [RelayNativeContent.Attachment] = []) -> RelayNativeContent {
-        RelayNativeContent(v: 1, conversationId: "stable-room@chatroom", conversationName: "同名会话", senderId: "wxid_sender", senderName: "群内发送者", isOutgoing: nil, kind: .reference, text: String(repeating: "完整消息", count: 400), rawXML: "<msg><script>never execute</script></msg>", attachments: attachments, records: [RelayNativeContent.Record(senderName: "原发送者", kind: .record, text: "嵌套记录中的完整文本", rawXML: "<record><nested>原始记录</nested></record>")])
+        RelayNativeContent(v: 1, conversationId: "stable-room@chatroom", conversationName: "同名会话", accountFingerprint: nil, senderId: "wxid_sender", senderName: "群内发送者", isOutgoing: nil, kind: .reference, text: String(repeating: "完整消息", count: 400), rawXML: "<msg><script>never execute</script></msg>", attachments: attachments, records: [RelayNativeContent.Record(senderName: "原发送者", kind: .record, text: "嵌套记录中的完整文本", rawXML: "<record><nested>原始记录</nested></record>")])
     }
 
     @Test func legacyMessagesDecodeWithoutNativeFields() throws {
@@ -136,6 +136,34 @@ struct RelayNativeContentTests {
     }
 
     private struct ContentResponse: Encodable { let contentEnvelope: RelayEncryptedEnvelope }
+
+    @Test func canonicalManifestGETFillsCachedMessageWithoutANewSequence() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [NativeURLProtocol.self]
+        let api = try RelayAPI(origin: URL(string: "https://example.invalid")!, configuration: configuration)
+        let session = try RelaySession(origin: URL(string: "https://example.invalid")!, ackToken: "pair-scoped-test", pairId: pairID, messageKey: key, replyKey: Data(repeating: 8, count: 32))
+        let slot = RelayNativeAssetSlot(id: assetID, kind: .file, role: .original)
+        let legacy = try message()
+        let before = try RelayMessage(messageId: legacy.id, deviceId: legacy.deviceId, seq: legacy.seq, createdAt: legacy.createdAt, wechatUserId: legacy.wechatUserId, replyCapable: false, conversationSendCapable: false, previewEnvelope: legacy.previewEnvelope, assets: [], receivedAt: legacy.receivedAt, hasNativeContent: true, nativeVersion: 8, nativeAssetSlots: [slot])
+        let body = content(attachments: [RelayNativeContent.Attachment(assetId: assetID, name: "original.bin", recordItemIndex: 0)])
+        let envelope = try RelayCrypto.encrypt(JSONEncoder().encode(body), key: key, kid: "phase2-content", aad: RelayCrypto.nativeContentAAD(before, pairID: pairID))
+        func response(_ assets: [RelayNativeAssetMetadata]) throws -> Data {
+            try JSONSerialization.data(withJSONObject: ["contentEnvelope": JSONSerialization.jsonObject(with: JSONEncoder().encode(envelope)), "nativeAssetSlots": JSONSerialization.jsonObject(with: JSONEncoder().encode([slot])), "nativeAssets": JSONSerialization.jsonObject(with: JSONEncoder().encode(assets))])
+        }
+        NativeURLProtocol.configure(status: 200, data: try response([]))
+        let first = try await api.nativeManifest(session: session, messageID: before.id)
+        let cached = try before.mergingNativeManifest(slots: #require(first.nativeAssetSlots), assets: #require(first.nativeAssets))
+        #expect(try RelayCrypto.decryptNativeContent(first.contentEnvelope, for: cached, messageKey: key, pairID: pairID) == body)
+        let metadata = try RelayNativeAssetMetadata(id: assetID, kind: .file, mimeType: "application/octet-stream", byteLength: 3, role: .original)
+        NativeURLProtocol.configure(status: 200, data: try response([metadata]))
+        let refreshed = try await api.nativeManifest(session: session, messageID: cached.id)
+        let after = try cached.mergingNativeManifest(slots: #require(refreshed.nativeAssetSlots), assets: #require(refreshed.nativeAssets))
+        #expect(after.id == cached.id)
+        #expect(after.seq == cached.seq)
+        #expect(after.nativeAssets == [metadata])
+        #expect(first.contentEnvelope == refreshed.contentEnvelope)
+        #expect(NativeURLProtocol.captured()?.value(forHTTPHeaderField: "X-AWR-Pair-Id") == pairID)
+    }
 }
 
 private final class NativeURLProtocol: URLProtocol, @unchecked Sendable {

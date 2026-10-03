@@ -28,7 +28,15 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -project ios
 
 1. 用 Xcode 打开 `ios/AuroraRelay.xcodeproj`, 为 App 和扩展选择同一 Development Team.
 2. 保持 Automatic Signing, 连接已信任的 iPhone, 开启手机的 Developer Mode, 选择 `AuroraRelay` scheme 后 Run.
-3. Developer Portal 的 App ID 需要启用 Push Notifications. Debug 使用 sandbox APNs, Release 使用 production APNs.
+3. Developer Portal 的 App ID 需要启用 Push Notifications. APNs 环境必须匹配最终签名的 `aps-environment`, 不能仅凭 Debug/Release 判断. Development profile 对应 sandbox, distribution profile 对应 production, Server 密钥也必须支持该环境.
+
+直接覆盖安装到开发设备时, 使用以下命令构建优化的 Release 包. 脚本显式选择 sandbox 注册, 并在构建后核对实际签名和 Info.plist, 不匹配即失败. 构建本身不会安装或清除数据; App Store/TestFlight archive 仍使用原 production 配置.
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ios/scripts/build-development-device.sh /private/tmp/relay-development-device
+```
+
+2026-10-03 build14 推送故障已定位为 development 签名与 production 注册不一致, 当前 Sandbox-only provider key 返回 `403 BadEnvironmentKeyInToken`. build15 通过以上流程修正, 安装后仍需核对 Server 注册环境、APNs 接受和真实锁屏收件.
 
 可在已忽略的 `ios/Configuration/Signing.local.xcconfig` 中写 `DEVELOPMENT_TEAM = 你的TeamID`. Debug/Release 配置会自动包含此文件, 不需要替换 base configuration. 不要提交密钥、描述文件或账户信息.
 

@@ -18,7 +18,19 @@ struct InboxItem: Identifiable {
         if message.hasNativeContent { return pendingConversationID }
         return source.conversationID(pairID: pairID, profile: message.wechatUserId, name: preview.sender)
     }
-    var conversationName: String { nativeContent?.conversationName.isEmpty == false ? nativeContent!.conversationName : preview.sender }
+    var conversationName: String {
+        guard let content = nativeContent else {
+            guard message.hasNativeContent else { return preview.sender }
+            if preview.sender.hasSuffix("@chatroom") { return "群聊" }
+            if preview.sender.isEmpty || preview.sender.hasPrefix("wxid_") { return "微信会话" }
+            return preview.sender
+        }
+        let name = content.conversationName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty || name == content.conversationId || name.hasSuffix("@chatroom") {
+            return content.conversationId.hasSuffix("@chatroom") ? "群聊" : "微信会话"
+        }
+        return name
+    }
     var body: String { nativeContent?.text.isEmpty == false ? nativeContent!.text : preview.body }
 }
 
@@ -57,6 +69,7 @@ private struct CachedContacts: Codable {
     let wechatUserId: Int
     let capturedAt: Int64
     let contacts: [RelayContact]
+    var accountFingerprint: String? = nil
 }
 
 private struct InboxSnapshot: Codable {
@@ -66,8 +79,10 @@ private struct InboxSnapshot: Codable {
     var clearedThrough: Int = 0
     var contacts: [CachedContacts] = []
     var nativeContents: [String: RelayNativeContent] = [:]
+    var tabletBootstrap: RelayReplyRequest? = nil
+    var tabletBootstrapStatus: RelayReplyStatus? = nil
 
-    enum CodingKeys: String, CodingKey { case messages, outgoing, readThrough, clearedThrough, contacts, nativeContents }
+    enum CodingKeys: String, CodingKey { case messages, outgoing, readThrough, clearedThrough, contacts, nativeContents, tabletBootstrap, tabletBootstrapStatus }
 
     init(messages: [RelayMessage] = [], outgoing: [OutgoingMessage] = [], readThrough: [String: Int] = [:], clearedThrough: Int = 0, contacts: [CachedContacts] = []) {
         self.messages = messages
@@ -86,6 +101,8 @@ private struct InboxSnapshot: Codable {
         // Cache versions before Friends did not have this key.
         contacts = try values.decodeIfPresent([CachedContacts].self, forKey: .contacts) ?? []
         nativeContents = try values.decodeIfPresent([String: RelayNativeContent].self, forKey: .nativeContents) ?? [:]
+        tabletBootstrap = try values.decodeIfPresent(RelayReplyRequest.self, forKey: .tabletBootstrap)
+        tabletBootstrapStatus = try values.decodeIfPresent(RelayReplyStatus.self, forKey: .tabletBootstrapStatus)
     }
 }
 
@@ -103,6 +120,7 @@ final class RelayConnectionModel: ObservableObject {
     @Published private(set) var policy: RelayPolicy = .default
     @Published private(set) var pairing: RelayPairing?
     @Published private(set) var previewEnabled = false
+    @Published private(set) var tabletReplyProblem: String?
     @Published private(set) var notificationPermission: UNAuthorizationStatus = .notDetermined
     @Published private(set) var lastSync: Date?
     @Published private(set) var isRefreshing = false
@@ -118,7 +136,11 @@ final class RelayConnectionModel: ObservableObject {
     @Published private(set) var isDemo: Bool
 
     @Published private(set) var nativeContentProblems: [UUID: String] = [:]
-    private var nativeContentTasks: [UUID: (id: UUID, task: Task<RelayNativeContent, Error>)] = [:]
+    @Published private(set) var nativeAssetRevisions: [UUID: Int] = [:]
+    private var pendingNativeAssets = Set<UUID>()
+    private var nativeAssetTasks: [UUID: (id: UUID, task: Task<URL, Error>)] = [:]
+    private var nativeContentTasks: [UUID: (id: UUID, task: Task<RelayNativeContentResponse, Error>)] = [:]
+    private var nativeBackfillTask: (id: UUID, task: Task<Void, Never>)?
     private var nativeContentTerminal = Set<UUID>()
     private let nativeStore: RelayNativeStore
     private var snapshot = InboxSnapshot()
@@ -134,6 +156,7 @@ final class RelayConnectionModel: ObservableObject {
     private var cacheReadable = true
     private var lastStatusCheck = Date.distantPast
     private var submitting = Set<UUID>()
+    private var preparingTabletReplyKey = false
     private var imageCache = NSCache<NSString, UIImage>()
 
     init(source: RelaySource, demo: Bool) {
@@ -145,6 +168,21 @@ final class RelayConnectionModel: ObservableObject {
         isDemo = false
         #endif
         imageCache.totalCostLimit = 24 * 1_024 * 1_024
+        #if DEBUG
+        if TabletInputRegression.enabled {
+            guard source == .tablet else { return }
+            TabletInputRegression.install()
+            session = TabletInputRegression.session
+            device = TabletInputRegression.device
+            pushDirty = false
+            do {
+                try mergeContacts(TabletInputRegression.legacyContacts, currentDeviceID: TabletInputRegression.device.deviceId!, session: TabletInputRegression.session)
+                snapshot.tabletBootstrap = TabletInputRegression.legacyBootstrap
+                snapshot.tabletBootstrapStatus = .submitting
+            } catch { problem = Self.describe(error) }
+            return
+        }
+        #endif
         if isDemo {
             loadDemo()
             return
@@ -195,16 +233,10 @@ final class RelayConnectionModel: ObservableObject {
         foregroundRun = run
         loop = Task { [weak self] in
             await self?.refreshNotificationPermission()
-            while !Task.isCancelled {
-                guard let self, self.foregroundRun == run else { return }
-                // Keep a low-frequency reconciliation while connected, and poll during stream outages.
-                if !self.streamConnected || self.problem != nil || Date().timeIntervalSince(self.lastSync ?? .distantPast) >= 30 {
-                    await self.refresh()
-                }
-                guard !Task.isCancelled, self.foregroundRun == run else { return }
-                self.startEventStream(run: run)
-                try? await Task.sleep(for: .seconds(self.problem == nil ? 4 : 15))
-            }
+            guard let self, self.foregroundRun == run, !Task.isCancelled else { return }
+            await self.refresh()
+            guard self.foregroundRun == run, !Task.isCancelled else { return }
+            self.startEventStream(run: run)
         }
     }
 
@@ -212,19 +244,22 @@ final class RelayConnectionModel: ObservableObject {
         foregroundRun = nil
         loop?.cancel(); loop = nil
         stream?.cancel(); stream = nil
+        nativeBackfillTask?.task.cancel(); nativeBackfillTask = nil
         nativeContentTasks.values.forEach { $0.task.cancel() }
+        nativeAssetTasks.values.forEach { $0.task.cancel() }
+        nativeAssetTasks = [:]
         streamConnected = false
         refreshRequested = false
     }
 
     private func startEventStream(run: UUID) {
-        guard stream == nil, let session, device?.paired == true, cacheReadable else { return }
+        guard stream == nil, let session, cacheReadable else { return }
         stream = Task { [weak self] in
             var delay = 1
             while !Task.isCancelled {
                 guard let self, self.foregroundRun == run, self.session?.pairId == session.pairId else { return }
                 do {
-                    let api = try RelayAPI(origin: session.origin)
+                    let api = try makeAPI(origin: session.origin)
                     let cursor = max(self.snapshot.clearedThrough, self.snapshot.messages.map(\.seq).max() ?? 0)
                     try await api.streamEvents(session: session, afterSeq: cursor) { [weak self] event in
                         await self?.receiveStreamEvent(event, pairID: session.pairId, run: run)
@@ -233,7 +268,7 @@ final class RelayConnectionModel: ObservableObject {
                     guard !Task.isCancelled, self.foregroundRun == run else { return }
                     if self.streamConnected { delay = 1 }
                     self.streamConnected = false
-                    // A stream failure does not imply message sync failed; HTTP polling remains available.
+                    // Reconnecting emits ready and reconciles missed messages without periodic polling.
                 }
                 try? await Task.sleep(for: .seconds(delay))
                 delay = min(delay * 2, 30)
@@ -243,7 +278,33 @@ final class RelayConnectionModel: ObservableObject {
 
     private func receiveStreamEvent(_ event: RelayStreamEvent, pairID: String, run: UUID) async {
         guard !Task.isCancelled, foregroundRun == run, session?.pairId == pairID else { return }
-        if case .ready = event { streamConnected = true }
+        if case .assetReady(let assetID) = event {
+            guard let message = snapshot.messages.first(where: { $0.nativeAssetSlots.contains(where: { $0.id == assetID }) || $0.nativeAssets.contains(where: { $0.id == assetID }) }) else { return }
+            if message.nativeVersion == 8, let item = items.first(where: { $0.id == message.id }) {
+                do { _ = try await loadNativeContent(for: item, refreshManifest: true) }
+                catch {
+                    // A failed upload hint must recover through the canonical message manifest.
+                    await refresh()
+                    return
+                }
+                guard foregroundRun == run, self.session?.pairId == pairID else { return }
+            }
+            nativeAssetRevisions[assetID, default: 0] += 1
+            return
+        }
+        if case .ready = event {
+            streamConnected = true
+            let waiting = pendingNativeAssets.union(nativeAssetTasks.keys)
+            let messages = items.filter { item in
+                item.message.nativeVersion == 8 && (item.message.hasUnresolvedNativeSlots || item.message.nativeAssetSlots.contains { waiting.contains($0.id) })
+            }
+            for item in messages {
+                guard foregroundRun == run, self.session?.pairId == pairID, !Task.isCancelled else { return }
+                _ = try? await loadNativeContent(for: item, refreshManifest: true)
+            }
+            // A disconnected stream can miss uploads without changing the message cursor.
+            for assetID in pendingNativeAssets.union(nativeAssetTasks.keys) { nativeAssetRevisions[assetID, default: 0] += 1 }
+        }
         // The ready event follows subscription, so this also recovers reply changes during disconnection.
         await refresh()
     }
@@ -259,9 +320,9 @@ final class RelayConnectionModel: ObservableObject {
     #endif
 
     func connect(origin: String, token: String) async throws {
-        guard !isDemo, session == nil, cacheReadable else { throw RelayError.invalidValue("existing connection") }
         guard let url = URL(string: origin.trimmingCharacters(in: .whitespacesAndNewlines)) else { throw RelayError.invalidOrigin }
-        let api = try RelayAPI(origin: url)
+        let api = try makeAPI(origin: url)
+        guard !isDemo, session == nil, cacheReadable else { throw RelayError.invalidValue("existing connection") }
         let ack = try await api.createSession(token: token.trimmingCharacters(in: .whitespacesAndNewlines))
         let newPairing = try await api.createPairing(token: token.trimmingCharacters(in: .whitespacesAndNewlines), ackToken: ack)
         let newSession = try newPairing.makeSession(ackToken: ack)
@@ -276,6 +337,17 @@ final class RelayConnectionModel: ObservableObject {
         contactsProblem = nil
         pushDirty = true
         await refresh()
+        if let run = foregroundRun, !Task.isCancelled {
+            startEventStream(run: run)
+        }
+    }
+
+    private func makeAPI(origin: URL) throws -> RelayAPI {
+        #if DEBUG
+        return try RelayAPI(origin: origin, configuration: TabletInputRegression.configuration)
+        #else
+        return try RelayAPI(origin: origin)
+        #endif
     }
 
     func refresh() async {
@@ -290,8 +362,8 @@ final class RelayConnectionModel: ObservableObject {
             }
         }
         do {
-            let api = try RelayAPI(origin: session.origin)
-            if device == nil || Date().timeIntervalSince(lastStatusCheck) > 25 {
+            let api = try makeAPI(origin: session.origin)
+            if device?.paired != true || Date().timeIntervalSince(lastStatusCheck) > 25 {
                 let current = try await api.deviceStatus(session: session)
                 guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
                 device = current
@@ -304,8 +376,18 @@ final class RelayConnectionModel: ObservableObject {
             }
             try await syncMessages(api: api, session: session)
             guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
-            await refreshNativeContents()
+            startNativeBackfill()
+            if source == .tablet, device?.tabletContactSendAvailable == true, let deviceID = device?.deviceId {
+                do { try await syncContacts(api: api, session: session, deviceID: deviceID) }
+                catch { contactsProblem = Self.describe(error) }
+            }
             guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
+            do {
+                try await ensureTabletReplyKey(api: api, session: session)
+                tabletReplyProblem = nil
+            } catch {
+                if self.session?.pairId == session.pairId { tabletReplyProblem = "平板回复通道尚未就绪, 收件不受影响" }
+            }
             try await refreshReplies(api: api, session: session)
             guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             if policy.updatedAt == 0 || Date().timeIntervalSince(lastStatusCheck) < 2 {
@@ -336,8 +418,16 @@ final class RelayConnectionModel: ObservableObject {
             let page = try await api.messages(session: session, beforeSeq: cursor)
             guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             collected += page.messages.filter { $0.seq > known }
+            // Attachments can arrive without advancing the message cursor.
+            for incoming in page.messages where incoming.seq <= known && incoming.nativeVersion == 8 {
+                guard let cached = snapshot.messages.first(where: { $0.id == incoming.id }), cached.hasUnresolvedNativeSlots else { continue }
+                _ = try RelayCrypto.decryptPreview(incoming, messageKey: session.messageKey)
+                let updated = try cached.mergingNativeManifest(slots: incoming.nativeAssetSlots, assets: incoming.nativeAssets)
+                if updated != cached { collected.append(updated) }
+            }
             let next = page.nextCursor.flatMap(Int.init)
-            if snapshot.messages.isEmpty && cursor == nil { nextCursor = next; hasMore = page.hasMore && snapshot.clearedThrough == 0 }
+            if cursor == nil && !page.hasMore { nextCursor = nil; hasMore = false }
+            else if snapshot.messages.isEmpty && cursor == nil { nextCursor = next; hasMore = page.hasMore && snapshot.clearedThrough == 0 }
             if !page.hasMore || known == 0 || page.messages.contains(where: { $0.seq <= known }) { break }
             guard let next, next > 0, cursor == nil || next < cursor! else { throw RelayError.invalidResponse }
             cursor = next
@@ -350,13 +440,13 @@ final class RelayConnectionModel: ObservableObject {
     func loadOlder() async {
         guard !isDemo, let session, hasMore, let nextCursor else { return }
         do {
-            let page = try await RelayAPI(origin: session.origin).messages(session: session, beforeSeq: nextCursor)
+            let page = try await makeAPI(origin: session.origin).messages(session: session, beforeSeq: nextCursor)
             guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             try merge(page.messages.filter { $0.seq > snapshot.clearedThrough })
             self.nextCursor = page.nextCursor.flatMap(Int.init)
             hasMore = page.hasMore && self.nextCursor != nil
             try saveCache()
-            await refreshNativeContents()
+            startNativeBackfill()
         } catch {
             if self.session?.pairId == session.pairId, !Task.isCancelled { problem = Self.describe(error) }
         }
@@ -367,7 +457,7 @@ final class RelayConnectionModel: ObservableObject {
         isRefreshingContacts = true
         defer { isRefreshingContacts = false }
         do {
-            let api = try RelayAPI(origin: session.origin)
+            let api = try makeAPI(origin: session.origin)
             let currentDevice = try await api.deviceStatus(session: session)
             guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
             device = currentDevice
@@ -376,11 +466,13 @@ final class RelayConnectionModel: ObservableObject {
                   currentDeviceID.range(of: "^[A-Za-z0-9_-]{16,128}$", options: .regularExpression) != nil else {
                 throw RelayError.invalidResponse
             }
-            let snapshots = try await api.contacts(session: session)
-            guard self.session?.pairId == session.pairId, !Task.isCancelled else { return }
-            try mergeContacts(snapshots, currentDeviceID: currentDeviceID, session: session)
-            contactsAvailable = true
-            contactsProblem = nil
+            try await syncContacts(api: api, session: session, deviceID: currentDeviceID)
+            do {
+                try await ensureTabletReplyKey(api: api, session: session, retryFailed: true)
+                tabletReplyProblem = nil
+            } catch {
+                if self.session?.pairId == session.pairId { tabletReplyProblem = "平板回复通道尚未就绪, 收件不受影响" }
+            }
         } catch is CancellationError {
         } catch RelayError.httpStatus(404) {
             // Older Relay servers do not expose contacts. Keep message synchronization independent.
@@ -389,6 +481,14 @@ final class RelayConnectionModel: ObservableObject {
         } catch {
             if !Task.isCancelled { contactsProblem = Self.describe(error) }
         }
+    }
+
+    private func syncContacts(api: RelayAPI, session: RelaySession, deviceID: String) async throws {
+        let snapshots = try await api.contacts(session: session)
+        guard self.session?.pairId == session.pairId, !Task.isCancelled else { throw CancellationError() }
+        try mergeContacts(snapshots, currentDeviceID: deviceID, session: session)
+        contactsAvailable = true
+        contactsProblem = nil
     }
 
     private func merge(_ messages: [RelayMessage]) throws {
@@ -423,7 +523,7 @@ final class RelayConnectionModel: ObservableObject {
                     continue
                 }
             }
-            cached[remote.wechatUserId] = CachedContacts(version: remote.v, id: remote.id, deviceId: remote.deviceId, wechatUserId: remote.wechatUserId, capturedAt: remote.capturedAt, contacts: payload.contacts)
+            cached[remote.wechatUserId] = CachedContacts(version: remote.v, id: remote.id, deviceId: remote.deviceId, wechatUserId: remote.wechatUserId, capturedAt: remote.capturedAt, contacts: payload.contacts, accountFingerprint: payload.accountFingerprint)
             changed = true
         }
         guard changed else { return }
@@ -441,7 +541,10 @@ final class RelayConnectionModel: ObservableObject {
     private func refreshFriends() {
         guard let session else { friends = []; return }
         friends = snapshot.contacts.flatMap { snapshot in
-            snapshot.contacts.map { RelayFriend(source: source, pairID: session.pairId, name: $0.name, wechatUserId: snapshot.wechatUserId, capturedAt: snapshot.capturedAt) }
+            snapshot.contacts.map { contact in
+                let stableID = source == .tablet && snapshot.version == 3 ? contact.conversationId.map { source.nativeConversationID(pairID: session.pairId, profile: snapshot.wechatUserId, conversationID: $0) } : nil
+                return RelayFriend(source: source, pairID: session.pairId, name: contact.name, wechatUserId: snapshot.wechatUserId, capturedAt: snapshot.capturedAt, stableConversationID: stableID)
+            }
         }.sorted {
             let comparison = $0.name.localizedStandardCompare($1.name)
             if comparison == .orderedSame { return $0.wechatUserId < $1.wechatUserId }
@@ -451,7 +554,51 @@ final class RelayConnectionModel: ObservableObject {
 
     func canSend(to friend: RelayFriend) -> Bool {
         guard friend.source == source, friend.pairID == session?.pairId else { return false }
-        return snapshot.contacts.contains { $0.version == 2 && $0.deviceId == device?.deviceId && $0.wechatUserId == friend.wechatUserId && $0.contacts.contains(where: { $0.name == friend.name }) }
+        guard let contacts = contacts(for: friend) else { return false }
+        if source == .tablet, !isDemo {
+            return device?.tabletContactSendAvailable == true && tabletReplyKeyInstalled && contacts.version == 3 && contacts.accountFingerprint != nil &&
+                contacts.contacts.contains { contact in
+                    guard let identity = contact.conversationId, !identity.hasSuffix("@chatroom"), contact.alias?.isEmpty == false else { return false }
+                    return source.nativeConversationID(pairID: friend.pairID, profile: friend.wechatUserId, conversationID: identity) == friend.id
+                }
+        }
+        return contacts.version == 2 && contacts.contacts.contains(where: { $0.name == friend.name })
+    }
+
+    private func contacts(for friend: RelayFriend) -> CachedContacts? {
+        snapshot.contacts.first { $0.deviceId == device?.deviceId && $0.wechatUserId == friend.wechatUserId }
+    }
+
+    private var tabletReplyKeyInstalled: Bool { isDemo || (snapshot.tabletBootstrap?.deviceId == device?.deviceId && snapshot.tabletBootstrapStatus == .replyKeyInstalled) }
+
+    func canSend(to target: InboxItem) -> Bool {
+        guard target.source == source, target.pairID == session?.pairId, target.message.deviceId == device?.deviceId else { return false }
+        if target.message.hasNativeContent {
+            return source == .tablet && device?.tabletRepliesAvailable == true && tabletReplyKeyInstalled && RelayCrypto.canReplyToTablet(target: target.message, content: target.nativeContent)
+        }
+        return target.message.replyCapable
+    }
+
+    func sendUnavailableReason(to friend: RelayFriend) -> String? {
+        guard !canSend(to: friend) else { return nil }
+        guard let contacts = contacts(for: friend) else { return "好友信息尚未同步. 请重新同步好友." }
+        guard source == .tablet, !isDemo else { return "此来源尚未提供主动发送能力. 请更新来源端并重新同步好友." }
+        guard device?.tabletContactSendAvailable == true else { return "平板尚未提供好友发送能力. 请更新来源端并重新同步好友." }
+        guard contacts.version == 3, contacts.accountFingerprint != nil else { return "好友身份信息尚未就绪. 请重新同步平板好友." }
+        guard let contact = contacts.contacts.first(where: { contact in contact.conversationId.map { source.nativeConversationID(pairID: friend.pairID, profile: friend.wechatUserId, conversationID: $0) } == friend.id }) else { return "好友信息已更新. 请重新打开好友会话." }
+        if contact.conversationId?.hasSuffix("@chatroom") == true { return "平板暂不支持群聊发送." }
+        if contact.alias?.isEmpty != false { return "此好友缺少微信号, 暂时无法安全发送. 请在微信确认微信号后重新同步好友." }
+        return "平板发送通道尚未就绪. 请稍后刷新."
+    }
+
+    func sendUnavailableReason(to target: InboxItem) -> String? {
+        guard !canSend(to: target) else { return nil }
+        guard target.message.hasNativeContent else { return "这条消息暂不支持回复." }
+        if target.nativeContent?.conversationId.hasSuffix("@chatroom") == true { return "平板暂不支持群聊发送." }
+        guard device?.tabletRepliesAvailable == true else { return "平板回复能力尚未提供. 请更新来源端后刷新." }
+        guard target.nativeContent != nil else { return "消息身份信息尚在加载, 请稍后重试." }
+        guard RelayCrypto.canReplyToTablet(target: target.message, content: target.nativeContent) else { return "这条消息暂不支持安全回复." }
+        return "平板发送通道尚未就绪. 请稍后刷新."
     }
 
     func avatarItem(for friend: RelayFriend) -> InboxItem? {
@@ -465,20 +612,78 @@ final class RelayConnectionModel: ObservableObject {
     }
 
     func send(_ body: String, to target: InboxItem) async throws {
-        guard let session, target.source == source, target.pairID == session.pairId else { throw RelayError.invalidValue("session") }
+        guard let session, canSend(to: target) else { throw RelayError.invalidValue("reply target") }
         let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        let request = try RelayCrypto.makeReply(session: session, target: target.message, body: text)
+        let request: RelayReplyRequest
+        if target.message.hasNativeContent {
+            guard source == .tablet, device?.tabletRepliesAvailable == true, let content = target.nativeContent else { throw RelayError.invalidValue("tablet content") }
+            try await ensureTabletReplyKey(api: makeAPI(origin: session.origin), session: session)
+            guard self.session?.pairId == session.pairId, tabletReplyKeyInstalled else { throw RelayError.invalidValue("tablet reply key") }
+            request = try RelayCrypto.makeTabletReply(session: session, target: target.message, content: content, body: text)
+        } else {
+            request = try RelayCrypto.makeReply(session: session, target: target.message, body: text)
+        }
         let pending = OutgoingMessage(request: request, conversationID: target.conversationID, body: text, status: .submitting)
         try await enqueue(pending)
     }
 
+    private func ensureTabletReplyKey(api: RelayAPI, session: RelaySession, retryFailed: Bool = false) async throws {
+        guard source == .tablet, !isDemo, let deviceID = device?.deviceId, !preparingTabletReplyKey else { return }
+        preparingTabletReplyKey = true
+        defer { preparingTabletReplyKey = false }
+        if tabletReplyKeyInstalled { return }
+        let target = device?.tabletRepliesAvailable == true ? snapshot.messages.last(where: { $0.hasNativeContent && $0.deviceId == deviceID }) : nil
+        let contacts = device?.tabletContactSendAvailable == true ? snapshot.contacts.first(where: { $0.version == 3 && $0.wechatUserId == 0 && $0.deviceId == deviceID }) : nil
+        guard target != nil || contacts != nil else { return }
+        // Contact bootstrap installs the same key without relying on an old message remaining available.
+        let migrateLegacyBootstrap = contacts != nil && snapshot.tabletBootstrap?.v == 6
+        func makeBootstrap() throws -> RelayReplyRequest {
+            if let contacts { return try RelayCrypto.makeTabletContactReplyBootstrap(session: session, snapshotId: contacts.id, deviceId: deviceID) }
+            guard let target else { throw RelayError.invalidValue("tablet bootstrap target") }
+            return try RelayCrypto.makeTabletReplyBootstrap(session: session, target: target)
+        }
+        let contactChanged = snapshot.tabletBootstrap?.v == 8 && snapshot.tabletBootstrap?.targetContactSnapshotId != contacts?.id
+        let retryTerminalBootstrap = retryFailed && snapshot.tabletBootstrapStatus?.isTerminal == true
+        if snapshot.tabletBootstrap?.deviceId != deviceID || contactChanged || migrateLegacyBootstrap || retryTerminalBootstrap {
+            snapshot.tabletBootstrap = try makeBootstrap()
+            snapshot.tabletBootstrapStatus = .submitting
+            try saveCache()
+        }
+        guard var command = snapshot.tabletBootstrap, snapshot.tabletBootstrapStatus != .replyKeyInstalled else { return }
+        let result: RelayReplyResult
+        do {
+            result = try await api.replyStatus(session: session, id: command.id)
+        } catch RelayError.httpStatus(404) where snapshot.tabletBootstrapStatus == .submitting {
+            guard self.session?.pairId == session.pairId else { throw RelayError.invalidResponse }
+            // Only a confirmed absence permits replacement of an expired, never-accepted control command.
+            if Int64(Date().timeIntervalSince1970 * 1_000) - command.createdAt > 120_000 {
+                command = try makeBootstrap()
+                snapshot.tabletBootstrap = command
+                try saveCache()
+            }
+            result = try await api.submitReply(session: session, request: command)
+        }
+        guard self.session?.pairId == session.pairId, result.replyId == command.id, snapshot.tabletBootstrap?.id == command.id else { throw RelayError.invalidResponse }
+        snapshot.tabletBootstrapStatus = result.status
+        try saveCache()
+        guard result.status == .replyKeyInstalled else { throw RelayError.invalidValue("tablet reply key") }
+    }
+
     func send(_ body: String, to friend: RelayFriend) async throws {
         guard let session, canSend(to: friend),
-              let contacts = snapshot.contacts.first(where: { $0.wechatUserId == friend.wechatUserId }) else {
+              let contacts = contacts(for: friend) else {
             throw RelayError.invalidValue("contact snapshot")
         }
         let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        let request = try RelayCrypto.makeContactSend(session: session, snapshotId: contacts.id, deviceId: contacts.deviceId, wechatUserId: friend.wechatUserId, conversationTitle: friend.name, body: text)
+        let request: RelayReplyRequest
+        if source == .tablet, !isDemo {
+            try await ensureTabletReplyKey(api: makeAPI(origin: session.origin), session: session)
+            guard self.session?.pairId == session.pairId, canSend(to: friend), let account = contacts.accountFingerprint,
+                  let contact = contacts.contacts.first(where: { contact in contact.conversationId.map { source.nativeConversationID(pairID: session.pairId, profile: friend.wechatUserId, conversationID: $0) } == friend.id }) else { throw RelayError.invalidValue("tablet contact") }
+            request = try RelayCrypto.makeTabletContactSend(session: session, snapshotId: contacts.id, deviceId: contacts.deviceId, contact: contact, accountFingerprint: account, body: text)
+        } else {
+            request = try RelayCrypto.makeContactSend(session: session, snapshotId: contacts.id, deviceId: contacts.deviceId, wechatUserId: friend.wechatUserId, conversationTitle: friend.name, body: text)
+        }
         try await enqueue(OutgoingMessage(request: request, conversationID: friend.id, body: text, status: .submitting))
     }
 
@@ -501,7 +706,7 @@ final class RelayConnectionModel: ObservableObject {
         submitting.insert(reply.id)
         defer { submitting.remove(reply.id) }
         do {
-            let result = try await RelayAPI(origin: session.origin).submitReply(session: session, request: reply.request)
+            let result = try await makeAPI(origin: session.origin).submitReply(session: session, request: reply.request)
             guard self.session?.pairId == session.pairId else { return }
             guard result.replyId == reply.id else { throw RelayError.invalidResponse }
             updateReply(reply.id, status: result.status)
@@ -540,7 +745,7 @@ final class RelayConnectionModel: ObservableObject {
         isSavingPolicy = true
         defer { isSavingPolicy = false }
         if isDemo { policy = value; return }
-        policy = try await RelayAPI(origin: session.origin).savePolicy(session: session, policy: value)
+        policy = try await makeAPI(origin: session.origin).savePolicy(session: session, policy: value)
     }
 
     func setPreviewEnabled(_ enabled: Bool) async throws {
@@ -600,7 +805,7 @@ final class RelayConnectionModel: ObservableObject {
         let key = metadata.id.uuidString as NSString
         if let image = imageCache.object(forKey: key) { return image }
         guard let session else { throw RelayError.invalidValue("session") }
-        let asset = try await RelayAPI(origin: session.origin).asset(session: session, id: metadata.id)
+        let asset = try await makeAPI(origin: session.origin).asset(session: session, id: metadata.id)
         let data = try RelayCrypto.decryptAsset(asset, for: message, messageKey: session.messageKey)
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 2_048, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { throw RelayError.invalidResponse }
@@ -609,27 +814,41 @@ final class RelayConnectionModel: ObservableObject {
         return image
     }
 
-    func loadNativeContent(for item: InboxItem) async throws -> RelayNativeContent {
+    func loadNativeContent(for item: InboxItem, refreshManifest: Bool = false) async throws -> RelayNativeContent {
         guard let session, item.source == source, item.pairID == session.pairId, item.message.hasNativeContent else { throw RelayError.invalidValue("content source") }
-        if let cached = snapshot.nativeContents[item.id.uuidString] { return cached }
+        if !refreshManifest, let cached = snapshot.nativeContents[item.id.uuidString] { return cached }
+        if refreshManifest, let pending = nativeContentTasks[item.id] {
+            // A hint may follow the snapshot of an already-running GET; read again after it finishes.
+            _ = try? await pending.task.value
+            if nativeContentTasks[item.id]?.id == pending.id { nativeContentTasks[item.id] = nil }
+            try Task.checkCancellation()
+        }
         let requestID: UUID
-        let task: Task<RelayNativeContent, Error>
+        let task: Task<RelayNativeContentResponse, Error>
         if let pending = nativeContentTasks[item.id] {
             requestID = pending.id
             task = pending.task
         } else {
             requestID = UUID()
             task = Task {
-                let envelope = try await RelayAPI(origin: session.origin).nativeContent(session: session, messageID: item.id)
+                let response = try await makeAPI(origin: session.origin).nativeManifest(session: session, messageID: item.id)
                 try Task.checkCancellation()
-                return try RelayCrypto.decryptNativeContent(envelope, for: item.message, messageKey: session.messageKey)
+                return response
             }
             nativeContentTasks[item.id] = (requestID, task)
         }
         defer { if nativeContentTasks[item.id]?.id == requestID { nativeContentTasks[item.id] = nil } }
         do {
-            let content = try await task.value
-            guard self.session?.pairId == session.pairId, snapshot.messages.contains(where: { $0.id == item.id }), !Task.isCancelled else { throw CancellationError() }
+            let response = try await task.value
+            guard self.session?.pairId == session.pairId, let index = snapshot.messages.firstIndex(where: { $0.id == item.id }), !Task.isCancelled else { throw CancellationError() }
+            var message = snapshot.messages[index]
+            if message.nativeVersion == 8 {
+                guard let slots = response.nativeAssetSlots, let assets = response.nativeAssets else { throw RelayError.invalidResponse }
+                message = try message.mergingNativeManifest(slots: slots, assets: assets)
+            }
+            let content = try RelayCrypto.decryptNativeContent(response.contentEnvelope, for: message, messageKey: session.messageKey, pairID: session.pairId)
+            if let cached = snapshot.nativeContents[item.id.uuidString], cached != content { throw RelayError.invalidResponse }
+            snapshot.messages[index] = message
             snapshot.nativeContents[item.id.uuidString] = content
             if let read = snapshot.readThrough.removeValue(forKey: item.pendingConversationID) {
                 let stable = source.nativeConversationID(pairID: session.pairId, profile: item.message.wechatUserId, conversationID: content.conversationId)
@@ -649,6 +868,17 @@ final class RelayConnectionModel: ObservableObject {
         }
     }
 
+    private func startNativeBackfill() {
+        guard nativeBackfillTask == nil else { return }
+        let id = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.refreshNativeContents()
+            if self.nativeBackfillTask?.id == id { self.nativeBackfillTask = nil }
+        }
+        nativeBackfillTask = (id, task)
+    }
+
     private func refreshNativeContents() async {
         // Bound foreground backfill independently of SSE seq. Visible cards can request an older item directly.
         for item in items.reversed().filter({ $0.message.hasNativeContent && $0.nativeContent == nil && !nativeContentTerminal.contains($0.id) }).prefix(8) {
@@ -660,9 +890,38 @@ final class RelayConnectionModel: ObservableObject {
     func nativeAssetURL(_ metadata: RelayNativeAssetMetadata, in item: InboxItem) async throws -> URL {
         guard let session, item.source == source, item.pairID == session.pairId else { throw RelayError.invalidValue("asset source") }
         let content = try await loadNativeContent(for: item)
-        let url = try await nativeStore.file(metadata: metadata, message: item.message, content: content, session: session)
-        guard self.session?.pairId == session.pairId, snapshot.messages.contains(where: { $0.id == item.id }) else { throw CancellationError() }
-        return url
+        let requestID: UUID
+        let task: Task<URL, Error>
+        if let existing = nativeAssetTasks[metadata.id] {
+            requestID = existing.id; task = existing.task
+        } else {
+            requestID = UUID()
+            task = Task {
+                while true {
+                    let revision = nativeAssetRevisions[metadata.id, default: 0]
+                    do { return try await nativeStore.file(metadata: metadata, message: item.message, content: content, session: session) }
+                    catch RelayError.assetPending {
+                        try Task.checkCancellation()
+                        // An upload hint can arrive while the pending response is in flight.
+                        guard revision != nativeAssetRevisions[metadata.id, default: 0] else { throw RelayError.assetPending }
+                    }
+                }
+            }
+            nativeAssetTasks[metadata.id] = (requestID, task)
+        }
+        defer { if nativeAssetTasks[metadata.id]?.id == requestID { nativeAssetTasks[metadata.id] = nil } }
+        do {
+            let url = try await task.value
+            pendingNativeAssets.remove(metadata.id)
+            guard self.session?.pairId == session.pairId, snapshot.messages.contains(where: { $0.id == item.id }), !Task.isCancelled else { throw CancellationError() }
+            return url
+        } catch RelayError.assetPending {
+            if self.session?.pairId == session.pairId { pendingNativeAssets.insert(metadata.id) }
+            throw RelayError.assetPending
+        } catch {
+            if !(error is CancellationError) { pendingNativeAssets.remove(metadata.id) }
+            throw error
+        }
     }
 
     func clearHistory() throws {
@@ -673,6 +932,8 @@ final class RelayConnectionModel: ObservableObject {
         cacheReadable = true
         do { try saveCache() } catch { snapshot = previous; cacheReadable = wasReadable; throw error }
         nativeContentProblems = [:]; nativeContentTerminal = []
+        nativeAssetTasks.values.forEach { $0.task.cancel() }
+        nativeAssetTasks = [:]; pendingNativeAssets = []; nativeAssetRevisions = [:]
         items = []; outgoing = []; imageCache.removeAllObjects(); hasMore = false
         if let session { try nativeStore.clear(session: session) }
         problem = nil
@@ -690,6 +951,7 @@ final class RelayConnectionModel: ObservableObject {
         }
         removeDeliveredNotifications()
         nativeContentProblems = [:]; nativeContentTerminal = []
+        pendingNativeAssets = []; nativeAssetRevisions = [:]
         session = nil; pairing = nil; device = nil
         isDemo = false
         snapshot = InboxSnapshot(); items = []; outgoing = []; friends = []; conversationPath = []
@@ -729,7 +991,7 @@ final class RelayConnectionModel: ObservableObject {
             let selected = pushSelected
             let token = apnsToken
             let preview = previewEnabled
-            try await RelayAPI(origin: session.origin).updatePush(session: session, token: selected ? token : nil, environment: pushEnvironment, previewEnabled: selected && preview)
+            try await makeAPI(origin: session.origin).updatePush(session: session, token: selected ? token : nil, environment: pushEnvironment, previewEnabled: selected && preview)
             guard self.session?.pairId == session.pairId else { return }
             if selected == pushSelected, token == apnsToken, preview == previewEnabled { pushDirty = false }
         }
@@ -797,6 +1059,7 @@ final class RelayConnectionModel: ObservableObject {
 
     static func describe(_ error: Error) -> String {
         switch error {
+        case RelayError.invalidValue("message no longer available"): return "这条通知对应的消息不在本机记录中. 请从消息列表查看最新消息."
         case RelayError.assetPending: return "原始附件仍在上传, 稍后会自动重试, 也可手动刷新."
         case RelayError.assetExpired: return "原始附件已超过服务端保留期, 无法重新下载."
         case RelayError.invalidOrigin: return "请填写完整的 HTTPS 服务地址, 不带路径或参数."
@@ -826,6 +1089,9 @@ final class RelayConnectionModel: ObservableObject {
             }
             #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("--demo-native") { try loadNativeDemo(session: session) }
+            if ProcessInfo.processInfo.arguments.contains("--demo-native-image") {
+                try loadNativeImageDemo(session: session, previewOnly: ProcessInfo.processInfo.arguments.contains("--preview-only"))
+            }
             #endif
             try merge([])
             snapshot.contacts = [
@@ -839,6 +1105,32 @@ final class RelayConnectionModel: ObservableObject {
         } catch { problem = Self.describe(error) }
     }
     #if DEBUG
+    private func loadNativeImageDemo(session: RelaySession, previewOnly: Bool) throws {
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 600, height: 400))
+        let bytes = renderer.jpegData(withCompressionQuality: 0.9) { context in
+            UIColor.systemBlue.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 600, height: 400))
+            UIColor.systemYellow.setFill()
+            context.fill(CGRect(x: 50, y: 50, width: 500, height: 300))
+        }
+        let id = try UUIDv7.make(), originalID = try UUIDv7.make(), previewID = try UUIDv7.make()
+        let timestamp = Int64(Date().timeIntervalSince1970 * 1_000)
+        let deviceID = "demo_native_0001"
+        let metadata = try RelayNativeAssetMetadata(id: previewOnly ? previewID : originalID, kind: .image, mimeType: "image/jpeg", byteLength: bytes.count, role: previewOnly ? .playback : .original, derivedFrom: previewOnly ? originalID : nil)
+        let preview = RelayPreview(sender: "图片查看演示", body: "点击图片查看全屏")
+        let envelope = try RelayCrypto.encrypt(JSONEncoder().encode(preview), key: session.messageKey, kid: "phase1", aad: "AWR1|A2I|\(id.uuidString.lowercased())|\(deviceID)|8|\(timestamp)|0")
+        let slots = [RelayNativeAssetSlot(id: originalID, kind: .image, role: .original), RelayNativeAssetSlot(id: previewID, kind: .image, role: .playback, derivedFrom: originalID)]
+        let message = try RelayMessage(messageId: id, deviceId: deviceID, seq: 8, createdAt: timestamp, wechatUserId: 0, replyCapable: false, conversationSendCapable: false, previewEnvelope: envelope, assets: [], receivedAt: timestamp, hasNativeContent: true, nativeAssets: [metadata], nativeVersion: 8, nativeAssetSlots: slots)
+        let payload: [String: Any] = ["v": 1, "conversationId": "native-image-demo", "conversationName": "图片查看演示", "senderId": "demo-sender", "senderName": "图片查看演示", "kind": "image", "text": "", "attachments": [["assetId": originalID.uuidString.lowercased(), "name": "original.jpg"], ["assetId": previewID.uuidString.lowercased(), "name": "preview.jpg"]]]
+        snapshot.messages.append(message)
+        snapshot.nativeContents[id.uuidString] = try JSONDecoder().decode(RelayNativeContent.self, from: JSONSerialization.data(withJSONObject: payload))
+        let assetAAD = "AWR1|A2I_ASSET|8|\(session.pairId)|\(id.uuidString.lowercased())|\(metadata.id.uuidString.lowercased())|\(deviceID)|8|\(timestamp)|0|image|image/jpeg|\(bytes.count)|\(metadata.role.rawValue)|\(metadata.derivedFrom?.uuidString.lowercased() ?? "")"
+        let assetEnvelope = try RelayCrypto.encrypt(bytes, key: session.messageKey, kid: "phase2-asset", aad: assetAAD)
+        var assetObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(metadata)) as! [String: Any]
+        assetObject["envelope"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(assetEnvelope))
+        nativeStore.seedDemo(try JSONDecoder().decode(RelayNativeAsset.self, from: JSONSerialization.data(withJSONObject: assetObject)))
+    }
+
     private func loadNativeDemo(session: RelaySession) throws {
         let assetID = try UUIDv7.make()
         let bytes = Data("原始附件演示字节, 不进行摘要或转写.\n".utf8)
@@ -866,18 +1158,20 @@ extension RelayReplyStatus {
     var label: String {
         switch self {
         case .submitting: return "提交尚未确认 · 点按重试"
-        case .queued: return "等待 Android 取走"
-        case .deliveredToAndroid: return "Android 正在处理"
+        case .queued: return "等待来源设备处理"
+        case .deliveredToAndroid: return "来源设备正在处理"
         case .sentToWechat: return "已发往微信"
+        case .replyKeyInstalled: return "平板回复密钥已就绪"
+        case .sendUnconfirmed: return "发送结果未确认, 请先在微信核实, 勿重复发送"
         case .notificationNotActive: return "原通知已失效, 请等待对方的新消息"
         case .wechatActionChanged: return "微信回复入口已变化"
-        case .remoteInputUnsupported: return "此消息不支持通知回复"
+        case .remoteInputUnsupported: return "旧版通知快捷回复不可用"
         case .pendingIntentCanceled: return "微信回复入口已失效"
         case .invalidReply: return "回复内容未通过校验"
         case .contactSnapshotStale: return "好友名单已失效, 请在小米重新同步好友后重发"
-        case .automationNotReady: return "小米锁屏自动化未就绪, 请打开小米 Relay 检查保护状态"
-        case .wechatWindowTimeout: return "等待微信会话超时, 请在小米检查微信界面"
-        case .failed: return "Android 发送失败"
+        case .automationNotReady: return "自动回复尚未就绪, 请检查来源设备"
+        case .wechatWindowTimeout: return "等待微信会话超时, 请检查来源微信界面"
+        case .failed: return "来源设备发送失败"
         }
     }
 }

@@ -1,0 +1,6 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.aurora.tabletrelay">
+    <uses-sdk android:minSdkVersion="34" android:targetSdkVersion="34" />
+    <queries><package android:name="com.tencent.mm" /></queries>
+    <application android:label="Aurora tablet UI adapter" android:debuggable="true" android:allowBackup="false" />
+    <instrumentation android:name="com.aurora.tabletrelay.ReplyInstrumentation" android:targetPackage="com.aurora.tabletrelay" />
+</manifest>

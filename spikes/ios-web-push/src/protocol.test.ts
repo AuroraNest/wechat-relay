@@ -111,7 +111,7 @@ test("message v4/v5 reply capability is persisted and defaults legacy messages t
   const server = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
   const migration = await readFile(new URL("../scripts/migrations/003-message-reply-capability.sql", import.meta.url), "utf8");
   const android = await readFile(new URL("../../android-notification-probe/app/src/main/java/com/aurora/wechatrelay/probe/SyncNetwork.kt", import.meta.url), "utf8");
-  assert.match(server, /message\.v === 4 \|\| message\.v === 5 \|\| message\.v === 6 \? message\.replyCapable : false/);
+  assert.match(server, /message\.v === 4 \|\| message\.v === 5 \|\| message\.v === 6 \|\| message\.v === 7 \|\| message\.v === 8 \? message\.replyCapable : false/);
   assert.match(server, /throw new Error\("REPLY_UNSUPPORTED"\)/);
   assert.match(migration, /ADD COLUMN reply_capable TINYINT\(1\) NOT NULL DEFAULT 0/);
   assert.match(android, /\\"v\\":5/);
