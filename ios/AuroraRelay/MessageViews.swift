@@ -197,12 +197,12 @@ struct ConversationView: View {
     @EnvironmentObject private var model: RelayAppModel
     @Environment(\.dismiss) private var dismiss
     let conversationID: String
-    @State private var draft = ""
-    @State private var sending = false
-    @State private var error: String?
     @FocusState private var inputFocused: Bool
     private var resolvedID: String { model.resolvedConversationID(conversationID) }
-    private var messages: [InboxItem] { model.items.filter { $0.conversationID == resolvedID } }
+    private var messages: [InboxItem] {
+        let id = resolvedID
+        return model.items.filter { $0.conversationID == id }
+    }
     private var target: InboxItem? { messages.last(where: { model.canSend(to: $0) }) }
     private var friend: RelayFriend? { model.friends.first { $0.id == resolvedID } }
     private var canSend: Bool { target != nil || friend.map { model.canSend(to: $0) } == true }
@@ -210,7 +210,10 @@ struct ConversationView: View {
         if let friend { return model.sendUnavailableReason(to: friend) }
         return messages.last.flatMap { model.sendUnavailableReason(to: $0) }
     }
-    private var replies: [OutgoingMessage] { model.outgoing.filter { $0.conversationID == resolvedID } }
+    private var replies: [OutgoingMessage] {
+        let id = resolvedID
+        return model.outgoing.filter { $0.conversationID == id }
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -272,28 +275,10 @@ struct ConversationView: View {
         }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 8) {
-                if let error { Text(error).font(.caption).foregroundStyle(.red) }
                 if let problem = model.problem { Text(problem).font(.caption).foregroundStyle(.orange).lineLimit(3) }
-                HStack(alignment: .bottom, spacing: 10) {
-                    TextField("输入回复", text: $draft, axis: .vertical)
-                        .lineLimit(1...5).focused($inputFocused).padding(.horizontal, 15).padding(.vertical, 11)
-                        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 22))
-                        .accessibilityIdentifier("message-composer")
-                    Button {
-                        guard canSend else { return }
-                        sending = true; error = nil
-                        Task {
-                            do {
-                                if let target { try await model.send(draft, to: target) }
-                                else if let friend { try await model.send(draft, to: friend) }
-                                draft = ""
-                            }
-                            catch { self.error = RelayAppModel.describe(error) }
-                            sending = false
-                        }
-                    } label: { Image(systemName: "arrow.up").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44).foregroundStyle(.white).background(Color.relayGreen, in: Circle()) }
-                        .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.count > 1_000 || sending)
-                        .opacity(!canSend || draft.isEmpty ? 0.4 : 1).accessibilityLabel("发送回复")
+                ConversationComposer(canSend: canSend, inputFocused: $inputFocused) { text in
+                    if let target { try await model.send(text, to: target) }
+                    else if let friend { try await model.send(text, to: friend) }
                 }
                 if !canSend, let sendUnavailableReason {
                     Text(sendUnavailableReason).font(.caption).foregroundStyle(.secondary)
@@ -306,7 +291,6 @@ struct ConversationView: View {
                         Button("刷新发送状态") { Task { await model.refreshContacts(); await model.refresh() } }
                     }
                 }
-                if draft.count > 1_000 { Text("回复最多 1000 字").font(.caption).foregroundStyle(.red) }
             }.padding(.horizontal, 16).padding(.vertical, 10).background(.bar)
         }
     }
@@ -319,6 +303,43 @@ struct ConversationView: View {
     }
     private var timeline: [Entry] {
         (messages.map { Entry(id: $0.id, time: $0.message.createdAt, incoming: $0, outgoing: nil) } + replies.map { Entry(id: $0.id, time: $0.request.createdAt, incoming: nil, outgoing: $0) }).sorted { $0.time < $1.time }
+    }
+}
+
+// Keep keystrokes local so typing does not rebuild or sort the conversation timeline.
+private struct ConversationComposer: View {
+    let canSend: Bool
+    let inputFocused: FocusState<Bool>.Binding
+    let send: (String) async throws -> Void
+    @State private var draft = ""
+    @State private var sending = false
+    @State private var error: String?
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+            HStack(alignment: .bottom, spacing: 10) {
+                TextField("输入回复", text: $draft, axis: .vertical)
+                    .lineLimit(1...5).focused(inputFocused).padding(.horizontal, 15).padding(.vertical, 11)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 22))
+                    .accessibilityIdentifier("message-composer")
+                Button {
+                    guard canSend else { return }
+                    sending = true; error = nil
+                    Task {
+                        do {
+                            try await send(draft)
+                            draft = ""
+                        }
+                        catch { self.error = RelayAppModel.describe(error) }
+                        sending = false
+                    }
+                } label: { Image(systemName: "arrow.up").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44).foregroundStyle(.white).background(Color.relayGreen, in: Circle()) }
+                    .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.count > 1_000 || sending)
+                    .opacity(!canSend || draft.isEmpty ? 0.4 : 1).accessibilityLabel("发送回复")
+            }
+            if draft.count > 1_000 { Text("回复最多 1000 字").font(.caption).foregroundStyle(.red) }
+        }
     }
 }
 
